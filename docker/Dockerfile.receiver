@@ -1,0 +1,11 @@
+FROM mikebrady/shairport-sync:latest
+
+USER root
+RUN apk add --no-cache socat
+
+COPY docker/receiver-entrypoint.sh /app/receiver-entrypoint.sh
+COPY scripts/receiver-session-start.sh scripts/receiver-session-stop.sh scripts/receiver-volume.sh /app/scripts/
+RUN chmod +x /app/receiver-entrypoint.sh /app/scripts/*.sh
+
+EXPOSE 9001
+ENTRYPOINT ["/app/receiver-entrypoint.sh"]

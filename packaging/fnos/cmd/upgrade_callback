@@ -1,0 +1,13 @@
+#!/bin/bash
+set -u
+mkdir -p "$TRIM_PKGVAR"
+chmod 0700 "$TRIM_PKGVAR"
+chown -R "$TRIM_USERNAME" "$TRIM_PKGVAR"
+runtime="${TRIM_APPDEST}/airplay2-runtime"
+chmod 0755 "$runtime/bin/nqptp" "$runtime/bin/shairport-sync" "$runtime/run-shairport"
+if ! command -v setcap >/dev/null 2>&1; then
+  echo "系统缺少 setcap，无法启用原生 AirPlay 2 所需的 NQPTP。" > "$TRIM_TEMP_LOGFILE"
+  exit 1
+fi
+setcap cap_net_bind_service=+ep "$runtime/lib/ld-musl-x86_64.so.1"
+rm -f "${TRIM_PKGVAR}/micast.pid" "${TRIM_APPDEST}/app.sock"

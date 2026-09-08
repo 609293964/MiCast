@@ -1,0 +1,330 @@
+[
+  {
+    "file": "fnos/ICON.PNG",
+    "size": [
+      64,
+      64
+    ],
+    "bytes": 2802
+  },
+  {
+    "file": "fnos/ICON_256.PNG",
+    "size": [
+      256,
+      256
+    ],
+    "bytes": 10156
+  },
+  {
+    "file": "tray/tray-dark-16.png",
+    "size": [
+      16,
+      16
+    ],
+    "bytes": 667
+  },
+  {
+    "file": "tray/tray-dark-20.png",
+    "size": [
+      20,
+      20
+    ],
+    "bytes": 704
+  },
+  {
+    "file": "tray/tray-dark-24.png",
+    "size": [
+      24,
+      24
+    ],
+    "bytes": 811
+  },
+  {
+    "file": "tray/tray-dark-32.png",
+    "size": [
+      32,
+      32
+    ],
+    "bytes": 909
+  },
+  {
+    "file": "tray/tray-dark-40.png",
+    "size": [
+      40,
+      40
+    ],
+    "bytes": 1008
+  },
+  {
+    "file": "tray/tray-dark-48.png",
+    "size": [
+      48,
+      48
+    ],
+    "bytes": 1101
+  },
+  {
+    "file": "tray/tray-dark-64.png",
+    "size": [
+      64,
+      64
+    ],
+    "bytes": 1341
+  },
+  {
+    "file": "tray/tray-light-16.png",
+    "size": [
+      16,
+      16
+    ],
+    "bytes": 732
+  },
+  {
+    "file": "tray/tray-light-20.png",
+    "size": [
+      20,
+      20
+    ],
+    "bytes": 771
+  },
+  {
+    "file": "tray/tray-light-24.png",
+    "size": [
+      24,
+      24
+    ],
+    "bytes": 891
+  },
+  {
+    "file": "tray/tray-light-32.png",
+    "size": [
+      32,
+      32
+    ],
+    "bytes": 993
+  },
+  {
+    "file": "tray/tray-light-40.png",
+    "size": [
+      40,
+      40
+    ],
+    "bytes": 1102
+  },
+  {
+    "file": "tray/tray-light-48.png",
+    "size": [
+      48,
+      48
+    ],
+    "bytes": 1260
+  },
+  {
+    "file": "tray/tray-light-64.png",
+    "size": [
+      64,
+      64
+    ],
+    "bytes": 1504
+  },
+  {
+    "file": "web/apple-touch-icon.png",
+    "size": [
+      180,
+      180
+    ],
+    "bytes": 4303
+  },
+  {
+    "file": "web/favicon-16.png",
+    "size": [
+      16,
+      16
+    ],
+    "bytes": 1008
+  },
+  {
+    "file": "web/favicon-32.png",
+    "size": [
+      32,
+      32
+    ],
+    "bytes": 1646
+  },
+  {
+    "file": "web/favicon-48.png",
+    "size": [
+      48,
+      48
+    ],
+    "bytes": 2232
+  },
+  {
+    "file": "web/icon-128.png",
+    "size": [
+      128,
+      128
+    ],
+    "bytes": 4569
+  },
+  {
+    "file": "web/icon-16.png",
+    "size": [
+      16,
+      16
+    ],
+    "bytes": 900
+  },
+  {
+    "file": "web/icon-192.png",
+    "size": [
+      192,
+      192
+    ],
+    "bytes": 6507
+  },
+  {
+    "file": "web/icon-256.png",
+    "size": [
+      256,
+      256
+    ],
+    "bytes": 9046
+  },
+  {
+    "file": "web/icon-32.png",
+    "size": [
+      32,
+      32
+    ],
+    "bytes": 1452
+  },
+  {
+    "file": "web/icon-48.png",
+    "size": [
+      48,
+      48
+    ],
+    "bytes": 1986
+  },
+  {
+    "file": "web/icon-512.png",
+    "size": [
+      512,
+      512
+    ],
+    "bytes": 18464
+  },
+  {
+    "file": "web/icon-64.png",
+    "size": [
+      64,
+      64
+    ],
+    "bytes": 2436
+  },
+  {
+    "file": "web/icon-96.png",
+    "size": [
+      96,
+      96
+    ],
+    "bytes": 3480
+  },
+  {
+    "file": "web/maskable-192.png",
+    "size": [
+      192,
+      192
+    ],
+    "bytes": 4951
+  },
+  {
+    "file": "web/maskable-512.png",
+    "size": [
+      512,
+      512
+    ],
+    "bytes": 13622
+  },
+  {
+    "file": "windows/micast-128.png",
+    "size": [
+      128,
+      128
+    ],
+    "bytes": 4569
+  },
+  {
+    "file": "windows/micast-16.png",
+    "size": [
+      16,
+      16
+    ],
+    "bytes": 829
+  },
+  {
+    "file": "windows/micast-20.png",
+    "size": [
+      20,
+      20
+    ],
+    "bytes": 967
+  },
+  {
+    "file": "windows/micast-24.png",
+    "size": [
+      24,
+      24
+    ],
+    "bytes": 1090
+  },
+  {
+    "file": "windows/micast-256.png",
+    "size": [
+      256,
+      256
+    ],
+    "bytes": 9046
+  },
+  {
+    "file": "windows/micast-32.png",
+    "size": [
+      32,
+      32
+    ],
+    "bytes": 1282
+  },
+  {
+    "file": "windows/micast-40.png",
+    "size": [
+      40,
+      40
+    ],
+    "bytes": 1529
+  },
+  {
+    "file": "windows/micast-48.png",
+    "size": [
+      48,
+      48
+    ],
+    "bytes": 1748
+  },
+  {
+    "file": "windows/micast-64.png",
+    "size": [
+      64,
+      64
+    ],
+    "bytes": 2436
+  },
+  {
+    "file": "windows/micast-96.png",
+    "size": [
+      96,
+      96
+    ],
+    "bytes": 3480
+  }
+]

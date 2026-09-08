@@ -1,0 +1,14 @@
+prefix=/ffmpeg_build
+exec_prefix=${prefix}
+libdir=/ffmpeg_build/lib
+includedir=/ffmpeg_build/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 60.26.102
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil 
+Libs.private: -lm -latomic -pthread
+Cflags: -I${includedir}

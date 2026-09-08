@@ -1,0 +1,757 @@
+import { api } from "./api";
+import "./volume-actions";
+import { renderAccountView, bindAccountView } from "./components/account-view";
+import {
+  applyTheme,
+  bindNavigation,
+  bindThemeToggle,
+  renderAppShell,
+  updateThemeToggle,
+} from "./components/app-shell";
+import { bindDebugPanel, bindStreamKicks, renderConnectionChecks, renderDebugPanel, renderStreamRows, updateRuntimeLog, type DebugState } from "./components/debug-panel";
+import { bindDevicesView, renderDevicesView } from "./components/devices-view";
+import { renderQRSheet, bindQRSheet } from "./components/qr-sheet";
+import { bindReceiversView, renderReceiversView } from "./components/receivers-view";
+import { bindSettingsView, renderSettingsView } from "./components/settings-view";
+import { bindAirPlay2View, renderAirPlay2View } from "./components/airplay2-view";
+import { renderToast } from "./components/toast";
+import { bindAccessLogin, bindOnboarding, renderAccessLogin, renderOnboarding, renderXiaomiRecovery } from "./components/onboarding-view";
+import { bindPlaybackBar, isPlaybackBarInteracting, renderPlaybackBar } from "./components/playback-bar";
+import { bindTopologyView, renderTopologyView } from "./components/topology-view";
+import { store, type Section, type State, type Theme } from "./state";
+import { appWebSocketUrl } from "./paths";
+import "./styles.css";
+
+// fnOS presents MiCast inside its own titled window/sheet. Mark that context
+// once, before the first render, so the web shell does not duplicate the host
+// chrome while the standalone browser and desktop app keep their header.
+document.documentElement.classList.toggle("is-embedded", window.self !== window.top);
+
+let shellMounted = false;
+// The topology view owns a canvas render loop and an EventSource; torn down
+// whenever the main content is about to be replaced.
+let topologyCleanup: (() => void) | null = null;
+// Content scrolls inside .app-body; switching sections starts at the top.
+let lastRenderedSection: Section | null = null;
+
+function render(state: State) {
+  const app = document.getElementById("app");
+  if (!app) return;
+
+  // The document is never the application scroller. Native file pickers and
+  // focus restoration can still move an overflow-hidden root in WebKit.
+  // Reset it before updating the fixed app shell.
+  if (document.scrollingElement?.scrollTop) {
+    document.scrollingElement.scrollTop = 0;
+  }
+  if (app.scrollTop) app.scrollTop = 0;
+
+  if (!state.access) {
+    app.innerHTML = `<main class="boot-page"><span class="setup-progress" aria-label="正在加载"></span></main>`;
+    shellMounted = false;
+    return;
+  }
+  if (!state.access.setup_complete) {
+    app.innerHTML = renderOnboarding(state) + renderToast(state.toast);
+    bindOnboarding(app, {
+      onAccess: async (payload) => {
+        try {
+          await api.setupAccess(payload);
+          const access = await api.getAccessStatus();
+          store.set({ access, onboardingStep: "xiaomi" });
+          render(store.get());
+        } catch (error) {
+          store.showToast(`保存失败：${friendlyError(error)}`);
+          throw error;
+        }
+      },
+      onXiaomi: startQRLogin,
+      onReview: async () => {
+        const [fullConfig, xiaomi] = await Promise.all([api.getConfig(), api.getXiaomiStatus()]);
+        let devices = store.get().devices;
+        if (xiaomi.logged_in) devices = await api.getDevices().catch(() => devices);
+        store.set({ fullConfig, xiaomi, devices, onboardingStep: fullConfig.airplay2_available ? "airplay2" : "complete", qr: { open: false, qrUrl: null, scanToken: null, state: "idle" } });
+        render(store.get());
+      },
+      onAirPlay2: async (enabled, target) => {
+        if (enabled && target) {
+          const [target_type, target_id] = target.split(":", 2) as ["speaker" | "group", string];
+          await api.saveAirPlay2Instance({ id: "airplay2", name: "MiCast", target_type, target_id, enabled: true });
+        }
+        await api.setAirPlay2Enabled(enabled);
+        store.set({ onboardingStep: "complete" });
+        render(store.get());
+      },
+      onComplete: finishOnboarding,
+    });
+    shellMounted = false;
+    return;
+  }
+  if (state.access.auth_enabled && !state.access.authenticated) {
+    app.innerHTML = renderAccessLogin(state.access) + renderToast(state.toast);
+    bindAccessLogin(app, async (username, password) => {
+      await api.loginAccess(username, password);
+      window.location.reload();
+    });
+    shellMounted = false;
+    return;
+  }
+
+  const appName = state.fullConfig?.app.name ?? "MiCast";
+  const activeSection = state.ui.activeSection;
+
+  let mainContent = "";
+
+  switch (activeSection) {
+    case "receivers":
+      mainContent = renderReceiversView(state);
+      break;
+    case "devices":
+      mainContent = renderDevicesView({
+        devices: state.devices,
+        expandedDid: state.ui.expandedDeviceDid,
+        status: state.status?.status || "",
+        pcmSource: state.status?.pcm_source || "",
+        streamUrl: state.status?.stream_url || "",
+        loggedIn: state.xiaomi.logged_in,
+        loadError: state.deviceLoadError,
+        playback: state.playback,
+      });
+      break;
+    case "settings":
+      mainContent = renderSettingsView({
+        audio: state.audio,
+        config: state.fullConfig,
+        appName,
+        protocol: state.fullConfig?.airplay_protocol ?? "auto",
+        airplay2Enabled: state.fullConfig?.airplay2_enabled ?? false,
+        airplay2Available: state.fullConfig?.airplay2_available ?? false,
+        dlnaEnabled: state.fullConfig?.dlna_enabled ?? false,
+        dlnaStatus: state.fullConfig?.dlna_status ?? null,
+        syncGroupsEnabled: state.fullConfig?.sync_groups_enabled ?? true,
+        theme: state.ui.theme,
+        status: state.status?.status || "",
+        xiaomiLoggedIn: state.xiaomi.logged_in,
+        deviceCount: state.devices.length,
+        access: state.access,
+        saving: state.saving,
+      });
+      break;
+    case "account":
+      mainContent = renderAccountView(state);
+      break;
+    case "debug":
+      mainContent = renderDebugPanel(state, state.debug);
+      break;
+    case "airplay2":
+      mainContent = renderAirPlay2View(state.airplay2, state.ui.airplay2Tab);
+      break;
+    case "topology":
+      mainContent = renderTopologyView();
+      break;
+  }
+
+  if (!shellMounted) {
+    app.innerHTML =
+      renderAppShell("", activeSection, appName, state.ui.theme) +
+      `<div id="playback-slot"></div>` +
+      `<div id="qr-slot"></div>` +
+      `<div id="recovery-slot"></div>` +
+      renderToast(state.toast);
+    bindGlobalUI(app);
+    shellMounted = true;
+  }
+
+  const main = app.querySelector<HTMLElement>(".main-content");
+  if (main) {
+    main.dataset.activeSection = activeSection;
+    const scrollContainer = main.closest<HTMLElement>(".app-body");
+    const sectionChanged = activeSection !== lastRenderedSection;
+    const previousScrollTop = scrollContainer?.scrollTop ?? 0;
+    topologyCleanup?.();
+    topologyCleanup = null;
+    main.innerHTML = mainContent;
+    bindSectionUI(main);
+    if (sectionChanged) {
+      scrollContainer?.scrollTo(0, 0);
+    } else if (scrollContainer) {
+      // Replacing a section can make it much shorter (source-tab changes,
+      // uploads finishing, async button states). WebKit may keep the old
+      // scroll offset for a frame and render an apparently empty page. Clamp
+      // it both now and after layout so every in-place rerender stays valid.
+      const restoreScroll = () => {
+        const maxScrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
+        scrollContainer.scrollTo(0, Math.min(previousScrollTop, maxScrollTop));
+      };
+      restoreScroll();
+      requestAnimationFrame(restoreScroll);
+    }
+  }
+  lastRenderedSection = activeSection;
+  app.querySelectorAll<HTMLElement>("[data-section]").forEach((item) => {
+    const selected = item.dataset.section === activeSection;
+    item.classList.toggle("active", selected);
+    item.setAttribute("aria-selected", String(selected));
+  });
+  const title = app.querySelector<HTMLElement>("#app-title");
+  if (title) title.textContent = appName;
+  updateThemeToggle(app, state.ui.theme);
+  const qrSlot = app.querySelector<HTMLElement>("#qr-slot");
+  if (qrSlot) {
+    qrSlot.innerHTML = renderQRSheet(state.qr);
+    bindQRSheet(qrSlot, closeQRSheet);
+  }
+  const recoverySlot = app.querySelector<HTMLElement>("#recovery-slot");
+  if (recoverySlot) {
+    recoverySlot.innerHTML = renderXiaomiRecovery(state);
+    recoverySlot.querySelectorAll<HTMLElement>("[data-recovery-close]").forEach((button) => button.addEventListener("click", () => {
+      store.set({ recoveryDismissed: true });
+      render(store.get());
+    }));
+    recoverySlot.querySelectorAll<HTMLElement>("[data-recovery-login]").forEach((button) => button.addEventListener("click", startQRLogin));
+  }
+  updatePlaybackBar();
+}
+
+function updatePlaybackBar() {
+  const slot = document.getElementById("playback-slot");
+  if (!slot) return;
+  // Don't clobber the slider (and its value) while the user is dragging it.
+  if (isPlaybackBarInteracting()) return;
+  const markup = renderPlaybackBar(store.get().playback);
+  slot.innerHTML = markup;
+  document.documentElement.classList.toggle("has-playback", Boolean(markup));
+  document.documentElement.classList.toggle("playback-minimized", Boolean(slot.querySelector(".mobile-minimized")));
+  bindPlaybackBar(slot);
+}
+
+document.addEventListener("micast:render-playback", updatePlaybackBar);
+// The playback-bar volume slider also edits per-speaker volumes; refresh the
+// speakers page when it's the one on screen.
+document.addEventListener("micast:render-devices", () => {
+  if (store.get().ui.activeSection === "devices") render(store.get());
+});
+
+// True while the user is interacting with ANY form control in the main
+// content — a re-render mid-interaction would destroy the element, wipe
+// half-typed values, and drop focus. Covers range sliders, number inputs,
+// text fields, and selects alike.
+function isInteracting(): boolean {
+  const el = document.activeElement;
+  if (!(el instanceof HTMLElement)) return false;
+  const main = document.querySelector(".main-content");
+  if (!main || !main.contains(el)) return false;
+  return el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement;
+}
+
+// A poll/push that arrived during an interaction is stored but not rendered;
+// when the interaction ends (focus leaves the form control), flush it once.
+let renderPending = false;
+function requestRender() {
+  if (isInteracting()) {
+    renderPending = true;
+    return;
+  }
+  renderPending = false;
+  render(store.get());
+}
+// focusout bubbles; when the last focused control in main content loses
+// focus and a render was skipped, apply it now that it's safe.
+document.addEventListener("focusout", () => {
+  if (!renderPending) return;
+  // Wait for the browser to settle the new activeElement (may be another
+  // control in the same form — still interacting).
+  requestAnimationFrame(() => {
+    if (renderPending && !isInteracting()) {
+      renderPending = false;
+      render(store.get());
+    }
+  });
+});
+
+function bindGlobalUI(container: HTMLElement) {
+  bindNavigation(container, (section) => {
+    store.setUi({ activeSection: section });
+    render(store.get());
+    if (section === "devices") {
+      loadDevices();
+    } else if (section === "receivers") {
+      if (store.get().devices.length === 0) loadDevices();
+      loadAirPlay2State();
+    } else if (section === "account" && store.get().xiaomi.logged_in) {
+      loadDevices();
+    } else if (section === "debug") {
+      loadDebugState();
+    }
+  });
+
+  bindThemeToggle(container, () => {
+    const current = store.get().ui.theme;
+    const order: Theme[] = ["auto", "light", "dark"];
+    const next = order[(order.indexOf(current) + 1) % order.length];
+    store.setUi({ theme: next });
+    applyTheme(next);
+    render(store.get());
+  });
+
+  bindPlaybackBar(container);
+}
+
+function bindSectionUI(container: HTMLElement) {
+  const activeSection = store.get().ui.activeSection;
+  if (activeSection === "receivers") {
+    bindReceiversView(container, () => render(store.get()));
+  } else if (activeSection === "settings") {
+    bindSettingsView(
+      container,
+      (theme) => {
+        store.setUi({ theme });
+        applyTheme(theme);
+        render(store.get());
+      },
+      () => render(store.get()),
+      () => {
+        store.setUi({ activeSection: "airplay2" });
+        render(store.get());
+        loadAirPlay2State();
+      },
+      () => {
+        store.setUi({ activeSection: "account" });
+        render(store.get());
+        if (store.get().xiaomi.logged_in) loadDevices();
+      }
+    );
+  } else if (activeSection === "devices") {
+    bindDevicesView(container, (did) => {
+      store.setUi({ expandedDeviceDid: did });
+      render(store.get());
+    });
+  } else if (activeSection === "account") {
+    bindAccountView(container, {
+      onBack: () => {
+        store.setUi({ activeSection: "settings" });
+        render(store.get());
+      },
+      onLogout: async () => {
+        try {
+          await api.logoutXiaomi();
+          store.set({ xiaomi: { logged_in: false, user_id: null }, devices: [] });
+          store.showToast("已退出登录");
+          render(store.get());
+        } catch (e) {
+          store.showToast(`退出失败: ${e instanceof Error ? e.message : "未知错误"}`);
+        }
+      },
+      onQRLogin: startQRLogin,
+      onRetry: loadDevices,
+      onCookieLogin: async (userId, passToken) => {
+        try {
+          await api.loginWithCookie(userId, passToken);
+          store.showToast("Cookie 登录成功");
+          await refreshLoginState();
+          loadDevices();
+        } catch (e) {
+          store.showToast(`登录失败: ${e instanceof Error ? e.message : "未知错误"}`);
+        }
+      },
+    });
+  } else if (activeSection === "debug") {
+    bindDebugPanel(container, (msg) => store.showToast(msg), () => render(store.get()));
+  } else if (activeSection === "airplay2") {
+    bindAirPlay2View(container, {
+      onBack: () => {
+        store.setUi({ activeSection: "settings" });
+        render(store.get());
+      },
+      onTab: (airplay2Tab) => {
+        store.setUi({ airplay2Tab });
+        render(store.get());
+      },
+      onRefresh: loadAirPlay2State,
+    });
+  } else if (activeSection === "topology") {
+    topologyCleanup = bindTopologyView(container);
+  }
+
+}
+
+function closeQRSheet() {
+  store.set({ qr: { ...store.get().qr, open: false } });
+  render(store.get());
+}
+
+function updateDevicesStatus(status: State["status"]) {
+  if (!status) return;
+
+  const isRunning = status.status === "running";
+  const statusText = isRunning
+    ? "运行中"
+    : status.status === "error"
+      ? "出错"
+      : status.status || "未启动";
+  const pill = document.querySelector<HTMLElement>(".status-pill");
+  const stream = document.querySelector<HTMLElement>("[data-status-stream]");
+  const source = document.querySelector<HTMLElement>("[data-status-source]");
+
+  if (pill) {
+    pill.classList.toggle("running", isRunning);
+    pill.classList.toggle("error", status.status === "error");
+    const label = pill.querySelector<HTMLElement>("[data-status-label]");
+    if (label) label.textContent = statusText;
+  }
+  if (stream) stream.textContent = status.stream_url || "-";
+  if (source) source.textContent = status.pcm_source || "-";
+}
+
+window.addEventListener("micast:toast", (event) => {
+  const toast = document.querySelector<HTMLElement>(".toast");
+  if (!toast) return;
+  const detail = (event as CustomEvent<{ message: string; visible: boolean }>).detail;
+  toast.textContent = detail.message;
+  toast.classList.toggle("visible", detail.visible);
+});
+
+window.addEventListener("micast:access-required", async () => {
+  try {
+    store.set({ access: await api.getAccessStatus() });
+    render(store.get());
+  } catch {
+    // The next request or reload will retry the access bootstrap.
+  }
+});
+
+async function refreshLoginState() {
+  try {
+    const xiaomi = await api.getXiaomiStatus();
+    store.set({ xiaomi });
+    render(store.get());
+  } catch (e) {
+    store.showToast(`获取登录状态失败: ${e instanceof Error ? e.message : "未知错误"}`);
+  }
+}
+
+async function finishOnboarding() {
+  try {
+    // The first application view is always the live link map. Persist this
+    // before reload so a stale pre-onboarding section (for example 诊断) does
+    // not win over the completion destination.
+    store.setUi({ activeSection: "topology" });
+    await api.completeSetup();
+    window.location.reload();
+  } catch (error) {
+    store.showToast(`无法完成设置：${friendlyError(error)}`);
+  }
+}
+
+function friendlyError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : "未知错误";
+  return raw.match(/"detail"\s*:\s*"([^"]+)"/)?.[1] || raw;
+}
+
+async function startQRLogin() {
+  store.set({
+    qr: { open: true, qrUrl: null, scanToken: null, state: "idle" },
+  });
+  render(store.get());
+
+  try {
+    const { qr_url, scan_token } = await api.startQRLogin();
+    store.set({
+      qr: { open: true, qrUrl: qr_url, scanToken: scan_token, state: "waiting" },
+    });
+    render(store.get());
+    pollQR(scan_token);
+  } catch (e) {
+    store.showToast(`QR 登录失败: ${e instanceof Error ? e.message : "未知错误"}`);
+    store.set({ qr: { open: false, qrUrl: null, scanToken: null, state: "idle" } });
+    render(store.get());
+  }
+}
+
+async function pollQR(scanToken: string) {
+  const maxAttempts = 60;
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      const result = await api.pollQRLogin(scanToken);
+      const qr = store.get().qr;
+      if (!qr.open) return;
+
+      if (result.status === "scanned") {
+        store.set({ qr: { ...qr, state: "scanned" } });
+      } else if (result.status === "confirmed") {
+        store.set({ qr: { ...qr, state: "confirmed" } });
+        store.showToast("登录成功");
+        setTimeout(() => {
+          store.set({ qr: { open: false, qrUrl: null, scanToken: null, state: "idle" } });
+          render(store.get());
+          refreshLoginState();
+          loadDevices();
+        }, 1500);
+        return;
+      } else if (result.status === "expired") {
+        store.set({ qr: { ...qr, state: "expired" } });
+        return;
+      }
+      render(store.get());
+    } catch {
+      // continue polling
+    }
+  }
+  store.set({ qr: { ...store.get().qr, state: "expired" } });
+  render(store.get());
+}
+
+async function loadDevices() {
+  try {
+    const devices = await api.getDevices();
+    store.set({ devices, deviceLoadError: null });
+    if (["devices", "receivers", "account"].includes(store.get().ui.activeSection)) {
+      requestRender();
+    }
+  } catch (e) {
+    let xiaomi = store.get().xiaomi;
+    try {
+      xiaomi = await api.getXiaomiStatus();
+    } catch {
+      // Keep the last known account state if the status check itself fails.
+    }
+    const message = xiaomi.logged_in
+      ? `获取设备失败: ${e instanceof Error ? e.message : "未知错误"}`
+      : "米家连接已失效，请重新连接";
+    store.set({ devices: [], xiaomi, deviceLoadError: message });
+    if (["devices", "receivers", "account"].includes(store.get().ui.activeSection)) {
+      requestRender();
+    }
+    store.showToast(message);
+  }
+}
+
+async function loadDebugState() {
+  try {
+    const debug = await api.getDebugState();
+    store.set({ debug });
+    if (store.get().ui.activeSection === "debug") {
+      render(store.get());
+    }
+  } catch (e) {
+    store.showToast(`获取调试状态失败: ${e instanceof Error ? e.message : "未知错误"}`);
+  }
+}
+
+async function loadAirPlay2State() {
+  try {
+    const airplay2 = await api.getAirPlay2State();
+    store.set({ airplay2 });
+    if (["airplay2", "receivers"].includes(store.get().ui.activeSection)) requestRender();
+  } catch (e) {
+    store.showToast(`获取 AirPlay 2 状态失败: ${e instanceof Error ? e.message : "未知错误"}`);
+  }
+}
+
+async function loadInitialState() {
+  try {
+    const [status, audio, config, xiaomi, airplay2] = await Promise.all([
+      api.getStatus(),
+      api.getAudioConfig(),
+      api.getConfig(),
+      api.getXiaomiStatus(),
+      api.getAirPlay2State().catch(() => null),
+    ]);
+    store.set({ status, audio, fullConfig: config, xiaomi, receivers: status.receivers, airplay2 });
+    render(store.get());
+
+    if (xiaomi.logged_in) {
+      api.getPlaybackState(true).then((playback) => {
+        store.set({ playback });
+        updatePlaybackBar();
+      }).catch(() => undefined);
+    }
+
+    if (xiaomi.logged_in) {
+      loadDevices();
+    }
+    if (store.get().ui.activeSection === "debug") {
+      await loadDebugState();
+    }
+    if (store.get().ui.activeSection === "airplay2") {
+      await loadAirPlay2State();
+    }
+  } catch (e) {
+    store.showToast(`加载状态失败: ${e instanceof Error ? e.message : "未知错误"}`);
+  }
+}
+
+async function init() {
+  const ui = store.get().ui;
+  applyTheme(ui.theme);
+  render(store.get());
+
+  try {
+    const access = await api.getAccessStatus();
+    store.set({ access, onboardingStep: access.access_configured ? "xiaomi" : "access" });
+    render(store.get());
+    if (!access.setup_complete || (access.auth_enabled && !access.authenticated)) return;
+  } catch (e) {
+    store.showToast(`加载访问设置失败：${friendlyError(e)}`);
+    return;
+  }
+
+  await loadInitialState();
+
+  // Realtime state: WebSocket push when available, polling as fallback.
+  function applyStatus(status: any) {
+    const changed = JSON.stringify(store.get().status) !== JSON.stringify(status);
+    const interactionPending = store.get().saving;
+    store.set(interactionPending ? { status } : { status, receivers: status.receivers });
+    const activeSection = store.get().ui.activeSection;
+    if (changed && activeSection === "devices") {
+      updateDevicesStatus(status);
+    } else if (changed && activeSection === "receivers" && !interactionPending) {
+      requestRender();
+    }
+  }
+
+  function applyPlayback(playback: any) {
+    if (JSON.stringify(playback) !== JSON.stringify(store.get().playback)) {
+      store.set({ playback });
+      updatePlaybackBar();
+    }
+  }
+
+  let pollTimers: number[] = [];
+  function stopPolling() {
+    pollTimers.forEach((id) => window.clearInterval(id));
+    pollTimers = [];
+  }
+
+  function startPolling() {
+    if (pollTimers.length) return; // already polling
+    pollTimers = [
+      window.setInterval(async () => {
+        try {
+          applyStatus(await api.getStatus());
+        } catch {
+          // ignore
+        }
+      }, 3000),
+      window.setInterval(async () => {
+        if (!store.get().xiaomi.logged_in) return;
+        try {
+          applyPlayback(await api.getPlaybackState());
+        } catch {
+          // Playback controls keep the last confirmed state while temporarily offline.
+        }
+      }, 5000),
+    ];
+  }
+
+  function startRealtime() {
+    let socket: WebSocket | null = null;
+    try {
+      socket = new WebSocket(appWebSocketUrl("api/ws"));
+    } catch {
+      startPolling();
+      return;
+    }
+    socket.onopen = () => stopPolling();
+    socket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === "status") applyStatus(message.data);
+        else if (message.type === "playback" && store.get().xiaomi.logged_in) applyPlayback(message.data);
+      } catch {
+        // malformed frame — ignore
+      }
+    };
+    socket.onclose = () => {
+      // Fall back to polling; retry the socket when it likely recovered.
+      startPolling();
+      setTimeout(startRealtime, 30000);
+    };
+    socket.onerror = () => socket?.close();
+  }
+  startRealtime();
+
+  // Xiaomi validity changes independently from transport status. Poll it
+  // quietly so an expired cloud login is surfaced even when the user stays
+  // on the playback page and no device refresh is running.
+  window.setInterval(async () => {
+    if (!store.get().xiaomi.ever_logged_in && !store.get().xiaomi.logged_in) return;
+    try {
+      const xiaomi = await api.getXiaomiStatus();
+      if (JSON.stringify(xiaomi) !== JSON.stringify(store.get().xiaomi)) {
+        store.set({ xiaomi });
+        requestRender();
+      }
+    } catch {
+      // A status request failing is connectivity trouble, not proof of expiry.
+    }
+  }, 30000);
+
+  setInterval(async () => {
+    if (store.get().ui.activeSection !== "debug") return;
+    const log = document.querySelector<HTMLElement>("[data-runtime-log]");
+    if (!log || log.dataset.paused === "true") return;
+    try {
+      const debug = await api.getDebugState();
+      const needsInitialRender = store.get().debug === null;
+      store.set({ debug });
+      if (needsInitialRender) {
+        render(store.get());
+      } else {
+        updateRuntimeLog(log, debug, log.dataset.filter || "micast");
+        const checks = document.querySelector<HTMLElement>("[data-connection-checks]");
+        if (checks) checks.innerHTML = renderConnectionChecks(debug, store.get());
+        const streamList = document.querySelector<HTMLElement>("[data-stream-list]");
+        if (streamList) {
+          streamList.innerHTML = renderStreamRows(debug, store.get());
+          bindStreamKicks(streamList, (msg) => store.showToast(msg));
+        }
+      }
+    } catch {
+      // Keep the latest diagnostics visible during a temporary API failure.
+    }
+  }, 1500);
+}
+
+init();
+
+// ---- Desktop shell close prompt (packaged app only) ----
+// The WebView2 window's X fires this via pywebview; the page shows a styled
+// dialog and reports the choice back through the JS bridge. In plain browsers
+// this is never invoked and pywebview.api does not exist.
+declare global {
+  interface Window {
+    micastClosePrompt?: () => void;
+    pywebview?: { api?: { desktop_quit?: () => void; desktop_hide?: () => void } };
+  }
+}
+
+window.micastClosePrompt = () => {
+  if (document.querySelector(".desktop-close-dialog")) return;
+  const dialog = document.createElement("dialog");
+  dialog.className = "confirm-dialog desktop-close-dialog";
+  dialog.innerHTML = `<form method="dialog">
+    <div class="confirm-dialog-copy">
+      <h3>关闭 MiCast</h3>
+      <p>退出后手机将无法继续投放；也可以收进系统托盘，在后台继续运行。</p>
+    </div>
+    <div class="confirm-dialog-actions">
+      <button class="button plain" value="cancel">取消</button>
+      <button class="button plain" value="tray">最小化到托盘</button>
+      <button class="button danger" value="quit">退出 MiCast</button>
+    </div>
+  </form>`;
+  document.body.appendChild(dialog);
+  dialog.addEventListener("close", () => {
+    const choice = dialog.returnValue;
+    dialog.remove();
+    const bridge = window.pywebview?.api;
+    if (choice === "quit") bridge?.desktop_quit?.();
+    else if (choice === "tray") bridge?.desktop_hide?.();
+  }, { once: true });
+  dialog.addEventListener("cancel", () => dialog.close("cancel"));
+  dialog.showModal();
+  dialog.querySelector<HTMLButtonElement>('[value="tray"]')?.focus();
+};

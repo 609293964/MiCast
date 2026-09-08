@@ -1,0 +1,16 @@
+#!/bin/bash
+set -u
+
+mkdir -p "$TRIM_PKGVAR"
+backup="${TRIM_PKGVAR}/upgrade-backup.tgz"
+files=""
+for name in micast.json access.json xiaomi-account.json xiaomi-tokens.enc; do
+  [ -f "${TRIM_PKGVAR}/${name}" ] && files="$files $name"
+done
+if [ -n "$files" ]; then
+  # shellcheck disable=SC2086
+  tar -czf "$backup" -C "$TRIM_PKGVAR" $files || {
+    echo "升级前备份 MiCast 配置失败。" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+  }
+fi

@@ -1,0 +1,5 @@
+#!/bin/bash
+set -u
+
+# Stop artifacts are disposable even when fnOS has already stopped the service.
+rm -f "${TRIM_PKGVAR}/micast.pid" "${TRIM_APPDEST}/app.sock"

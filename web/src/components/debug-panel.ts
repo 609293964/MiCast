@@ -1,0 +1,517 @@
+import { api, type DebugState } from "../api";
+import { icon } from "../icons";
+import { store } from "../state";
+import type { State } from "../state";
+import { EQ_PRESET_LABELS } from "./devices-view";
+import { getTestMedia, setTestMedia } from "../test-media";
+
+export type { DebugState };
+
+/**
+ * Resolve a "-q{n}" EQ-split suffix to something meaningful: the backend
+ * numbers each distinct non-flat EQ signature in order of first appearance
+ * (config.py receiver_stream_variants). Reproduce that order here, then name
+ * the split after the speaker's EQ preset. The bare number means nothing to
+ * the user — anything unresolved is just "自定义音效".
+ */
+function eqSplitTag(state: State, receiverId: string, channelTag: "L" | "R" | null, q: number): string {
+  const fallback = "自定义音效";
+  const config = state.fullConfig;
+  if (!config) return fallback;
+  const receiver = config.receivers.find((r) => r.id === receiverId);
+  if (!receiver) return fallback;
+  let dids: string[] = [];
+  let baseOf: (did: string) => "" | "L" | "R" = () => "";
+  if (receiver.target_type === "group") {
+    const group = config.groups.find((g) => g.id === receiver.target_id);
+    if (!group) return fallback;
+    dids = group.speaker_ids;
+    baseOf = (did) => {
+      const ch = group.channels?.[did];
+      return ch === "right" ? "R" : ch === "left" ? "L" : "";
+    };
+  } else if (receiver.target_type === "speaker" && receiver.target_id) {
+    dids = [receiver.target_id];
+  } else if (receiver.target_type === "selected" && config.selected_device_id) {
+    dids = [config.selected_device_id];
+  }
+  const wantBase = channelTag ?? "";
+  const signatures: number[][] = [];
+  for (const did of dids) {
+    if (baseOf(did) !== wantBase) continue;
+    const eq = state.devices.find((d) => d.did === did)?.eq;
+    if (!eq?.enabled || !eq.bands.some((b) => b !== 0)) continue;
+    if (!signatures.some((sig) => sig.every((b, i) => Math.abs(b - (eq.bands[i] ?? 0)) < 0.01))) {
+      signatures.push([...eq.bands]);
+    }
+  }
+  const bands = signatures[q - 1];
+  if (!bands) return fallback;
+  const owner = dids
+    .map((did) => state.devices.find((d) => d.did === did))
+    .find((d) => d?.eq?.enabled && d.eq.bands.every((b, i) => Math.abs(b - (bands[i] ?? 0)) < 0.01));
+  const preset = owner?.eq?.preset;
+  return (preset && EQ_PRESET_LABELS[preset]) || "自定义音效";
+}
+
+let debugTargetKey = "";
+let debugTestSource: "builtin" | "upload" | "url" = "builtin";
+let activeTestSession = "";
+let debugTestBusy: "upload" | "start" | "stop" | "tts" | "" = "";
+
+function selectedTestDeviceIds(state: State, debug: DebugState | null): string[] {
+  const key = debugTargetKey || (debug?.selected_device_id ? `speaker:${debug.selected_device_id}` : "");
+  if (key.startsWith("group:")) {
+    return state.fullConfig?.groups.find((group) => group.id === key.slice(6))?.speaker_ids ?? [];
+  }
+  return key.startsWith("speaker:") ? [key.slice(8)] : [];
+}
+
+function formatDuration(seconds: number | null): string {
+  if (seconds === null) return "时长未知";
+  const rounded = Math.max(0, Math.round(seconds));
+  return `${Math.floor(rounded / 60)}:${String(rounded % 60).padStart(2, "0")}`;
+}
+
+export function renderConnectionChecks(debug: DebugState | null, state: State): string {
+  const raop = Object.values(debug?.diagnostics?.raop || {});
+  const streams = Object.values(debug?.diagnostics?.streams || {});
+  const sum = (values: number[]) => values.reduce((total, value) => total + value, 0);
+  const activeSessions = sum(raop.map((item) => item.active_sessions));
+  const streamClients = debug?.stream_clients ?? 0;
+  const transportErrors = sum(raop.map((item) => item.dropped_packets + item.decode_errors)) + sum(streams.map((item) => item.dropped_chunks));
+  const inputBufferMs = Math.max(0, ...raop.map((item) => item.input_buffer_ms || 0));
+  const streamLatency = Math.max(0, ...streams.filter((item) => item.clients > 0).map((item) => item.latency?.estimated_ms || 0));
+  const latencyMs = inputBufferMs + streamLatency;
+  const latencyLabel = activeSessions === 0
+    ? "等待音频"
+    : streamClients === 0
+      ? "等待音箱取流"
+      : `约 ${latencyMs} ms`;
+  const latencyState = streamClients === 0 ? "未测量" : latencyMs <= 500 ? "稳定" : latencyMs <= 1000 ? "较高" : "过高";
+  return `
+      <div class="cell">
+        <div class="cell-icon ${activeSessions > 0 ? "green" : "gray"}">${activeSessions > 0 ? "1" : "—"}</div>
+        <div class="cell-content">
+          <span class="cell-title">音频输入</span>
+          <span class="cell-subtitle">${activeSessions > 0 ? `${activeSessions} 个手机正在传输音频` : "目前没有手机传输音频"}</span>
+        </div>
+        <span class="plain-state ${activeSessions > 0 ? "success" : ""}">${activeSessions > 0 ? "已连接" : "等待播放"}</span>
+      </div>
+      <div class="cell">
+        <div class="cell-icon ${streamClients > 0 ? "green" : "gray"}">${streamClients > 0 ? "2" : "—"}</div>
+        <div class="cell-content">
+          <span class="cell-title">音箱输出</span>
+          <span class="cell-subtitle">${streamClients > 0 ? `${streamClients} 台音箱正在接收音频` : "当前没有音箱接收 MiCast 音频"}</span>
+        </div>
+        <span class="plain-state ${streamClients > 0 ? "success" : ""}">${streamClients > 0 ? "正在接收" : "未连接"}</span>
+      </div>
+      <div class="cell">
+        <div class="cell-icon ${transportErrors > 0 ? "red" : "green"}">${transportErrors > 0 ? "!" : "✓"}</div>
+        <div class="cell-content">
+          <span class="cell-title">音频传输质量</span>
+          <span class="cell-subtitle">${transportErrors > 0 ? `检测到 ${transportErrors} 个丢包、解码或流错误` : "暂未检测到丢包或解码错误"}</span>
+        </div>
+        <span class="plain-state ${transportErrors > 0 ? "error" : "success"}">${transportErrors > 0 ? "需要检查" : "正常"}</span>
+      </div>
+      <div class="cell">
+        <div class="cell-icon ${streamClients > 0 ? (latencyMs > 1000 ? "red" : "green") : "gray"}">${icon("clock")}</div>
+        <div class="cell-content">
+          <span class="cell-title">传输延迟 <small>估算</small></span>
+          <span class="cell-subtitle">${latencyLabel}</span>
+        </div>
+        <span class="plain-state ${streamClients > 0 && latencyMs <= 500 ? "success" : latencyMs > 1000 ? "error" : ""}">${latencyState}</span>
+      </div>`;
+}
+
+export function renderDebugPanel(state: State, debug: DebugState | null): string {
+  const raop = Object.values(debug?.diagnostics?.raop || {});
+  const sum = (values: number[]) => values.reduce((total, value) => total + value, 0);
+  const activeSessions = sum(raop.map((item) => item.active_sessions));
+  const selectedStream = findSelectedAirPlayStream(state, debug);
+  const selectedSessionActive = selectedStream
+    ? (debug?.diagnostics.raop[selectedStream.id]?.active_sessions || 0) > 0
+    : false;
+  return `
+    <div class="page-heading">
+      <h2 class="page-title">诊断</h2>
+      <p>查看连接与传输状态。测试工具会临时接管所选测试音箱，不属于日常播放控制。</p>
+    </div>
+
+    <div class="group-header">连接检查</div>
+    <div class="group diagnostic-overview" data-connection-checks>
+      ${renderConnectionChecks(debug, state)}
+    </div>
+
+    <div class="group-header">传输连接</div>
+    <div class="group" data-stream-list>
+      ${renderStreamRows(debug, state)}
+    </div>
+
+    <details class="diagnostic-details" open>
+      <summary><span><strong>技术计数</strong><small>传输、时钟与编码数据</small></span></summary>
+      <div class="technical-metrics">
+        <span>服务：${debug?.bridge_status.status || "-"}</span>
+        <span>AirPlay 会话：${activeSessions}</span>
+        <span>时钟响应：${sum(raop.map((item) => item.timing_responses))}/${sum(raop.map((item) => item.timing_requests))}</span>
+        <span>补包：${sum(raop.map((item) => item.resend_requests))}</span>
+        <span>已发送：${((debug?.stream_bytes_sent ?? 0) / 1024).toFixed(1)} KB</span>
+        <span>编码：${debug?.audio_config.format.toUpperCase() || "-"} · ${debug?.audio_config.bitrate || ""} · ${debug?.audio_config.sample_rate ? `${debug.audio_config.sample_rate / 1000} kHz` : "-"}</span>
+        <span>延迟：${latencyBreakdown(debug)}</span>
+      </div>
+    </details>
+
+    <div class="group-header">播放测试</div>
+    <div class="group diagnostic-workbench">
+      <div class="debug-warning"><strong>测试期间会暂时切换播放内容</strong><span>停止测试后，MiCast 会尝试恢复此前正在播放的内容。</span></div>
+      <label class="debug-target-row">
+        <span><strong>播放到</strong><small>可检查一台音箱，也可检查整个组合</small></span>
+        <select class="input" data-debug-target aria-label="测试目标" ${debug?.devices.length ? "" : "disabled"}>
+          ${debug === null ? `<option>正在加载音箱…</option>` : [
+            ...debug.devices.map((device) => `<option value="speaker:${escapeHtml(device.did)}" ${(debugTargetKey || `speaker:${debug.selected_device_id}`) === `speaker:${device.did}` ? "selected" : ""}>${escapeHtml(device.name)}</option>`),
+            ...(state.fullConfig?.groups ?? []).map((group) => `<option value="group:${escapeHtml(group.id)}" ${debugTargetKey === `group:${group.id}` ? "selected" : ""}>${escapeHtml(group.name)} · ${group.speaker_ids.length} 台音箱</option>`),
+          ].join("")}
+        </select>
+      </label>
+      <div class="test-source-tabs" role="radiogroup" aria-label="测试音频来源">
+        ${([['builtin', '内置节拍'], ['upload', '上传音频'], ['url', '音频地址']] as const).map(([value, label]) => `<label><input type="radio" name="debug-source" value="${value}" ${debugTestSource === value ? "checked" : ""}><span>${label}</span></label>`).join("")}
+      </div>
+      <div class="test-source-panel">
+        ${debugTestSource === "builtin" ? `<div><strong>内置节拍</strong><p>短促、清晰，适合确认音箱能否播放和多台音箱是否同步。</p></div>` : ""}
+        ${debugTestSource === "upload" ? `<div class="test-upload">
+          ${getTestMedia() ? `<div class="test-media-file"><div><strong>${escapeHtml(getTestMedia()!.name)}</strong><span>${formatDuration(getTestMedia()!.duration)} · ${(getTestMedia()!.size / 1048576).toFixed(1)} MB${getTestMedia()!.converted ? " · 已转换" : ""}</span></div><button class="button plain" type="button" data-remove-test-media>移除</button></div>` : `<label class="test-file-picker"><input type="file" accept=".mp3,.aac,.m4a,.flac,.wav,.ogg,.ape,audio/*" data-test-file><strong>${debugTestBusy === "upload" ? "正在处理音频…" : "选择音频文件"}</strong><span>MP3、AAC、M4A、FLAC、WAV、OGG 或 APE，最大 50 MB</span></label>`}
+        </div>` : ""}
+        ${debugTestSource === "url" ? `<label class="test-url-field"><span>音频地址</span><input type="url" data-debug-url placeholder="输入可直接访问的音频地址" class="input"></label>` : ""}
+      </div>
+      <div class="test-session-bar" aria-live="polite">
+        <div><strong>${activeTestSession ? "测试音频正在播放" : debugTestBusy ? "正在准备测试…" : "准备就绪"}</strong><span>${activeTestSession ? "可调整音箱音量，完成后停止并恢复" : "开始后会暂时接管所选目标"}</span></div>
+        <button class="button ${activeTestSession ? "secondary" : "primary"}" type="button" data-debug-test-action ${debugTestBusy || !selectedTestDeviceIds(state, debug).length ? "disabled" : ""}>${debugTestBusy === "start" ? "正在开始…" : debugTestBusy === "stop" ? "正在恢复…" : activeTestSession ? "停止并恢复" : "开始测试"}</button>
+      </div>
+      <div class="diagnostic-utilities">
+        <button class="diagnostic-test" id="btn-debug-tts" ${selectedTestDeviceIds(state, debug).length !== 1 ? "disabled" : ""}><strong>米家语音检查</strong><span>让单台音箱朗读“调试测试”，检查账号和指令响应</span></button>
+        <button class="diagnostic-test" id="btn-debug-play-stream" ${selectedStream ? "" : "disabled"}><strong>接回当前 AirPlay</strong><span>${selectedStream
+          ? selectedSessionActive ? `重新播放“${escapeHtml(selectedStream.name)}”当前收到的内容` : `“${escapeHtml(selectedStream.name)}”当前没有收到音频`
+          : "所选音箱没有对应的独立播放入口"}</span></button>
+      </div>
+      <label class="debug-volume volume-control test-volume-row">
+        <span><strong>音箱音量</strong><small>修改目标音箱的真实音量</small></span>
+        <input type="range" min="0" max="100" value="${state.devices.find(d => d.did === selectedTestDeviceIds(state, debug)[0])?.volume ?? 0}" id="debug-volume" ${selectedTestDeviceIds(state, debug).length ? "" : "disabled"} aria-label="测试音箱音量" style="--volume:${state.devices.find(d => d.did === selectedTestDeviceIds(state, debug)[0])?.volume ?? 0}%">
+        <output id="debug-volume-output">${state.devices.find(d => d.did === selectedTestDeviceIds(state, debug)[0])?.volume ?? "—"}</output>
+      </label>
+    </div>
+
+    <details class="diagnostic-details" open>
+      <summary><span><strong>运行记录</strong><small>查看最近的连接与播放情况</small></span></summary>
+      <section class="runtime-log-panel" aria-label="运行记录">
+      <div class="runtime-log-toolbar">
+        <div class="live-indicator"><span></span><strong>自动更新</strong></div>
+        <select class="log-filter" data-log-filter aria-label="日志范围">
+          <option value="micast">AirPlay 与 MiCast</option>
+          <option value="all">全部日志</option>
+          <option value="warning">仅警告与错误</option>
+        </select>
+        <button class="button plain log-action" type="button" data-log-pause>暂停</button>
+        <button class="button plain log-action" type="button" data-log-copy>复制</button>
+      </div>
+      <div class="runtime-log" role="log" aria-label="最新连接日志" data-runtime-log data-filter="micast">
+        ${renderRuntimeLogRows(debug, "micast")}
+      </div>
+      </section>
+    </details>
+
+  `;
+}
+
+export function renderStreamRows(debug: DebugState | null, state: State): string {
+  const streams = debug?.diagnostics?.streams || {};
+  const raop = debug?.diagnostics?.raop || {};
+  const ids = Object.keys(streams);
+  if (!ids.length) {
+    return `<div class="cell"><span class="cell-subtitle">暂无传输连接</span></div>`;
+  }
+  return ids
+    .map((id) => {
+      const s = streams[id];
+      // Stream ids carry suffixes: stereo channels "-L"/"-R" and per-EQ
+      // splits "-q1"… (topology.py: "<receiver>-Lq1"). Strip both, resolve
+      // the receiver's display name, then reattach human-readable tags.
+      let baseId = id;
+      const tags: string[] = [];
+      let channelTag: "L" | "R" | null = null;
+      const eqMatch = baseId.match(/-q(\d+)$/);
+      let eqTag: string | null = null;
+      if (eqMatch) {
+        baseId = baseId.slice(0, -eqMatch[0].length);
+        eqTag = eqMatch[1];
+      }
+      const channelMatch = baseId.match(/-(L|R)$/);
+      if (channelMatch) {
+        channelTag = channelMatch[1] as "L" | "R";
+        tags.unshift(channelTag === "L" ? "左" : "右");
+        baseId = baseId.slice(0, -2);
+      }
+      if (eqTag !== null) tags.push(eqSplitTag(state, baseId, channelTag, Number(eqTag)));
+      const baseName = state.status?.receivers.find((r) => r.did === baseId)?.name
+        || state.airplay2?.instances.find((r) => r.id === baseId)?.name
+        || baseId;
+      const name = tags.length ? `${baseName} · ${tags.join(" · ")}` : baseName;
+      const sessions = raop[id]?.active_sessions ?? raop[baseId]?.active_sessions ?? 0;
+      const mb = (s.bytes_sent / 1048576).toFixed(1);
+      const active = s.clients > 0;
+      const subtitle = active
+        ? `${s.clients} 台音箱取流中 · 已发 ${mb} MB${s.dropped_chunks ? ` · 丢弃 ${s.dropped_chunks}` : ""}`
+        : sessions > 0
+          ? `手机已连接，暂无音箱取流 · 已发 ${mb} MB`
+          : `空闲 · 已发 ${mb} MB`;
+      return `
+        <div class="cell">
+          <div class="cell-icon ${active ? "green" : "gray"}">${active ? "▶" : "—"}</div>
+          <div class="cell-content">
+            <span class="cell-title">${escapeHtml(name)}</span>
+            <span class="cell-subtitle">${subtitle}</span>
+          </div>
+          <button class="button plain" data-kick-stream="${escapeHtml(id)}" ${active || sessions > 0 ? "" : "disabled"}>断开</button>
+        </div>`;
+    })
+    .join("");
+}
+
+export function bindStreamKicks(container: HTMLElement, showToast: (msg: string) => void) {
+  container.querySelectorAll<HTMLElement>("[data-kick-stream]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.kickStream;
+      if (!id) return;
+      btn.setAttribute("disabled", "");
+      try {
+        const result = await api.kickStream(id);
+        showToast(`已断开 ${result.sender_sessions} 个手机会话，并停止目标音箱`);
+      } catch (e) {
+        btn.removeAttribute("disabled");
+        showToast(`断开失败: ${e instanceof Error ? e.message : "未知错误"}`);
+      }
+    });
+  });
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function latencyBreakdown(debug: DebugState | null): string {
+  const raop = Object.values(debug?.diagnostics?.raop || {});
+  const streams = Object.values(debug?.diagnostics?.streams || {});
+  const input = Math.max(0, ...raop.map((item) => item.input_buffer_ms || 0));
+  const active = streams.filter((item) => item.clients > 0);
+  if (!active.length) return "等待音箱取流";
+  const encoding = Math.max(0, ...active.map((item) => item.latency?.encoding_ms || 0));
+  const buffer = Math.max(0, ...active.map((item) => item.latency?.stream_buffer_ms || 0));
+  const queue = Math.max(0, ...active.map((item) => item.latency?.send_queue_ms || 0));
+  return `输入 ${input} ms · 编码 ${encoding} ms · 缓冲 ${buffer} ms · 队列 ${queue} ms`;
+}
+
+export function bindDebugPanel(container: HTMLElement, showToast: (msg: string) => void, rerender?: () => void) {
+  const log = container.querySelector<HTMLElement>("[data-runtime-log]");
+  const filter = container.querySelector<HTMLSelectElement>("[data-log-filter]");
+  const pause = container.querySelector<HTMLButtonElement>("[data-log-pause]");
+  const rerenderTestPanel = () => {
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    rerender?.();
+
+    const restoreTestAnchor = () => {
+      const appRoot = document.getElementById("app");
+      const scroller = document.querySelector<HTMLElement>(".app-body");
+      const anchor = document.querySelector<HTMLElement>(".diagnostic-workbench");
+      if (appRoot?.scrollTop) appRoot.scrollTop = 0;
+      if (!scroller || !anchor) return;
+      const headerBottom = document.querySelector<HTMLElement>(".app-header")?.getBoundingClientRect().bottom ?? 0;
+      const desiredTop = headerBottom + 16;
+      scroller.scrollTop += anchor.getBoundingClientRect().top - desiredTop;
+    };
+
+    restoreTestAnchor();
+    requestAnimationFrame(() => {
+      restoreTestAnchor();
+      requestAnimationFrame(restoreTestAnchor);
+    });
+  };
+  bindStreamKicks(container, showToast);
+  container.querySelector<HTMLSelectElement>("[data-debug-target]")?.addEventListener("change", (event) => {
+    debugTargetKey = (event.currentTarget as HTMLSelectElement).value;
+    rerenderTestPanel();
+  });
+  container.querySelectorAll<HTMLInputElement>('input[name="debug-source"]').forEach((input) => input.addEventListener("change", () => {
+    debugTestSource = input.value as typeof debugTestSource;
+    rerenderTestPanel();
+  }));
+  container.querySelector<HTMLInputElement>("[data-test-file]")?.addEventListener("change", async (event) => {
+    const file = (event.currentTarget as HTMLInputElement).files?.[0];
+    if (!file) return;
+    debugTestBusy = "upload";
+    rerenderTestPanel();
+    try {
+      const existing = getTestMedia();
+      if (existing) await api.deleteTestMedia(existing.token).catch(() => undefined);
+      const uploaded = await api.uploadTestMedia(file);
+      setTestMedia(uploaded);
+      showToast(`${uploaded.name} 已准备好`);
+    } catch (e) {
+      showToast(`上传失败: ${e instanceof Error ? e.message : "未知错误"}`);
+    } finally {
+      debugTestBusy = "";
+      rerenderTestPanel();
+    }
+  });
+  container.querySelector("[data-remove-test-media]")?.addEventListener("click", async () => {
+    const media = getTestMedia();
+    setTestMedia(null);
+    rerenderTestPanel();
+    if (media) await api.deleteTestMedia(media.token).catch(() => undefined);
+  });
+  container.querySelector("[data-debug-test-action]")?.addEventListener("click", async () => {
+    debugTestBusy = activeTestSession ? "stop" : "start";
+    rerenderTestPanel();
+    try {
+      if (activeTestSession) {
+        const session = activeTestSession;
+        activeTestSession = "";
+        const result = await api.stopDebugTest(session, true);
+        showToast(result.restored ? "测试已停止，原播放已恢复" : "测试已停止");
+      } else {
+        const state = store.get();
+        const devices = selectedTestDeviceIds(state, state.debug);
+        const url = container.querySelector<HTMLInputElement>("[data-debug-url]")?.value.trim();
+        const media = getTestMedia();
+        if (debugTestSource === "upload" && !media) throw new Error("请先上传测试音频");
+        if (debugTestSource === "url" && !url) throw new Error("请输入音频地址");
+        const result = await api.startDebugTest({
+          device_ids: devices,
+          source: debugTestSource,
+          ...(media ? { media_token: media.token } : {}),
+          ...(url ? { url } : {}),
+        });
+        activeTestSession = result.session_id;
+        showToast(`测试已发送到 ${result.members.length} 台音箱`);
+      }
+    } catch (e) {
+      showToast(`测试失败: ${e instanceof Error ? e.message : "未知错误"}`);
+    } finally {
+      debugTestBusy = "";
+      rerenderTestPanel();
+    }
+  });
+  filter?.addEventListener("change", () => {
+    if (!log) return;
+    log.dataset.filter = filter.value;
+    updateRuntimeLog(log, store.get().debug, filter.value);
+  });
+  pause?.addEventListener("click", () => {
+    if (!log || !pause) return;
+    const paused = log.dataset.paused !== "true";
+    log.dataset.paused = String(paused);
+    pause.textContent = paused ? "继续" : "暂停";
+    container.querySelector(".live-indicator")?.classList.toggle("paused", paused);
+  });
+  container.querySelector("[data-log-copy]")?.addEventListener("click", async () => {
+    const text = log?.innerText.trim() || "";
+    if (!text) return showToast("暂无日志可复制");
+    try { await navigator.clipboard.writeText(text); showToast("日志已复制"); }
+    catch { showToast("复制失败，请手动选择日志"); }
+  });
+  const ttsBtn = container.querySelector("#btn-debug-tts");
+  ttsBtn?.addEventListener("click", async () => {
+    const did = selectedTestDeviceIds(store.get(), store.get().debug)[0];
+    debugTestBusy = "tts";
+    rerenderTestPanel();
+    try {
+      await api.debugTTS("调试测试", did);
+      showToast("语音命令已发送，请确认音箱是否出声");
+    } catch (e) {
+      showToast(`TTS 失败: ${e instanceof Error ? e.message : "未知错误"}`);
+    } finally {
+      debugTestBusy = "";
+      rerenderTestPanel();
+    }
+  });
+
+  container.querySelector("#btn-debug-play-stream")?.addEventListener("click", async () => {
+    try {
+      const latestDebug = await api.getDebugState();
+      const selectedStream = findSelectedAirPlayStream(store.get(), latestDebug);
+      if (!selectedStream) {
+        showToast("所选音箱尚未添加到 AirPlay");
+        return;
+      }
+      await api.debugPlayUrl(selectedStream.url);
+      showToast(`已接回“${selectedStream.name}”`);
+    } catch (e) {
+      showToast(`播放失败: ${e instanceof Error ? e.message : "未知错误"}`);
+    }
+  });
+
+
+  const volume = container.querySelector<HTMLInputElement>("#debug-volume");
+  const volumeOutput = container.querySelector<HTMLOutputElement>("#debug-volume-output");
+  let volumeTimer: ReturnType<typeof setTimeout> | null = null;
+  volume?.addEventListener("input", () => {
+    const value = Number(volume.value);
+    volume.style.setProperty("--volume", `${value}%`);
+    if (volumeOutput) volumeOutput.value = String(value);
+    if (volumeTimer) clearTimeout(volumeTimer);
+    volumeTimer = setTimeout(async () => {
+      try {
+        const dids = selectedTestDeviceIds(store.get(), store.get().debug);
+        if (!dids.length) return;
+        await api.setVolume(value, dids);
+      }
+      catch (e) { showToast(`音量设置失败: ${e instanceof Error ? e.message : "未知错误"}`); }
+    }, 100);
+  });
+}
+
+function findSelectedAirPlayStream(state: State, debug: DebugState | null): { id: string; name: string; url: string } | null {
+  const selectedDid = selectedTestDeviceIds(state, debug)[0];
+  if (!selectedDid) return null;
+  const definition = state.fullConfig?.receivers.find(
+    (item) => item.enabled && item.target_type === "speaker" && item.target_id === selectedDid
+  );
+  if (!definition) return null;
+  const runtime = state.status?.receivers.find((item) => item.did === definition.id);
+  if (!runtime?.stream_url) return null;
+  return { id: definition.id, name: definition.name, url: runtime.stream_url };
+}
+
+export function renderRuntimeLogRows(debug: DebugState | null, filter: string): string {
+  const records = (debug?.logs || []).filter((item) => {
+    if (filter === "warning") return ["WARNING", "ERROR", "CRITICAL"].includes(item.level);
+    if (filter === "all") return true;
+    return item.logger.startsWith("micast") || ["WARNING", "ERROR", "CRITICAL"].includes(item.level);
+  }).reverse();
+  if (!records.length) return `<div class="empty-log">等待 AirPlay 连接事件…</div>`;
+  return records.map((item) => `<article class="runtime-log-row ${item.level.toLowerCase()}">
+    <div class="runtime-log-meta"><time>${escapeHtml(item.time)}</time><span>${escapeHtml(item.level)}</span><code>${escapeHtml(shortLogger(item.logger))}</code></div>
+    <p>${escapeHtml(item.message)}</p>
+  </article>`).join("");
+}
+
+function shortLogger(name: string): string {
+  return name.replace("micast.raop.server", "AirPlay").replace("micast.", "MiCast · ");
+}
+
+/**
+ * Re-render the log rows while preserving a deliberate reading position:
+ * pinned to the newest entry when the user is already at (or near) the bottom,
+ * untouched when they have scrolled up to read history. Call this instead of
+ * assigning innerHTML directly — the newest line lives at the end, so an
+ * unanchored replace reads as the list endlessly scrolling.
+ */
+export function updateRuntimeLog(log: HTMLElement, debug: DebugState | null, filter: string): void {
+  // Nested desktop logs don't self-scroll (max-height:none) — nothing to pin.
+  if (getComputedStyle(log).overflowY === "visible") {
+    log.innerHTML = renderRuntimeLogRows(debug, filter);
+    return;
+  }
+  const gap = log.scrollHeight - log.scrollTop - log.clientHeight;
+  const pinned = gap <= 48;
+  log.innerHTML = renderRuntimeLogRows(debug, filter);
+  if (pinned) log.scrollTop = log.scrollHeight;
+}

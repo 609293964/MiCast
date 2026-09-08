@@ -1,0 +1,13 @@
+* text=auto
+*.sh text eol=lf
+packaging/fnos/cmd/* text eol=lf
+packaging/fnos/manifest text eol=lf
+packaging/fnos/app/ui/config text eol=lf
+packaging/fnos/config/* text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.png binary
+*.ico binary
+*.zip binary
+*.so binary
+*.fpk binary

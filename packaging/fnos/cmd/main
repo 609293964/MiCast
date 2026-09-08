@@ -1,0 +1,139 @@
+#!/bin/bash
+set -u
+
+PID_FILE="${TRIM_PKGVAR}/micast.pid"
+LOG_FILE="${TRIM_PKGVAR}/micast.log"
+OLD_LOG_FILE="${TRIM_PKGVAR}/micast.log.1"
+SOCKET_FILE="${TRIM_APPDEST}/app.sock"
+PYTHON_BIN="/var/apps/python312/target/bin/python3"
+export PATH="/var/apps/python312/target/bin:$PATH"
+
+is_running() {
+  [ -f "$PID_FILE" ] || return 1
+  pid="$(cat "$PID_FILE" 2>/dev/null)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+rotate_log() {
+  [ -f "$LOG_FILE" ] || return 0
+  size="$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)"
+  if [ "${size:-0}" -ge 5242880 ]; then
+    rm -f "$OLD_LOG_FILE"
+    mv "$LOG_FILE" "$OLD_LOG_FILE"
+  fi
+}
+
+is_healthy() {
+  "$PYTHON_BIN" - "$SOCKET_FILE" <<'PY'
+import socket
+import sys
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(1)
+try:
+    sock.connect(sys.argv[1])
+    sock.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    response = sock.recv(256)
+finally:
+    sock.close()
+raise SystemExit(0 if b" 200 " in response else 1)
+PY
+}
+
+stop_airplay2_runtime() {
+  for pid_file in "${TRIM_PKGVAR}/shairport-sync.pid" "${TRIM_PKGVAR}/nqptp.pid"; do
+    [ -f "$pid_file" ] || continue
+    child_pid="$(cat "$pid_file" 2>/dev/null)"
+    case "$child_pid" in
+      ''|*[!0-9]*) rm -f "$pid_file"; continue ;;
+    esac
+    # A stale PID may have been reused. Only stop a process whose command line
+    # still points inside this application's private AirPlay 2 runtime.
+    if [ -r "/proc/$child_pid/cmdline" ] && tr '\0' ' ' < "/proc/$child_pid/cmdline" | grep -Fq "${TRIM_APPDEST}/airplay2-runtime"; then
+      kill "$child_pid" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+  done
+  # Recover from an interrupted stop. Scope the match to this app's private
+  # runtime so no system AirPlay service is touched.
+  for cmdline in /proc/[0-9]*/cmdline; do
+    [ -r "$cmdline" ] || continue
+    tr '\0' ' ' < "$cmdline" | grep -Fq "${TRIM_APPDEST}/airplay2-runtime" || continue
+    child_pid="${cmdline#/proc/}"
+    child_pid="${child_pid%/cmdline}"
+    [ "$child_pid" = "$$" ] || kill "$child_pid" 2>/dev/null || true
+  done
+}
+
+start_service() {
+  if is_running; then
+    return 0
+  fi
+  stop_airplay2_runtime
+  rm -f "$PID_FILE" "$SOCKET_FILE"
+  mkdir -p "$TRIM_PKGVAR"
+  chown "$TRIM_USERNAME" "$TRIM_PKGVAR"
+  export PYTHONPATH="${TRIM_APPDEST}/vendor:${TRIM_APPDEST}"
+  export MICAST_DATA_DIR="$TRIM_PKGVAR"
+  export MICAST_UNIX_SOCKET="$SOCKET_FILE"
+  export MICAST_DEPLOYMENT="fnos"
+  export MICAST_STREAM_PORT="${MICAST_STREAM_PORT:-8080}"
+  export PYTHON_BIN
+  runtime="${TRIM_APPDEST}/airplay2-runtime"
+  token_file="${TRIM_PKGVAR}/callback-token"
+  if [ ! -s "$token_file" ]; then
+    "$PYTHON_BIN" -c 'import secrets,sys; open(sys.argv[1], "w").write(secrets.token_urlsafe(32))' "$token_file"
+    chown "$TRIM_USERNAME" "$token_file"
+    chmod 0600 "$token_file"
+  fi
+  export MICAST_ORCHESTRATOR_TOKEN="$(cat "$token_file")"
+  export MICAST_AIRPLAY2_RUNTIME="$runtime"
+  export MICAST_AIRPLAY_ENGINE="local"
+  export MICAST_AIRPLAY_PROTOCOL="classic"
+  export MICAST_AIRPLAY2_MODE="single"
+  export MICAST_AIRPLAY2_PCM_SOURCE="local:${runtime}/run-shairport"
+  export MICAST_DEVICE_ID="airplay2"
+  export MICAST_AIRPLAY_NAME="MiCast"
+  cd "$TRIM_APPDEST" || return 1
+  rotate_log
+  nohup runuser -u "$TRIM_USERNAME" --preserve-environment -- \
+    "$PYTHON_BIN" -m micast >>"$LOG_FILE" 2>&1 &
+  echo $! > "$PID_FILE"
+  for _ in $(seq 1 300); do
+    if [ -S "$SOCKET_FILE" ] && is_healthy; then
+      return 0
+    fi
+    is_running || break
+    sleep 0.1
+  done
+  {
+    echo "MiCast 启动失败。"
+    echo "日志：${LOG_FILE}"
+    tail -n 30 "$LOG_FILE" 2>/dev/null || true
+  } > "$TRIM_TEMP_LOGFILE"
+  return 1
+}
+
+stop_service() {
+  if ! is_running; then
+    stop_airplay2_runtime
+    rm -f "$PID_FILE" "$SOCKET_FILE"
+    return 0
+  fi
+  pid="$(cat "$PID_FILE")"
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  stop_airplay2_runtime
+  rm -f "$PID_FILE" "$SOCKET_FILE"
+}
+
+case "${1:-}" in
+  start) start_service ;;
+  stop) stop_service ;;
+  status) is_running && exit 0 || exit 3 ;;
+  *) exit 1 ;;
+esac

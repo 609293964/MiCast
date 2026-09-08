@@ -1,0 +1,782 @@
+"""HTTP audio stream server supporting multiple named streams on one port."""
+
+import asyncio
+import contextlib
+import logging
+import time
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from uvicorn import Config, Server
+
+from micast.audio_encoder import MediaProxyPump, StreamFormat, mp3_silence, wav_header
+from micast.config import settings
+from micast.test_tone import test_tone_wav
+
+logger = logging.getLogger(__name__)
+
+PACED_CHUNK_BYTES = 1024
+# Hard ceiling on a client's delay line. Producer (sender clock) and consumer
+# (speaker clock) always drift a little; a speaker that trails accumulates
+# backlog without bound until its queue overflows. Capping the lag skips it to
+# live once instead of kicking the connection — a kick reconnects and refills
+# on a fixed period, turning one drift event into a permanent rhythmic stutter.
+CLIENT_MAX_LAG_SECONDS = 4.0
+# A Xiaomi pull player abandons an HTTP response that stays silent for ~2s;
+# keepalive yields must stay well under that.
+CLIENT_KEEPALIVE_SECONDS = 1.0
+# First bytes of an encoder run are cached and replayed to late-joining
+# clients: WAV/FLAC decoders need the stream header, MP3 just skips it.
+STREAM_PREFIX_BYTES = 16384
+
+_MEDIA_UA = (
+    "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Mobile Safari/537.36"
+)
+
+
+def _mp3_aligned_drop(buffer: bytearray, requested: int) -> int:
+    """Find the next plausible MP3 frame boundary after a live delay cut."""
+    start = max(0, min(len(buffer), requested))
+    stop = min(len(buffer) - 1, start + 4096)
+    for index in range(start, stop):
+        first, second = buffer[index], buffer[index + 1]
+        if first != 0xFF or second & 0xE0 != 0xE0:
+            continue
+        if second & 0x18 == 0x08 or second & 0x06 == 0:
+            continue
+        return index
+    return start
+
+
+async def _serve_seekable_media(url: str, ss: float, volume_provider=None) -> StreamingResponse:
+    """In-process transcode of a remote URL streamed back as MP3. Seeking the
+    input container is fast when the origin supports Range requests (music
+    CDNs do)."""
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="invalid url")
+    pump = MediaProxyPump(url, ss, _MEDIA_UA, volume_provider).start()
+
+    async def generator():
+        try:
+            while True:
+                chunk = await pump.read()
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            pump.abort()
+
+    return StreamingResponse(generator(), media_type="audio/mpeg")
+
+
+
+class StreamServer:
+    """Broadcast multiple audio streams to HTTP clients on /stream/{device_id}."""
+
+    def __init__(self):
+        self._streams: dict[str, StreamFormat] = {}
+        self._clients: dict[str, set[asyncio.Queue[bytes | None]]] = {}
+        self._client_delay: dict[asyncio.Queue, dict[str, int | str | None]] = {}
+        self._prefixes: dict[str, bytearray] = {}
+        self._app = FastAPI()
+        self._server: Server | None = None
+        self._task: asyncio.Task | None = None
+        self.total_bytes_sent: dict[str, int] = {}
+        self.dropped_chunks: dict[str, int] = {}
+        self._last_broadcast: dict[str, float] = {}
+        self._calibration_sessions: dict[str, dict] = {}
+        self._diagnostic_media: dict[str, tuple[Path, str]] = {}
+        # One-shot rendezvous used when a grouped speaker disconnects while
+        # its AirPlay session is still live. New HTTP clients wait here until
+        # every group member has arrived, then start on the same future chunk.
+        self._group_recoveries: dict[str, dict[str, Any]] = {}
+        self.on_client_disconnected: Callable[[str, str], Awaitable[None]] | None = None
+        self.media_volume = None
+        self._setup_routes()
+
+    def _setup_routes(self) -> None:
+        @self._app.get("/stream/{device_id}/for/{receiver_id}/{sink}")
+        async def stream_for_sink(
+            request: Request, device_id: str, receiver_id: str, sink: str
+        ):
+            # Xiaomi players may discard a URL's query string before pulling
+            # it. Keep routing identity in the path so per-speaker delay still
+            # survives the cloud/player hand-off.
+            return await self._serve_stream(request, device_id, receiver_id, sink)
+
+        @self._app.get("/stream/{device_id}")
+        async def stream(request: Request, device_id: str):
+            return await self._serve_stream(request, device_id)
+
+        @self._app.get("/stream/{device_id}.{ext}")
+        async def stream_ext(request: Request, device_id: str, ext: str):
+            return await self._serve_stream(request, device_id)
+
+        @self._app.get("/calibration/{token}/{sink}.wav")
+        async def calibration_tone(token: str, sink: str):
+            """Finite local tone on the speaker-facing, known-reachable port.
+
+            Identity lives in the path because Xiaomi players may remove the
+            query string before fetching a cloud-issued URL.
+            """
+            session = self._calibration_sessions.get(token)
+            if session is None or sink not in session["expected"]:
+                raise HTTPException(status_code=404, detail="Calibration ended")
+            if session is not None and sink in session["expected"]:
+                session["arrivals"].setdefault(sink, time.monotonic())
+                if session["expected"].issubset(session["arrivals"]):
+                    session["start_at"] = time.monotonic() + 0.3
+                    session["ready"].set()
+                logger.info(
+                    "Calibration %s connected: %s (%d/%d)",
+                    token,
+                    sink,
+                    len(session["arrivals"]),
+                    len(session["expected"]),
+                )
+
+            if not session.get("group_id"):
+                return Response(
+                    test_tone_wav(),
+                    media_type="audio/wav",
+                    headers={"Cache-Control": "no-store"},
+                )
+
+            async def tone_stream():
+                duration_seconds = 600
+                data_bytes = 44100 * 4 * duration_seconds
+                yield wav_header(44100, data_bytes=data_bytes)
+                pcm = session.get("pcm") or test_tone_wav()[44:]
+                # Xiaomi speakers consume HTTP audio in comparatively large
+                # bursts. 20 ms writes left no scheduling margin on Windows and
+                # produced audible starvation, so keep a modest 200 ms cadence.
+                chunk_seconds = 0.2
+                chunk_bytes = int(44100 * 4 * chunk_seconds)
+                position = 0
+                applied_hold = 0
+                primed = False
+                sent = 0
+                while not session["stopped"].is_set() and sent < data_bytes:
+                    # Send valid audio immediately. Some players do not open a
+                    # second URL while the first response is waiting for data,
+                    # so an all-clients barrier here can deadlock calibration.
+                    start_at = session.get("start_at")
+                    if start_at is None or time.monotonic() < start_at:
+                        chunk = bytes(min(chunk_bytes, data_bytes - sent))
+                        sent += len(chunk)
+                        yield chunk
+                        await asyncio.sleep(chunk_seconds)
+                        continue
+                    if not primed:
+                        # One second of queued material absorbs normal event-loop
+                        # and Wi-Fi jitter without building an ever-growing lag.
+                        primed = True
+                        for _ in range(5):
+                            if sent >= data_bytes:
+                                break
+                            end = position + chunk_bytes
+                            chunk = pcm[position:end]
+                            if len(chunk) < chunk_bytes:
+                                chunk += pcm[: chunk_bytes - len(chunk)]
+                            position = end % len(pcm)
+                            chunk = chunk[: data_bytes - sent]
+                            sent += len(chunk)
+                            yield chunk
+                    group = next(
+                        (item for item in settings.groups if item.id == session.get("group_id")),
+                        None,
+                    )
+                    hold = group.delay_holds().get(sink, 0) if group else 0
+                    if hold > applied_hold:
+                        await asyncio.sleep((hold - applied_hold) / 1000)
+                    elif hold < applied_hold:
+                        position = (position + int((applied_hold - hold) * 176.4)) % len(pcm)
+                    applied_hold = hold
+                    end = position + chunk_bytes
+                    chunk = pcm[position:end]
+                    if len(chunk) < chunk_bytes:
+                        chunk += pcm[: chunk_bytes - len(chunk)]
+                    position = end % len(pcm)
+                    chunk = chunk[: data_bytes - sent]
+                    sent += len(chunk)
+                    yield chunk
+                    await asyncio.sleep(chunk_seconds)
+
+            return StreamingResponse(
+                tone_stream(),
+                media_type="audio/wav",
+                headers={
+                    "Cache-Control": "no-store",
+                    "Content-Length": str(44 + 44100 * 4 * 600),
+                },
+            )
+
+        @self._app.get("/dlna-media")
+        async def dlna_media(url: str, ss: float = 0.0, receiver: str = "", session: str = ""):
+            """Transcode proxy for DLNA casting: lets speakers play remote media
+            from an arbitrary position (DLNA Seek) — the input container is
+            seeked directly and re-encoded to MP3. `ss` is seconds."""
+            provider = (
+                (lambda: self.media_volume(receiver, session))
+                if receiver and self.media_volume
+                else None
+            )
+            return await _serve_seekable_media(url, max(0.0, ss), provider)
+
+        @self._app.get("/diagnostic/builtin.wav")
+        async def diagnostic_builtin():
+            """Finite built-in test tone on the universal speaker-facing port."""
+            return Response(
+                test_tone_wav(),
+                media_type="audio/wav",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @self._app.get("/diagnostic/media/{token}")
+        async def diagnostic_upload(token: str):
+            media = self._diagnostic_media.get(token)
+            if media is None or not media[0].is_file():
+                raise HTTPException(status_code=404, detail="Diagnostic media expired")
+            return FileResponse(
+                media[0],
+                media_type=media[1],
+                headers={"Cache-Control": "no-store"},
+            )
+
+    def register_stream(self, device_id: str, stream_format: StreamFormat) -> None:
+        """Register a new stream endpoint."""
+        self._streams[device_id] = stream_format
+        self._clients.setdefault(device_id, set())
+        self._prefixes[device_id] = bytearray()
+        self.total_bytes_sent.setdefault(device_id, 0)
+        self.dropped_chunks.setdefault(device_id, 0)
+        logger.info("Registered stream /stream/%s (%s)", device_id, stream_format.content_type)
+
+    def register_diagnostic_media(self, token: str, path: Path, media_type: str) -> None:
+        """Expose uploaded diagnostic audio on the same port as live streams."""
+        self._diagnostic_media[token] = (path, media_type)
+
+    def unregister_diagnostic_media(self, token: str) -> None:
+        self._diagnostic_media.pop(token, None)
+
+    def unregister_stream(self, device_id: str) -> None:
+        """Remove a stream endpoint and disconnect clients."""
+        self._broadcast_to(device_id, None)
+        self._streams.pop(device_id, None)
+        self._clients.pop(device_id, None)
+        self._prefixes.pop(device_id, None)
+        self.total_bytes_sent.pop(device_id, None)
+        self.dropped_chunks.pop(device_id, None)
+
+    def stream_ids(self) -> list[str]:
+        return list(self._streams.keys())
+
+    def client_count(self, device_id: str) -> int:
+        return len(self._clients.get(device_id, set()))
+
+    def total_clients(self) -> int:
+        return sum(len(clients) for clients in self._clients.values())
+
+    def sink_connected(self, receiver_id: str, sink: str) -> bool:
+        """Whether a current HTTP client already serves this grouped sink."""
+        return any(
+            state.get("receiver") == receiver_id and state.get("sink") == sink
+            for queue, state in self._client_delay.items()
+            if any(queue in clients for clients in self._clients.values())
+        )
+
+    def total_bytes(self) -> int:
+        return sum(self.total_bytes_sent.values())
+
+    def latency_metrics(self, device_id: str) -> dict[str, int | None]:
+        """Estimate buffering between the encoder output and HTTP clients."""
+        stream_format = self._streams.get(device_id)
+        clients = self._clients.get(device_id, set())
+        byte_rate = stream_format.byte_rate if stream_format else None
+        queued_bytes = 0
+        for queue in clients:
+            queued_bytes = max(
+                queued_bytes,
+                sum(len(chunk) for chunk in queue._queue if isinstance(chunk, bytes)),
+            )
+        send_queue_ms = round(queued_bytes / byte_rate * 1000) if byte_rate else 0
+        delay_states = [
+            self._client_delay.get(queue, {})
+            for queue in clients
+        ]
+        target_delay_ms = max(
+            (int(item.get("target_ms") or 0) for item in delay_states),
+            default=0,
+        )
+        retained_buffer_ms = max(
+            (int(item.get("buffer_ms") or 0) for item in delay_states),
+            default=0,
+        )
+        stream_buffer_ms = round(settings.stream_buffer_seconds * 1000)
+        encoding_ms = _encoding_frame_ms()
+        return {
+            "encoding_ms": encoding_ms,
+            "stream_buffer_ms": stream_buffer_ms,
+            "send_queue_ms": send_queue_ms,
+            "target_delay_ms": target_delay_ms,
+            "retained_buffer_ms": retained_buffer_ms,
+            "estimated_ms": encoding_ms + stream_buffer_ms + send_queue_ms,
+        }
+
+    async def _serve_stream(
+        self,
+        request: Request,
+        device_id: str,
+        receiver_id: str | None = None,
+        sink: str | None = None,
+    ) -> StreamingResponse:
+        stream_format = self._streams.get(device_id)
+        if stream_format is None:
+            raise HTTPException(status_code=404, detail="Stream not found")
+
+        sink = sink or request.query_params.get("sink") or None
+        receiver_id = receiver_id or request.query_params.get("receiver") or None
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=256)
+        self._clients.setdefault(device_id, set()).add(queue)
+        self._client_delay[queue] = {
+            "receiver": receiver_id,
+            "sink": sink,
+            "manual_ms": 0,
+            "startup_ms": 0,
+            "target_ms": 0,
+            "buffer_ms": 0,
+            "ready_at": None,
+            "calibrated": False,
+            "skip_ms": 0,
+            "intentional_close": False,
+            # Drift counters: how often this client was skipped to live
+            # (lag_drops/queue_drops) or needed injected silence (underruns).
+            "lag_drops": 0,
+            "queue_drops": 0,
+            "silence_fills": 0,
+        }
+        recovery = self._group_recoveries.get(receiver_id) if receiver_id else None
+        recovery_event: asyncio.Event | None = None
+        if recovery is not None and sink in recovery["expected"]:
+            recovery["clients"][sink] = queue
+            recovery_event = recovery["event"]
+            if recovery["expected"].issubset(recovery["clients"]):
+                # Drop everything accumulated while waiting. All clients will
+                # consume only chunks broadcast after this common boundary.
+                for waiting in recovery["clients"].values():
+                    while not waiting.empty():
+                        with contextlib.suppress(asyncio.QueueEmpty):
+                            waiting.get_nowait()
+                recovery_event.set()
+                self._group_recoveries.pop(receiver_id, None)
+                logger.info("Group stream recovery ready for %s", receiver_id)
+        logger.info(
+            "Stream client connected to /stream/%s (receiver=%s, sink=%s): %s",
+            device_id,
+            receiver_id,
+            sink,
+            request.client,
+        )
+
+        async def generator():
+            if recovery_event is not None:
+                try:
+                    await asyncio.wait_for(recovery_event.wait(), timeout=8.0)
+                except TimeoutError:
+                    logger.warning("Group stream recovery timed out for %s", receiver_id)
+                    self.abort_group_recovery(receiver_id)
+            stream_format = self._streams.get(device_id)
+            # MP3 is self-synchronising. Replaying the encoder's first 16 KiB
+            # on every reconnect injects old programme audio before the live
+            # edge and permanently offsets independently reconnecting members.
+            prefix = (
+                None
+                if stream_format and stream_format.content_type == "audio/mpeg"
+                else self._prefixes.get(device_id)
+            )
+            if prefix:
+                yield bytes(prefix)
+            buffer = bytearray()
+            # One frame of encoded silence (~20ms) for true-underrun keepalive.
+            # seconds=0 still produces one frame plus the encoder flush.
+            silence = (
+                mp3_silence(settings.audio.sample_rate, settings.audio.bitrate, 0)
+                if stream_format and stream_format.content_type == "audio/mpeg"
+                else b""
+            )
+            byte_rate = stream_format.byte_rate
+            buffer_seconds = settings.stream_buffer_seconds
+            initial_buffer = int(byte_rate * buffer_seconds) if byte_rate else 0
+            # Delay alignment: extra bytes held back per client so this speaker
+            # trails its siblings. Re-read live each chunk — a smaller value
+            # drops the staged excess (pull earlier), a larger one stages more.
+            hold_bytes = 0
+            hold_ms = 0
+            last_yield_at = time.monotonic()
+            try:
+                while True:
+                    chunk = await queue.get()
+                    if chunk is None:
+                        break
+                    if not byte_rate:
+                        yield chunk
+                        continue
+
+                    buffer.extend(chunk)
+
+                    manual_ms = (
+                        settings.sink_hold_ms(receiver_id, sink)
+                        if receiver_id and sink
+                        else 0
+                    )
+                    state = self._client_delay.get(queue)
+                    if state is not None:
+                        state["manual_ms"] = manual_ms
+                    startup_ms = int(state.get("startup_ms") or 0) if state else 0
+                    hold_ms = max(0, manual_ms + startup_ms)
+                    new_hold = int(byte_rate * hold_ms / 1000) if byte_rate else 0
+                    skip_ms = int(state.get("skip_ms") or 0) if state else 0
+                    if skip_ms:
+                        skip_bytes = min(len(buffer), int(byte_rate * skip_ms / 1000))
+                        if skip_bytes:
+                            del buffer[:skip_bytes]
+                        state["skip_ms"] = 0
+                    if new_hold != hold_bytes:
+                        if new_hold < hold_bytes:
+                            # Pull earlier: discard the staged excess from the
+                            # head (oldest content) so the client skips to live.
+                            drop = min(len(buffer), hold_bytes - new_hold)
+                            if stream_format.content_type == "audio/mpeg":
+                                drop = _mp3_aligned_drop(buffer, drop)
+                            if drop:
+                                del buffer[:drop]
+                        elif state is not None:
+                            # Hold grew mid-stream: the reserve must be re-filled
+                            # byte-by-byte from here on. Mark it so the keepalive
+                            # branch below feeds silence instead of draining the
+                            # real audio that is supposed to accumulate.
+                            state["needs_fill"] = True
+                        hold_bytes = new_hold
+
+                    # The encoder already produces data in real time. Treat
+                    # this buffer as a delay line and release only the bytes
+                    # above its permanent reserve. A second wall-clock pacer
+                    # based on nominal MP3 bitrate slowly accumulated several
+                    # seconds of queue and eventually caused periodic drops.
+                    reserve = initial_buffer + hold_bytes
+
+                    # Drift ceiling: a speaker whose clock trails the encoder
+                    # would backlog without bound (eventually overflowing its
+                    # queue). Skip the excess to live instead — one small skip
+                    # beats a permanent disconnect/reconnect rhythm.
+                    ceiling = reserve + int(byte_rate * CLIENT_MAX_LAG_SECONDS)
+                    if len(buffer) > ceiling:
+                        skipped = len(buffer) - ceiling
+                        del buffer[:skipped]
+                        if state is not None:
+                            state["lag_drops"] = int(state.get("lag_drops") or 0) + 1
+                            if state["lag_drops"] == 1 or state["lag_drops"] % 20 == 0:
+                                logger.info(
+                                    "Client %s on /stream/%s lagged %.1fs behind; "
+                                    "skipped to live (%d times)",
+                                    request.client,
+                                    device_id,
+                                    skipped / byte_rate,
+                                    state["lag_drops"],
+                                )
+
+                    if len(buffer) <= reserve:
+                        now = time.monotonic()
+                        if (
+                            state is not None
+                            and state.get("ready_at") is None
+                            and silence
+                        ):
+                            # Startup fill: the speaker just connected and the
+                            # delay line has never reached its reserve. Feed a
+                            # frame of silence per incoming chunk so the player
+                            # doesn't abandon the response while it fills.
+                            yield bytes(silence)
+                            last_yield_at = now
+                        elif (
+                            state is not None
+                            and state.get("needs_fill")
+                            and silence
+                        ):
+                            # Delay increase in progress: hold the real bytes so
+                            # the reserve grows, and keep the player alive with
+                            # frame-aligned silence — same trick as startup fill.
+                            # Draining real audio here would keep the speaker
+                            # live and the configured delay would never apply.
+                            yield bytes(silence)
+                            last_yield_at = now
+                        elif buffer and now - last_yield_at >= CLIENT_KEEPALIVE_SECONDS:
+                            # Keepalive with real audio: releasing below the
+                            # reserve beats injecting a dropout. The delay line
+                            # refills by itself once flow normalises.
+                            yield bytes(buffer)
+                            buffer.clear()
+                            last_yield_at = now
+                            if state is not None and state.get("ready_at") is None:
+                                # Real bytes flowed: this connection is out of
+                                # its startup fill phase for good.
+                                state["ready_at"] = now
+                        elif not buffer and silence:
+                            # True underrun: a single frame-aligned slice of
+                            # silence keeps the player from abandoning the
+                            # response until real bytes arrive. Never loop
+                            # mid-frame — byte-offset slices decode as clicks.
+                            yield bytes(silence)
+                            last_yield_at = now
+                            if state is not None:
+                                state["silence_fills"] = (
+                                    int(state.get("silence_fills") or 0) + 1
+                                )
+                                if state["silence_fills"] in (1, 20, 100):
+                                    logger.info(
+                                        "Client %s on /stream/%s underran; injected "
+                                        "silence (%d times)",
+                                        request.client,
+                                        device_id,
+                                        state["silence_fills"],
+                                    )
+                    if state is not None:
+                        state["target_ms"] = hold_ms
+                        state["buffer_ms"] = round(len(buffer) / byte_rate * 1000)
+                        if len(buffer) >= reserve:
+                            state["needs_fill"] = None
+                        if state.get("ready_at") is None and len(buffer) >= reserve:
+                            state["ready_at"] = time.monotonic()
+                    while len(buffer) - reserve >= PACED_CHUNK_BYTES:
+                        payload = bytes(buffer[:PACED_CHUNK_BYTES])
+                        del buffer[:PACED_CHUNK_BYTES]
+                        yield payload
+                        last_yield_at = time.monotonic()
+                    if state is not None:
+                        state["buffer_ms"] = round(len(buffer) / byte_rate * 1000)
+
+                if buffer:
+                    yield bytes(buffer)
+            finally:
+                self._clients.get(device_id, set()).discard(queue)
+                state = self._client_delay.pop(queue, None) or {}
+                waiting = self._group_recoveries.get(receiver_id) if receiver_id else None
+                if waiting is not None and sink and waiting["clients"].get(sink) is queue:
+                    waiting["clients"].pop(sink, None)
+                logger.info(
+                    "Stream client disconnected from /stream/%s: %s",
+                    device_id,
+                    request.client,
+                )
+                if (
+                    receiver_id
+                    and sink
+                    and not state.get("intentional_close")
+                    and self.on_client_disconnected is not None
+                ):
+                    await self.on_client_disconnected(receiver_id, sink)
+
+        return StreamingResponse(
+            generator(),
+            media_type=stream_format.content_type,
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
+
+    def clear_startup_sync(self, receiver_id: str) -> None:
+        """Remove the retired hidden startup correction from live clients.
+
+        Delay is now represented by the group's single persisted value.  The
+        old readiness comparison mixed independent encoder/HTTP start times
+        and could manufacture multi-second corrections, so it must never be
+        applied automatically during ordinary playback.
+        """
+        for state in self._client_delay.values():
+            if state.get("receiver") != receiver_id:
+                continue
+            state["startup_ms"] = 0
+            state["skip_ms"] = 0
+            state["calibrated"] = True
+
+    def begin_delay_calibration(
+        self,
+        token: str,
+        sinks: list[str],
+        group_id: str | None = None,
+        pcm: bytes | None = None,
+    ) -> dict:
+        session = {
+            "expected": set(sinks),
+            "arrivals": {},
+            "ready": asyncio.Event(),
+            "stopped": asyncio.Event(),
+            "group_id": group_id,
+            "start_at": None,
+            "pcm": pcm,
+        }
+        self._calibration_sessions[token] = session
+        return session
+
+    def end_delay_calibration(self, token: str) -> None:
+        session = self._calibration_sessions.pop(token, None)
+        if session is not None:
+            session["stopped"].set()
+
+    def sink_latency_metrics(self) -> dict[str, dict[str, dict[str, int]]]:
+        """Current per-speaker delay values for status/UI surfaces."""
+        result: dict[str, dict[str, dict[str, int]]] = {}
+        for state in self._client_delay.values():
+            receiver = str(state.get("receiver") or "")
+            sink = str(state.get("sink") or "")
+            if not receiver or not sink:
+                continue
+            result.setdefault(receiver, {})[sink] = {
+                "manual_ms": int(state.get("manual_ms") or 0),
+                "startup_ms": int(state.get("startup_ms") or 0),
+                "effective_ms": int(state.get("target_ms") or 0),
+                "buffer_ms": int(state.get("buffer_ms") or 0),
+                "silence_fills": int(state.get("silence_fills") or 0),
+                "lag_drops": int(state.get("lag_drops") or 0),
+                "queue_drops": int(state.get("queue_drops") or 0),
+            }
+        return result
+
+    async def start(self) -> None:
+        config = Config(
+            self._app, host=settings.host, port=settings.stream_port, log_level="warning"
+        )
+        self._server = Server(config)
+        self._task = asyncio.create_task(self._serve())
+        logger.info(
+            "Stream server started on http://%s:%s/stream/{device_id}",
+            settings.host,
+            settings.stream_port,
+        )
+
+    async def _serve(self) -> None:
+        """Run uvicorn, containing bind failures instead of killing the process.
+
+        uvicorn calls sys.exit() when startup fails (e.g. port still held by a
+        previous instance mid-restart); as a BaseException it would tear down
+        the whole event loop. Retry briefly, then give up gracefully.
+        """
+        for attempt in range(5):
+            try:
+                await self._server.serve()
+                return
+            except SystemExit:
+                logger.error(
+                    "Stream server failed to bind port %s (attempt %s/5)",
+                    settings.stream_port,
+                    attempt + 1,
+                )
+                if self._server.should_exit or attempt == 4:
+                    return
+                await asyncio.sleep(1)
+                self._server = Server(self._server.config)
+
+    async def stop(self) -> None:
+        for device_id in list(self._streams.keys()):
+            self.unregister_stream(device_id)
+        if self._server:
+            self._server.should_exit = True
+            if self._task and not self._task.done():
+                await self._task
+
+    def kick_clients(self, device_id: str) -> int:
+        """Close all client connections of a stream; returns how many were kicked."""
+        clients = self._clients.get(device_id, set())
+        count = len(clients)
+        if count:
+            logger.info("Kicking %d client(s) from /stream/%s", count, device_id)
+            for queue in clients:
+                state = self._client_delay.get(queue)
+                if state is not None:
+                    state["intentional_close"] = True
+            self._broadcast_to(device_id, None)
+        return count
+
+    def begin_group_recovery(self, receiver_id: str, sinks: list[str]) -> None:
+        """Hold replacement clients until every grouped sink has connected."""
+        previous = self._group_recoveries.pop(receiver_id, None)
+        if previous is not None:
+            previous["event"].set()
+        self._group_recoveries[receiver_id] = {
+            "expected": set(sinks),
+            "clients": {},
+            "event": asyncio.Event(),
+        }
+        logger.info("Group stream recovery waiting for %s: %s", receiver_id, sinks)
+
+    def abort_group_recovery(self, receiver_id: str) -> None:
+        recovery = self._group_recoveries.pop(receiver_id, None)
+        if recovery is not None:
+            recovery["event"].set()
+
+    async def broadcast(self, device_id: str, chunk: bytes | None) -> None:
+        """Send a chunk to all connected clients for a stream."""
+        if chunk:
+            self.total_bytes_sent[device_id] = self.total_bytes_sent.get(device_id, 0) + len(chunk)
+            self._last_broadcast[device_id] = time.monotonic()
+            prefix = self._prefixes.get(device_id)
+            if prefix is not None and len(prefix) < STREAM_PREFIX_BYTES:
+                prefix.extend(chunk[: STREAM_PREFIX_BYTES - len(prefix)])
+        self._broadcast_to(device_id, chunk)
+
+    def is_flowing(self, device_id: str, window: float = 3.0) -> bool:
+        """True only while bytes actually move: a paused speaker can hold the
+        HTTP connection open indefinitely, so client count alone lies."""
+        if not self._clients.get(device_id):
+            return False
+        last = self._last_broadcast.get(device_id, 0.0)
+        return (time.monotonic() - last) < window
+
+    def _broadcast_to(self, device_id: str, chunk: bytes | None) -> None:
+        clients = self._clients.get(device_id)
+        if not clients:
+            return
+        dead: set[asyncio.Queue] = set()
+        for queue in clients:
+            try:
+                queue.put_nowait(chunk)
+            except asyncio.QueueFull:
+                self.dropped_chunks[device_id] = self.dropped_chunks.get(device_id, 0) + 1
+                # Slow consumer: drop its oldest queued chunk so it skips to
+                # live. Kicking the connection (the old behaviour) makes the
+                # speaker reconnect and refill on a fixed period — one clock
+                # drift event becomes a permanent rhythmic stutter.
+                try:
+                    queue.get_nowait()
+                    queue.put_nowait(chunk)
+                    state = self._client_delay.get(queue)
+                    if state is not None:
+                        state["queue_drops"] = int(state.get("queue_drops") or 0) + 1
+                        if state["queue_drops"] in (1, 20, 100):
+                            logger.info(
+                                "Client queue for /stream/%s overflowed; dropped "
+                                "oldest chunk (%d times)",
+                                device_id,
+                                state["queue_drops"],
+                            )
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    dead.add(queue)
+        for queue in dead:
+            clients.discard(queue)
+            with contextlib.suppress(Exception):
+                queue.put_nowait(None)
+
+
+def _encoding_frame_ms() -> int:
+    if not settings.audio.auto_transcode or settings.audio.format == "wav":
+        return 0
+    if settings.audio.format == "mp3":
+        return round(1152 / settings.audio.sample_rate * 1000)
+    # FLAC block sizes vary; one short block is a useful conservative estimate.
+    return 20

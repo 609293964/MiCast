@@ -1,0 +1,101 @@
+from micast.config import ReceiverConfig, SpeakerGroupConfig, settings
+from micast.dlna import DlnaService
+from micast.routes.dlna import _dispatch
+
+
+class FakeDeviceManager:
+    def __init__(self):
+        self.calls = []
+        self._owners = {}
+
+    async def play_stream(self, did, url, owner=None, force=False):
+        self.calls.append(("play", did, url, owner, force))
+        if owner is not None:
+            self._owners[did] = owner
+        return True
+
+    async def stop(self, did, owner=None):
+        self.calls.append(("pause", did, owner))
+
+    async def stop_playback(self, did):
+        self.calls.append(("stop", did))
+
+    async def set_volume(self, did, volume):
+        self.calls.append(("volume", did, volume))
+        return volume
+
+    def owned_targets(self, receiver_id, owner):
+        return [
+            did for did in settings.receiver_targets(receiver_id)
+            if self._owners.get(did) == owner
+        ]
+
+
+def configure(monkeypatch):
+    monkeypatch.setattr(settings, "sender_volume_mode", "linked")
+    monkeypatch.setattr(settings, "default_volume_enabled", False)
+    group = SpeakerGroupConfig(id="all", name="全屋", speaker_ids=["a", "b"])
+    receivers = [
+        ReceiverConfig(id="living", name="客厅", target_type="speaker", target_id="a"),
+        ReceiverConfig(id="whole", name="全屋", target_type="group", target_id="all"),
+    ]
+    monkeypatch.setattr(settings, "receivers", receivers)
+    monkeypatch.setattr(settings, "groups", [group])
+    monkeypatch.setattr(settings, "dlna_enabled", True)
+    monkeypatch.setattr(settings, "sync_groups_enabled", True)
+
+
+def test_dlna_hides_groups_without_deleting_them(monkeypatch):
+    configure(monkeypatch)
+    service = DlnaService(FakeDeviceManager())
+
+    assert [item.name for item in service.active_receivers()] == ["客厅", "全屋"]
+
+    monkeypatch.setattr(settings, "sync_groups_enabled", False)
+    assert [item.name for item in service.active_receivers()] == ["客厅"]
+    assert settings.groups[0].name == "全屋"
+
+
+async def test_dlna_routes_group_media_to_every_speaker(monkeypatch):
+    configure(monkeypatch)
+    manager = FakeDeviceManager()
+    service = DlnaService(manager)
+
+    await service.set_uri("whole", "http://media.local/song.mp3")
+    await service.play("whole")
+
+    assert manager.calls == [
+        ("play", "a", "http://media.local/song.mp3", "dlna:whole", True),
+        ("play", "b", "http://media.local/song.mp3", "dlna:whole", True),
+    ]
+    assert service.state_for("whole").state == "PLAYING"
+
+
+async def test_dlna_soap_transport_and_volume(monkeypatch):
+    configure(monkeypatch)
+    manager = FakeDeviceManager()
+    service = DlnaService(manager)
+    body = b"<Envelope><CurrentURI>http://media.local/a.mp3</CurrentURI></Envelope>"
+
+    await _dispatch(service, "living", "AVTransport", "SetAVTransportURI", body)
+    await _dispatch(service, "living", "AVTransport", "Play", b"")
+    info = await _dispatch(service, "living", "AVTransport", "GetTransportInfo", b"")
+    await _dispatch(
+        service,
+        "living",
+        "RenderingControl",
+        "SetVolume",
+        b"<Envelope><DesiredVolume>63</DesiredVolume></Envelope>",
+    )
+
+    assert info["CurrentTransportState"] == "PLAYING"
+    assert ("volume", "a", 63) in manager.calls
+    assert service.state_for("living").volume == 63
+
+
+def test_dlna_uses_stable_unique_device_ids(monkeypatch):
+    configure(monkeypatch)
+    service = DlnaService(FakeDeviceManager())
+
+    assert service.uuid_for("living") == service.uuid_for("living")
+    assert service.uuid_for("living") != service.uuid_for("whole")

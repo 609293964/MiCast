@@ -1,0 +1,8 @@
+#!/bin/bash
+set -u
+
+# A full uninstall must not silently retain credentials or setup state.  Guard
+# the system-provided path before deleting anything below it.
+if [ -n "${TRIM_PKGVAR:-}" ] && [ "$TRIM_PKGVAR" != "/" ] && [ -d "$TRIM_PKGVAR" ]; then
+  find "$TRIM_PKGVAR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+fi

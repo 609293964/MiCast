@@ -1,0 +1,60 @@
+.venv
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environment
+.env
+.env.local
+
+# Config / runtime
+config/*.json
+config/*.enc
+config/shairport/
+.runtime/
+!config/.gitkeep
+
+# Web build output
+web/dist/
+node_modules/
+
+# Packaging artifacts
+build-tools/
+docker/data/
+*.fpk
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+
+# Local agent/editor artifacts
+.impeccable/
+.run/

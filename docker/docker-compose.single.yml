@@ -1,0 +1,66 @@
+# MiCast AirPlay 2 单例版：一个控制器 + 一个固定接收器。
+# 不启动编排器，不开放动态新增实例。
+services:
+  micast:
+    image: ${MICAST_IMAGE:-micast:0.1.0}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: micast
+    restart: unless-stopped
+    depends_on:
+      airplay2:
+        condition: service_started
+    environment:
+      MICAST_DATA_DIR: /data
+      MICAST_HOST: 0.0.0.0
+      MICAST_PORT: ${MICAST_PORT:-3000}
+      MICAST_STREAM_HOST: ${MICAST_STREAM_HOST:?Set the NAS LAN IP in docker/.env}
+      MICAST_STREAM_PORT: ${MICAST_STREAM_PORT:-8080}
+      MICAST_DEPLOYMENT: single
+      MICAST_AIRPLAY2_MODE: single
+      MICAST_AIRPLAY2_PCM_SOURCE: tcp:airplay2:9001
+      MI_AUDIO_FORMAT: ${MI_AUDIO_FORMAT:-mp3}
+      MI_AUDIO_BITRATE: ${MI_AUDIO_BITRATE:-320k}
+      MI_AUDIO_SAMPLE_RATE: ${MI_AUDIO_SAMPLE_RATE:-48000}
+      MI_AUDIO_AUTO_TRANSCODE: ${MI_AUDIO_AUTO_TRANSCODE:-true}
+    volumes:
+      - ${MICAST_DATA:-./data}:/data
+    networks:
+      - internal
+    ports:
+      - "${MICAST_PORT:-3000}:3000"
+      - "${MICAST_STREAM_PORT:-8080}:8080"
+
+  airplay2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.receiver
+    image: ${MICAST_RECEIVER_IMAGE:-micast-receiver:0.1.0}
+    container_name: micast-airplay2
+    restart: unless-stopped
+    environment:
+      MICAST_AIRPLAY_NAME: ${MICAST_AIRPLAY_NAME:-MiCast}
+      MICAST_AIRPLAY_PROTOCOL: airplay2
+      MICAST_PCM_PORT: 9001
+      MICAST_CALLBACK_BASE: http://micast:3000
+      MICAST_DEVICE_ID: airplay2
+      MICAST_CALLBACK_TOKEN: ${MICAST_CALLBACK_TOKEN:-}
+    networks:
+      - airplay
+      - internal
+
+networks:
+  internal:
+    name: micast-single-internal
+    driver: bridge
+  airplay:
+    name: micast-single-airplay
+    driver: macvlan
+    driver_opts:
+      parent: ${MICAST_LAN_INTERFACE:?Set the NAS LAN interface in docker/.env}
+    ipam:
+      config:
+        - subnet: ${MICAST_LAN_SUBNET:?Set the NAS LAN subnet in docker/.env}
+          gateway: ${MICAST_LAN_GATEWAY:?Set the NAS LAN gateway in docker/.env}
+          ip_range: ${MICAST_RECEIVER_IP_RANGE:?Set a free receiver IP range outside DHCP}

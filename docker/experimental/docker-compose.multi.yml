@@ -1,0 +1,81 @@
+services:
+  micast:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: micast:experimental-multi
+    container_name: micast
+    restart: unless-stopped
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+      - "8080:8080"
+    environment:
+      MICAST_HOST: 0.0.0.0
+      MICAST_PORT: 3000
+      MICAST_DEPLOYMENT: integrated
+      MICAST_STREAM_HOST: ${MICAST_STREAM_HOST:?Set the NAS LAN IP in docker/.env}
+      MICAST_STREAM_PORT: 8080
+      MICAST_ORCHESTRATOR_URL: http://orchestrator:3100
+      MICAST_ORCHESTRATOR_TOKEN: ${MICAST_ORCHESTRATOR_TOKEN:?Set a long random token in docker/.env}
+      MI_AUDIO_FORMAT: ${MI_AUDIO_FORMAT:-mp3}
+      MI_AUDIO_BITRATE: ${MI_AUDIO_BITRATE:-320k}
+      MI_AUDIO_SAMPLE_RATE: ${MI_AUDIO_SAMPLE_RATE:-48000}
+      MI_AUDIO_AUTO_TRANSCODE: ${MI_AUDIO_AUTO_TRANSCODE:-true}
+    volumes:
+      - ../config:/app/config
+    networks:
+      - internal
+
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.orchestrator
+    image: micast-orchestrator:latest
+    container_name: micast-orchestrator
+    restart: unless-stopped
+    depends_on:
+      receiver-image:
+        condition: service_completed_successfully
+    environment:
+      MICAST_ORCHESTRATOR_TOKEN: ${MICAST_ORCHESTRATOR_TOKEN:?Set a long random token in docker/.env}
+      MICAST_RECEIVER_IMAGE: micast-receiver:experimental-multi
+      MICAST_RECEIVER_LAN_NETWORK: micast-airplay
+      MICAST_INTERNAL_NETWORK: micast-internal
+      MICAST_CALLBACK_BASE: http://micast:3000
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3100/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  receiver-image:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.receiver
+    image: micast-receiver:experimental-multi
+    entrypoint: ["/bin/true"]
+    restart: "no"
+    networks:
+      - airplay
+
+networks:
+  internal:
+    name: micast-internal
+    driver: bridge
+  airplay:
+    name: micast-airplay
+    driver: macvlan
+    driver_opts:
+      parent: ${MICAST_LAN_INTERFACE:?Set the NAS LAN interface in docker/.env}
+    ipam:
+      config:
+        - subnet: ${MICAST_LAN_SUBNET:?Set the NAS LAN subnet in docker/.env}
+          gateway: ${MICAST_LAN_GATEWAY:?Set the NAS LAN gateway in docker/.env}
+          ip_range: ${MICAST_RECEIVER_IP_RANGE:?Set a free receiver IP range outside DHCP}

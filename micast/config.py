@@ -1,0 +1,1176 @@
+"""Application configuration with layered loading and hot reload."""
+
+import json
+import os
+import re
+import socket
+import sys
+import uuid
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Snapshot the real environment before .env loading: a port set in .env is a
+# config default, not a deliberate pin — only true env vars make a busy port
+# fatal instead of sliding to a free one.
+_ENV_PINNED: frozenset[str] = frozenset(os.environ)
+
+# Make .env values visible to os.environ so file-persistence checks below can
+# respect environment overrides correctly.
+load_dotenv(".env", override=False)
+
+
+def _default_route_ip() -> str:
+    """Return the IP address of the default outgoing interface."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # Connecting a UDP socket lets the OS pick the right interface.
+            s.connect(("192.168.0.12", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
+def port_in_use(port: int, host: str = "0.0.0.0") -> bool:
+    """True if something already listens on the port.
+
+    Connect first (catches listeners bound to a specific interface), then bind
+    without SO_REUSEADDR — on Windows that flag would let us "successfully"
+    hijack a port another process is actively listening on.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.3)
+        if probe.connect_ex(("127.0.0.1", port)) == 0:
+            return True
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, port))
+        return False
+    except OSError:
+        return True
+
+
+def resolve_port(preferred: int, env_var: str, attempts: int = 32) -> int:
+    """Pick a listen port: the preferred one, or the next free one.
+
+    Users can't be expected to keep 3000/8080 free, so a busy preferred port
+    silently slides to the next available one — unless the port was pinned
+    via env var, which is a deliberate choice worth failing loudly about.
+    """
+    if not port_in_use(preferred):
+        return preferred
+    if env_var in _ENV_PINNED:
+        raise RuntimeError(f"端口 {preferred} 已被占用（{env_var} 显式指定，不会自动更换）")
+    for candidate in range(preferred + 1, preferred + 1 + attempts):
+        if not port_in_use(candidate):
+            return candidate
+    raise RuntimeError(f"端口 {preferred}-{preferred + attempts} 全部被占用")
+
+
+def default_data_dir() -> Path:
+    """Where micast.json and the encrypted Xiaomi tokens live.
+
+    Priority:
+    1. MICAST_DATA_DIR env (Docker mounts, portable installs)
+    2. The repo's own config/ directory when running from a source checkout
+       (keeps existing dev/docker-volume behaviour unchanged)
+    3. The per-OS user data dir — the case that matters for packaged builds:
+       %APPDATA%/MiCast, ~/Library/Application Support/MiCast,
+       $XDG_DATA_HOME/micast.
+    """
+    override = os.environ.get("MICAST_DATA_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    if not getattr(sys, "frozen", False):
+        legacy = Path(__file__).resolve().parent.parent / "config"
+        if legacy.exists():
+            return legacy
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA")
+        return Path(base) / "MiCast" if base else Path.home() / "AppData" / "Roaming" / "MiCast"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "MiCast"
+    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+    return (Path(xdg) if xdg else Path.home() / ".local" / "share") / "micast"
+
+
+class AudioConfig(BaseSettings):
+    """Audio encoding configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="MI_AUDIO_", extra="ignore")
+
+    format: str = Field(default="mp3", pattern=r"^(mp3|flac|wav)$")
+    bitrate: str = Field(default="320k", pattern=r"^(128k|192k|320k)$")
+    sample_rate: int = Field(default=48000, ge=44100, le=48000)
+    auto_transcode: bool = Field(default=True)
+
+    @field_validator("format", "bitrate", "sample_rate", mode="before")
+    @classmethod
+    def _blank_to_default(cls, v, info):
+        if v is None or v == "":
+            return cls.model_fields[info.field_name].default
+        return v
+
+
+# Per-speaker equalizer: ten fixed ISO bands (Hz), gains in dB. A speaker with
+# all-zero gains (or EQ disabled) shares the receiver's base stream; distinct
+# non-flat signatures each get their own split stream (…-q1, …-q2).
+EQ_BANDS_HZ: tuple[int, ...] = (31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000)
+EQ_BAND_COUNT = len(EQ_BANDS_HZ)
+EQ_GAIN_RANGE = (-12.0, 12.0)
+
+# Built-in presets, key -> band gains in dB (31/62/125/250/500/1k/2k/4k/8k/16k).
+EQ_PRESETS: dict[str, list[float]] = {
+    "flat": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "bass": [4.0, 5.0, 4.0, 2.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0],
+    "vocal": [-2.0, -1.0, 0.0, 0.0, 1.0, 3.0, 2.0, 2.0, 1.0, 0.0],
+    "night": [-4.0, -4.0, -3.0, -2.0, -1.0, 0.0, 0.0, -1.0, -2.0, -3.0],
+    "live": [2.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 3.0, 3.0],
+}
+
+
+class AppConfig(BaseModel):
+    """Application-level settings."""
+
+    name: str = Field(default="MiCast", min_length=1, max_length=64)
+
+
+class SpeakerConfig(BaseModel):
+    """Persisted configuration for a single Xiaomi speaker."""
+
+    did: str = Field(min_length=1)
+    alias: str = ""
+    enabled: bool = False
+    # Xiaomi's deviceID may change after an account/device rebind.  miotDID is
+    # persisted separately so discovery can re-associate the same physical
+    # speaker and atomically rewrite every reference to its current deviceID.
+    miot_did: str = ""
+    hardware: str = ""
+    # Per-speaker EQ: gains in dB for EQ_BANDS_HZ. EQ is a property of the
+    # physical speaker (its room/placement), so it lives here and follows the
+    # speaker into any group.
+    eq_enabled: bool = False
+    eq_bands: list[float] = Field(default_factory=lambda: [0.0] * EQ_BAND_COUNT)
+    eq_preset: str = ""
+
+    @field_validator("eq_bands", mode="before")
+    @classmethod
+    def _clamp_eq_bands(cls, v):
+        if not isinstance(v, list):
+            return [0.0] * EQ_BAND_COUNT
+        lo, hi = EQ_GAIN_RANGE
+        # Migration: 5-band configs (60/250/1k/4k/12k) land on their nearest
+        # ISO band of the 10-band layout, not on the first five positions.
+        if len(v) == 5 and EQ_BAND_COUNT == 10:
+            v = [0.0, v[0], 0.0, v[1], 0.0, v[2], 0.0, v[3], 0.0, v[4]]
+        bands = [max(lo, min(hi, float(b))) for b in v[:EQ_BAND_COUNT]]
+        return bands + [0.0] * (EQ_BAND_COUNT - len(bands))
+
+
+class ReceiverConfig(BaseModel):
+    """An AirPlay name and the playback destination bound to it."""
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=64)
+    target_type: str = Field(default="selected", pattern=r"^(selected|speaker|group)$")
+    target_id: str | None = None
+    enabled: bool = True
+
+
+class SpeakerGroupConfig(BaseModel):
+    """A playback destination containing multiple physical speakers."""
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=64)
+    speaker_ids: list[str] = Field(default_factory=list)
+    # Signed offset (ms) per member, relative to `anchor_did`. Positive = later
+    # (delayed), negative = earlier (ahead). The anchor itself is always 0.
+    delays_ms: dict[str, int] = Field(default_factory=dict)
+    # Reference member every other member's offset is measured against.
+    anchor_did: str | None = None
+    # "mirror": every speaker plays the same stream. "stereo": exactly two
+    # speakers, each plays one channel of the source through its own stream.
+    mode: str = Field(default="mirror", pattern=r"^(mirror|stereo)$")
+    channels: dict[str, str] = Field(default_factory=dict)  # did -> "left" | "right"
+    gains_db: dict[str, float] = Field(default_factory=dict)  # loudness trim per speaker
+    # External AirPlay devices (discovered via mDNS) that play alongside the
+    # Xiaomi speakers; ids are MAC hex from the _raop service name.
+    airplay_targets: list[str] = Field(default_factory=list)
+    # External DLNA renderers (discovered via SSDP); ids are device UDNs.
+    dlna_targets: list[str] = Field(default_factory=list)
+    # Channel assignment per network device id (AirPlay id or DLNA UDN) in a
+    # stereo group; no entry means the full stereo mix.
+    network_channels: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_group_delays(cls, data: Any) -> Any:
+        """One-step migration: fold the old absolute-lag delay fields
+        (`delays_ms`, `audio_delays_ms`, `airplay_delays_ms`) into signed,
+        anchor-relative `delays_ms`. Runs on the raw dict before Pydantic drops
+        the removed fields, so a legacy JSON and a fresh group both normalize.
+
+        Discriminator: a legacy group has no `anchor_did`; a migrated one does.
+        """
+        if not isinstance(data, dict):
+            return data
+        members = (
+            list(data.get("speaker_ids") or [])
+            + list(data.get("airplay_targets") or [])
+            + list(data.get("dlna_targets") or [])
+        )
+        out = dict(data)
+        out.pop("audio_delays_ms", None)
+        out.pop("airplay_delays_ms", None)
+
+        anchor = data.get("anchor_did")
+        if anchor is None:
+            # Legacy (or fresh): fold the three absolute-lag dicts, whose key
+            # spaces are disjoint, then anchor on the least-delayed member.
+            abs_lag: dict[str, int] = dict.fromkeys(members, 0)
+            for src in (
+                data.get("delays_ms") or {},
+                data.get("audio_delays_ms") or {},
+                data.get("airplay_delays_ms") or {},
+            ):
+                for key, value in src.items():
+                    try:
+                        abs_lag[str(key)] = int(value)
+                    except (TypeError, ValueError):
+                        continue
+            anchor = min(members, key=lambda m: abs_lag.get(m, 0)) if members else None
+            base = abs_lag.get(anchor, 0) if anchor else 0
+            out["delays_ms"] = {
+                m: abs_lag[m] - base for m in members if abs_lag[m] != base
+            }
+            out["anchor_did"] = anchor
+            return out
+
+        # Already migrated: keep signed offsets, force the anchor offset to 0,
+        # and re-anchor (to the earliest member) if the anchor left the group.
+        delays = {k: int(v) for k, v in (data.get("delays_ms") or {}).items()}
+        if anchor not in members:
+            anchor = members[0] if members else None
+        delays.pop(anchor, None)
+        out["delays_ms"] = delays
+        out["anchor_did"] = anchor
+        return out
+
+    @property
+    def member_count(self) -> int:
+        """Total members: Xiaomi speakers + attached network devices."""
+        return len(self.speaker_ids) + len(self.airplay_targets) + len(self.dlna_targets)
+
+    def delay_holds(self) -> dict[str, int]:
+        """Non-negative hold (ms) per delay-capable member — Xiaomi speakers and
+        external AirPlay targets — normalized so the most-ahead member holds 0
+        and the rest pad after it. This is the ONE normalization shared by the
+        pull path (stream server per-client buffer) and the push path (AirPlay
+        pre-buffer), so a mixed group aligns to a single live edge. DLNA
+        renderers have no delay path and are excluded (they play live)."""
+        members = [*self.speaker_ids, *self.airplay_targets]
+        offsets = {m: int(self.delays_ms.get(m, 0)) for m in members}
+        if not offsets:
+            return {}
+        min_off = min(offsets.values())
+        return {m: max(0, offsets[m] - min_off) for m in members}
+
+
+def _sanitize_airplay_targets(items) -> list[str]:
+    return list(
+        dict.fromkeys(
+            str(item).lower()
+            for item in items
+            if re.fullmatch(r"[0-9a-f]{12}", str(item).lower())
+        )
+    )
+
+
+def _sanitize_dlna_targets(items) -> list[str]:
+    return list(dict.fromkeys(str(item).strip() for item in items if str(item).strip()))
+
+
+class AirPlay2InstanceConfig(BaseModel):
+    """An AirPlay 2 receiver identity mapped to one MiCast playback target."""
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=50)
+    target_type: str = Field(pattern=r"^(speaker|group)$")
+    target_id: str = Field(min_length=1)
+    enabled: bool = True
+
+
+class Settings(BaseSettings):
+    """Global application settings.
+
+    Priority (highest to lowest):
+    1. Environment variables
+    2. Runtime memory (set via web UI)
+    3. config/micast.json
+    4. Code defaults
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="MICAST_",
+        env_nested_delimiter="__",
+        extra="ignore",
+        env_parse_none_str="",
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
+
+    host: str = "0.0.0.0"
+    port: int = 3000
+    stream_host: str = ""
+    stream_port: int = 8080
+    pcm_source: str = "mock"
+    airplay2_pcm_source: str = "mock"
+    pcm_sample_rate: int = Field(default=48000, ge=8000, le=384000)
+    stream_buffer_seconds: float = Field(default=0.25, ge=0.05, le=3.0)
+    shairport_path: str = "shairport-sync"
+    orchestrator_url: str = ""
+    orchestrator_token: str = ""
+    encryption_key: str | None = None
+
+    audio: AudioConfig = Field(default_factory=AudioConfig)
+    app: AppConfig = Field(default_factory=AppConfig)
+    receiver_mode: str = Field(default="single", pattern=r"^(single|multi)$")
+    airplay_protocol: str = Field(default="auto", pattern=r"^(auto|classic|airplay2)$")
+    airplay_engine: str = Field(default="local", pattern=r"^(local|airplay2)$")
+    dlna_enabled: bool = True
+    sync_groups_enabled: bool = True
+    large_delay_enabled: bool = False
+    airplay2_enabled: bool = False
+    # Touch-screen speakers show real cover art + scrolling lyrics: DAAP track
+    # metadata from the phone is matched against Xiaomi's music library and
+    # the play command is re-issued with the song's audioID.
+    touchscreen_lyrics: bool = True
+    # Opt-in session-start device volume. Zero is mute, not an off sentinel.
+    default_volume: int = Field(default=0, ge=0, le=100)
+    default_volume_enabled: bool = False
+    sender_volume_mode: str = Field(default="independent", pattern=r"^(independent|linked)$")
+    # Webhook (飞书自定义机器人 / WxPusher) notified when the Xiaomi login
+    # expires; empty = disabled.
+    notify_webhook_url: str = ""
+    provider_account_id: str | None = None
+    selected_device_id: str | None = None
+    speakers: list[SpeakerConfig] = Field(default_factory=list)
+    receivers: list[ReceiverConfig] = Field(default_factory=list)
+    groups: list[SpeakerGroupConfig] = Field(default_factory=list)
+    airplay2_instances: list[AirPlay2InstanceConfig] = Field(default_factory=list)
+
+    @property
+    def effective_stream_host(self) -> str:
+        """Return a reachable host for the audio stream URL."""
+        if self.stream_host:
+            return self.stream_host
+        if self.host and self.host != "0.0.0.0":
+            return self.host
+        return _default_route_ip()
+
+    @property
+    def config_path(self) -> Path:
+        return default_data_dir() / "micast.json"
+
+    def load_from_file(self) -> None:
+        """Load non-env overrides from config file."""
+        path = self.config_path
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+
+        # Only load fields not explicitly set by environment
+        for key, value in data.items():
+            # Internal orchestration settings come only from the integrated
+            # Docker deployment and are never loaded from the data file.
+            if key in {"orchestrator_url", "orchestrator_token"}:
+                continue
+            if key == "audio" and isinstance(value, dict):
+                for audio_key, audio_value in value.items():
+                    env_var = f"MI_AUDIO_{audio_key.upper()}"
+                    if env_var not in os.environ:
+                        setattr(self.audio, audio_key, audio_value)
+            elif key == "app" and isinstance(value, dict):
+                if "MICAST_APP_NAME" not in os.environ:
+                    self.app = AppConfig.model_validate(value)
+            elif key == "speakers" and isinstance(value, list):
+                if "MICAST_SPEAKERS" not in os.environ:
+                    self.speakers = [SpeakerConfig.model_validate(item) for item in value]
+            elif key == "receivers" and isinstance(value, list):
+                self.receivers = [ReceiverConfig.model_validate(item) for item in value]
+            elif key == "groups" and isinstance(value, list):
+                self.groups = [SpeakerGroupConfig.model_validate(item) for item in value]
+            elif key == "airplay2_instances" and isinstance(value, list):
+                self.airplay2_instances = [
+                    AirPlay2InstanceConfig.model_validate(item) for item in value
+                ]
+            else:
+                env_var = f"MICAST_{key.upper()}"
+                if env_var not in os.environ and hasattr(self, key):
+                    setattr(self, key, value)
+        delay_limit_ms = 15000 if self.large_delay_enabled else 5000
+        for group in self.groups:
+            group.delays_ms = {
+                key: max(-delay_limit_ms, min(delay_limit_ms, int(value)))
+                for key, value in group.delays_ms.items()
+            }
+        self._migrate_receivers()
+
+    def save_to_file(self) -> None:
+        """Persist current runtime settings to config file."""
+        data = {
+            "audio": self.audio.model_dump(),
+            "app": self.app.model_dump(),
+            "receiver_mode": self.receiver_mode,
+            "airplay_protocol": self.airplay_protocol,
+            "airplay_engine": self.airplay_engine,
+            "dlna_enabled": self.dlna_enabled,
+            "sync_groups_enabled": self.sync_groups_enabled,
+            "large_delay_enabled": self.large_delay_enabled,
+            "airplay2_enabled": self.airplay2_enabled,
+            "touchscreen_lyrics": self.touchscreen_lyrics,
+            "default_volume": self.default_volume,
+            "default_volume_enabled": self.default_volume_enabled,
+            "sender_volume_mode": self.sender_volume_mode,
+            "notify_webhook_url": self.notify_webhook_url,
+            "provider_account_id": self.provider_account_id,
+            "selected_device_id": self.selected_device_id,
+            "speakers": [speaker.model_dump() for speaker in self.speakers],
+            "receivers": [receiver.model_dump() for receiver in self.receivers],
+            "groups": [group.model_dump() for group in self.groups],
+            "airplay2_instances": [item.model_dump() for item in self.airplay2_instances],
+        }
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config_path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def update_audio(self, **kwargs) -> None:
+        """Update audio config at runtime and persist."""
+        for key, value in kwargs.items():
+            if hasattr(self.audio, key):
+                setattr(self.audio, key, value)
+        self.save_to_file()
+
+    def update_app_name(self, name: str) -> None:
+        """Update application/AirPlay name and persist."""
+        self.app = AppConfig(name=name)
+        self.save_to_file()
+
+    def set_receiver_mode(self, mode: str) -> None:
+        """Set receiver mode and persist."""
+        if mode not in ("single", "multi"):
+            raise ValueError("receiver_mode must be 'single' or 'multi'")
+        self.receiver_mode = mode
+        self.save_to_file()
+
+    def set_airplay_protocol(self, protocol: str) -> None:
+        """Select the advertised AirPlay service type and persist it."""
+        if protocol not in ("auto", "classic", "airplay2"):
+            raise ValueError("airplay_protocol must be auto, classic, or airplay2")
+        self.airplay_protocol = protocol
+        self.save_to_file()
+
+    def set_airplay_engine(self, engine: str) -> None:
+        if engine not in ("local", "airplay2"):
+            raise ValueError("airplay_engine must be local or airplay2")
+        self.airplay_engine = engine
+        self.save_to_file()
+
+    def set_dlna_enabled(self, enabled: bool) -> None:
+        self.dlna_enabled = enabled
+        self.save_to_file()
+
+    def set_sync_groups_enabled(self, enabled: bool) -> None:
+        self.sync_groups_enabled = enabled
+        self.save_to_file()
+
+    def set_large_delay_enabled(self, enabled: bool) -> None:
+        self.large_delay_enabled = enabled
+        if not enabled:
+            for group in self.groups:
+                group.delays_ms = {
+                    key: max(-5000, min(5000, int(value)))
+                    for key, value in group.delays_ms.items()
+                }
+        self.save_to_file()
+
+    def set_touchscreen_lyrics(self, enabled: bool) -> None:
+        self.touchscreen_lyrics = enabled
+        self.save_to_file()
+
+    def set_default_volume(self, volume: int) -> None:
+        self.default_volume = max(0, min(100, int(volume)))
+        self.save_to_file()
+
+    def set_notify_webhook(self, url: str) -> None:
+        self.notify_webhook_url = url.strip()
+        self.save_to_file()
+
+    def set_airplay2_enabled(self, enabled: bool) -> None:
+        self.airplay2_enabled = enabled
+        self.save_to_file()
+
+    def configure_airplay2_deployment(self, mode: str) -> None:
+        """Apply deployment capabilities without conflating single and multi."""
+        if mode == "disabled":
+            self.airplay2_enabled = False
+            self.airplay2_instances = []
+            self.save_to_file()
+            return
+        if mode == "single":
+            current = self.airplay2_instances[0] if self.airplay2_instances else None
+            target_type = current.target_type if current else "speaker"
+            target_id = current.target_id if current else (self.selected_device_id or "unmapped")
+            self.airplay2_instances = [AirPlay2InstanceConfig(
+                id="airplay2",
+                name="MiCast",
+                target_type=target_type,
+                target_id=target_id,
+                enabled=True,
+            )]
+        self.save_to_file()
+
+    def bind_provider_account(self, account_id: str | None) -> bool:
+        """Bind device relationships to a Xiaomi account.
+
+        Returns True when an account switch cleared provider-owned topology.
+        Application/audio settings are account-independent and survive the switch.
+        """
+        normalized = str(account_id).strip() if account_id else None
+        if not normalized:
+            return False
+        if self.provider_account_id in (None, normalized):
+            self.provider_account_id = normalized
+            self.save_to_file()
+            return False
+
+        self.provider_account_id = normalized
+        self.selected_device_id = None
+        self.speakers = []
+        self.groups = []
+        self.receivers = [item for item in self.receivers if item.target_type == "selected"]
+        self.airplay2_instances = []
+        self.save_to_file()
+        return True
+
+    def upsert_airplay2_instance(
+        self, *, instance_id: str | None, name: str,
+        target_type: str, target_id: str, enabled: bool = True,
+    ) -> AirPlay2InstanceConfig:
+        current = next((item for item in self.airplay2_instances if item.id == instance_id), None)
+        updated = AirPlay2InstanceConfig(
+            id=instance_id or uuid.uuid4().hex[:12], name=name.strip(),
+            target_type=target_type, target_id=target_id, enabled=enabled,
+        )
+        if current:
+            self.airplay2_instances[self.airplay2_instances.index(current)] = updated
+        else:
+            self.airplay2_instances.append(updated)
+        self.save_to_file()
+        return updated
+
+    def remove_airplay2_instance(self, instance_id: str) -> bool:
+        before = len(self.airplay2_instances)
+        self.airplay2_instances = [
+            item for item in self.airplay2_instances if item.id != instance_id
+        ]
+        if len(self.airplay2_instances) == before:
+            return False
+        self.save_to_file()
+        return True
+
+    def active_receivers(self) -> list[ReceiverConfig]:
+        """Receivers currently published by local discovery protocols."""
+        return [
+            receiver
+            for receiver in self.receivers
+            if receiver.enabled
+            and (self.sync_groups_enabled or receiver.target_type != "group")
+        ]
+
+    def set_orchestrator(self, url: str, token: str | None = None) -> None:
+        self.orchestrator_url = url.strip().rstrip("/")
+        if token is not None and token.strip():
+            self.orchestrator_token = token.strip()
+        self.save_to_file()
+
+    def _migrate_receivers(self) -> None:
+        if not self.receivers and self.receiver_mode == "multi":
+            self.receivers = [
+                ReceiverConfig(
+                    id=f"speaker-{speaker.did}",
+                    name=speaker.alias or speaker.did,
+                    target_type="speaker",
+                    target_id=speaker.did,
+                )
+                for speaker in self.speakers
+                if speaker.enabled
+            ]
+        speaker_names = {speaker.did: speaker.alias for speaker in self.speakers if speaker.alias}
+        group_names = {group.id: group.name for group in self.groups}
+        for receiver in self.receivers:
+            if receiver.target_type == "speaker" and receiver.target_id in speaker_names:
+                receiver.name = speaker_names[receiver.target_id]
+            elif receiver.target_type == "group" and receiver.target_id in group_names:
+                receiver.name = group_names[receiver.target_id]
+
+    def receiver_targets(self, receiver_id: str) -> list[str]:
+        receiver = next((item for item in self.receivers if item.id == receiver_id), None)
+        if receiver is None:
+            instance = next(
+                (item for item in self.airplay2_instances if item.id == receiver_id), None
+            )
+            if instance:
+                if instance.target_type == "speaker":
+                    return [instance.target_id]
+                group = next((item for item in self.groups if item.id == instance.target_id), None)
+                return list(group.speaker_ids) if group else []
+        if receiver is None:
+            return []
+        if receiver.target_type == "selected":
+            return [self.selected_device_id] if self.selected_device_id else []
+        if receiver.target_type == "speaker":
+            return [receiver.target_id] if receiver.target_id else []
+        group = next((item for item in self.groups if item.id == receiver.target_id), None)
+        return list(group.speaker_ids) if group else []
+
+    def receiver_target_delays(self, receiver_id: str) -> dict[str, int]:
+        receiver = next((item for item in self.receivers if item.id == receiver_id), None)
+        if receiver is None or receiver.target_type != "group":
+            return {}
+        group = next((item for item in self.groups if item.id == receiver.target_id), None)
+        return dict(group.delays_ms) if group else {}
+
+    def group_for_receiver(self, receiver_id: str) -> SpeakerGroupConfig | None:
+        receiver = next((item for item in self.receivers if item.id == receiver_id), None)
+        if receiver is not None and receiver.target_type == "group":
+            return next((item for item in self.groups if item.id == receiver.target_id), None)
+        # An AirPlay 2 instance can also target a group; its receiver identity
+        # lives in airplay2_instances (not receivers), so resolve it here too —
+        # otherwise channel/EQ/stream-variant lookups miss the group for it.
+        instance = next((item for item in self.airplay2_instances if item.id == receiver_id), None)
+        if instance is not None and instance.target_type == "group":
+            return next((item for item in self.groups if item.id == instance.target_id), None)
+        return None
+
+    def sink_hold_ms(self, receiver_id: str, did: str) -> int:
+        """Return the live hold for ``did`` in one specific playback entry.
+
+        A speaker may belong to several groups. Looking it up by device id
+        alone silently applied the first matching group's delay, which made
+        the delay control of every other group appear to do nothing.
+        """
+        group = self.group_for_receiver(receiver_id)
+        if group is None or did not in group.speaker_ids:
+            return 0
+        return group.delay_holds().get(did, 0)
+
+    def receiver_channel(self, receiver_id: str, did: str) -> str | None:
+        """Channel ('left'/'right') a speaker plays in a stereo group, else None."""
+        group = self.group_for_receiver(receiver_id)
+        if group is None or group.mode != "stereo":
+            return None
+        channel = group.channels.get(did)
+        return channel if channel in ("left", "right") else None
+
+    def receiver_airplay_targets(self, receiver_id: str) -> list[str]:
+        """External AirPlay device ids attached to a receiver's group."""
+        group = self.group_for_receiver(receiver_id)
+        return list(group.airplay_targets) if group else []
+
+    def receiver_dlna_targets(self, receiver_id: str) -> list[str]:
+        """External DLNA renderer UDNs attached to a receiver's group."""
+        group = self.group_for_receiver(receiver_id)
+        return list(group.dlna_targets) if group else []
+
+    def receiver_airplay_delays(self, receiver_id: str) -> dict[str, int]:
+        """Normalized hold (ms) for a receiver's AirPlay targets, sharing the
+        group-wide normalization with the Xiaomi pull path (most-ahead member
+        across the whole group sits at 0)."""
+        group = self.group_for_receiver(receiver_id)
+        if group is None:
+            return {}
+        holds = group.delay_holds()
+        return {k: holds.get(k, 0) for k in group.airplay_targets}
+
+    def receiver_network_channels(self, receiver_id: str) -> dict[str, str]:
+        """Channel assignment (left/right) per attached network device id."""
+        group = self.group_for_receiver(receiver_id)
+        return dict(group.network_channels) if group else {}
+
+    def receiver_channel_variant_suffix(self, receiver_id: str, side: str) -> str:
+        """Stream URL suffix serving one channel of a stereo group ("left" →
+        "-L"). Prefers the EQ-less variant; "" when no such variant exists
+        (mirror group), which conveniently means the plain base stream."""
+        wanted_base = {"left": "-L", "right": "-R"}.get(side)
+        if wanted_base is None:
+            return ""
+        variants = self.receiver_stream_variants(receiver_id)
+        matching = [v for v in variants if v["base"] == wanted_base]
+        if not matching:
+            return ""
+        plain = next((v for v in matching if not v["eq"]), None)
+        return (plain or matching[0])["suffix"]
+
+    def channel_suffix(self, receiver_id: str, did: str) -> str:
+        """Stream URL suffix so each speaker of a stereo pair fetches its channel."""
+        channel = self.receiver_channel(receiver_id, did)
+        return {"left": "-L", "right": "-R"}.get(channel, "")
+
+    def speaker_eq_bands(self, did: str) -> list[float] | None:
+        """Effective EQ gains for a speaker; None when flat or disabled."""
+        speaker = self.get_speaker(did)
+        if not speaker or not speaker.eq_enabled:
+            return None
+        bands = list(speaker.eq_bands)
+        if all(abs(b) < 0.05 for b in bands):
+            return None
+        return bands
+
+    def set_speaker_eq(
+        self, did: str, *, enabled: bool, bands: list[float], preset: str = ""
+    ) -> SpeakerConfig:
+        speaker = self._get_or_create_speaker(did)
+        speaker.eq_enabled = enabled
+        lo, hi = EQ_GAIN_RANGE
+        bands = list(bands)
+        # Same 5→10 migration as the config validator: a stale client posting
+        # the old 60/250/1k/4k/12k layout lands on the nearest ISO bands.
+        if len(bands) == 5 and EQ_BAND_COUNT == 10:
+            bands = [0.0, bands[0], 0.0, bands[1], 0.0, bands[2], 0.0, bands[3], 0.0, bands[4]]
+        clean = [max(lo, min(hi, float(b))) for b in bands[:EQ_BAND_COUNT]]
+        speaker.eq_bands = clean + [0.0] * (EQ_BAND_COUNT - len(clean))
+        speaker.eq_preset = preset if preset in EQ_PRESETS else ""
+        self.save_to_file()
+        return speaker
+
+    def receiver_stream_variants(self, receiver_id: str) -> list[dict]:
+        """Streams a receiver must publish: one per (channel, EQ signature).
+
+        Returns entries of {suffix, base, channel, eq}; the EQ-less entry of
+        each channel keeps the plain suffix (-L/-R/"") so speakers without EQ
+        share one stream exactly as before. Distinct non-flat signatures get
+        ``-q{n}`` (or ``-Lq{n}``) in order of first appearance.
+        """
+        variants: list[dict] = []
+        seen: set[tuple[str, tuple[float, ...] | None]] = set()
+        eq_counts: dict[str, int] = {}
+        for did in self.receiver_targets(receiver_id):
+            channel = self.receiver_channel(receiver_id, did)
+            base = {"left": "-L", "right": "-R"}.get(channel, "")
+            bands = self.speaker_eq_bands(did)
+            key = (base, tuple(bands) if bands else None)
+            if key in seen:
+                continue
+            seen.add(key)
+            if bands is None:
+                suffix = base
+            else:
+                eq_counts[base] = eq_counts.get(base, 0) + 1
+                suffix = f"{base}-q{eq_counts[base]}"
+            variants.append(
+                {"suffix": suffix, "base": base, "channel": channel, "eq": bands}
+            )
+        # Network devices with a channel assignment need that channel's
+        # stream too (DLNA renderers pull it directly) — even when the group
+        # has no Xiaomi speaker holding it.
+        group = self.group_for_receiver(receiver_id)
+        if group and group.mode == "stereo":
+            assigned_sides = set(group.network_channels.values())
+            for side, base in (("left", "-L"), ("right", "-R")):
+                if side in assigned_sides and (base, None) not in seen:
+                    seen.add((base, None))
+                    variants.append({"suffix": base, "base": base, "channel": side, "eq": None})
+        # The plain base stream always exists: it is a cheap raw-PCM bypass
+        # (no encoder) and serves mirror speakers, DLNA renderers without a
+        # channel assignment, and anything else that just wants the mix.
+        if ("", None) not in seen:
+            variants.append({"suffix": "", "base": "", "channel": None, "eq": None})
+        return variants
+
+    def stream_suffix(self, receiver_id: str, did: str) -> str:
+        """Full stream URL suffix (channel + EQ split) for one speaker."""
+        base = self.channel_suffix(receiver_id, did)
+        bands = self.speaker_eq_bands(did)
+        if bands is None:
+            return base
+        key = (base, tuple(bands))
+        for variant in self.receiver_stream_variants(receiver_id):
+            other = variant["eq"]
+            if (variant["base"], tuple(other) if other else None) == key:
+                return variant["suffix"]
+        return base
+
+    def add_receiver(
+        self, name: str, target_type: str, target_id: str | None = None
+    ) -> ReceiverConfig:
+        receiver = ReceiverConfig(
+            id=uuid.uuid4().hex[:12], name=name, target_type=target_type, target_id=target_id
+        )
+        self.receivers.append(receiver)
+        self.save_to_file()
+        return receiver
+
+    def remove_receiver(self, receiver_id: str) -> bool:
+        before = len(self.receivers)
+        self.receivers = [item for item in self.receivers if item.id != receiver_id]
+        if len(self.receivers) == before:
+            return False
+        self.save_to_file()
+        return True
+
+    def update_receiver(
+        self,
+        receiver_id: str,
+        *,
+        name: str | None = None,
+        target_type: str | None = None,
+        target_id: str | None = None,
+        enabled: bool | None = None,
+    ) -> ReceiverConfig | None:
+        receiver = next((item for item in self.receivers if item.id == receiver_id), None)
+        if receiver is None:
+            return None
+        data = receiver.model_dump()
+        if name is not None:
+            data["name"] = name
+        if target_type is not None:
+            data["target_type"] = target_type
+            data["target_id"] = target_id
+        elif target_id is not None:
+            data["target_id"] = target_id
+        if enabled is not None:
+            data["enabled"] = enabled
+        updated = ReceiverConfig.model_validate(data)
+        self.receivers[self.receivers.index(receiver)] = updated
+        self.save_to_file()
+        return updated
+
+    def add_group(
+        self,
+        name: str,
+        speaker_ids: list[str],
+        airplay_targets: list[str] | None = None,
+        dlna_targets: list[str] | None = None,
+    ) -> SpeakerGroupConfig:
+        group = SpeakerGroupConfig(
+            id=uuid.uuid4().hex[:12],
+            name=name,
+            speaker_ids=list(dict.fromkeys(speaker_ids)),
+            airplay_targets=_sanitize_airplay_targets(airplay_targets or []),
+            dlna_targets=_sanitize_dlna_targets(dlna_targets or []),
+        )
+        if group.member_count < 2:
+            raise ValueError("组合至少需要两个成员（音箱或网络设备）")
+        self.groups.append(group)
+        self.save_to_file()
+        return group
+
+    def update_group(
+        self,
+        group_id: str,
+        *,
+        name: str | None = None,
+        speaker_ids: list[str] | None = None,
+        delays_ms: dict[str, int] | None = None,
+        mode: str | None = None,
+        channels: dict[str, str] | None = None,
+        gains_db: dict[str, float] | None = None,
+        airplay_targets: list[str] | None = None,
+        dlna_targets: list[str] | None = None,
+        network_channels: dict[str, str] | None = None,
+        anchor_did: str | None = None,
+    ) -> SpeakerGroupConfig | None:
+        group = next((item for item in self.groups if item.id == group_id), None)
+        if group is None:
+            return None
+        data = group.model_dump()
+        if name is not None:
+            data["name"] = name
+        if speaker_ids is not None:
+            data["speaker_ids"] = list(dict.fromkeys(speaker_ids))
+        delay_limit_ms = 15000 if self.large_delay_enabled else 5000
+        if delays_ms is not None:
+            data["delays_ms"] = {
+                str(key): max(-delay_limit_ms, min(delay_limit_ms, int(value)))
+                for key, value in delays_ms.items()
+            }
+        if mode is not None:
+            if mode not in ("mirror", "stereo"):
+                raise ValueError("mode must be 'mirror' or 'stereo'")
+            data["mode"] = mode
+        if channels is not None:
+            data["channels"] = {
+                str(key): value
+                for key, value in channels.items()
+                if value in ("left", "right", "both")
+            }
+        if gains_db is not None:
+            data["gains_db"] = {
+                str(key): max(-12.0, min(12.0, float(value)))
+                for key, value in gains_db.items()
+            }
+        if airplay_targets is not None:
+            data["airplay_targets"] = _sanitize_airplay_targets(airplay_targets)
+        if dlna_targets is not None:
+            data["dlna_targets"] = _sanitize_dlna_targets(dlna_targets)
+        if network_channels is not None:
+            data["network_channels"] = {
+                str(key): value
+                for key, value in network_channels.items()
+                if value in ("left", "right")
+            }
+        if anchor_did is not None:
+            if anchor_did not in data["speaker_ids"]:
+                raise ValueError("anchor_did 必须是组合中的音箱")
+            old_anchor = data.get("anchor_did")
+            if delays_ms is None and old_anchor and old_anchor != anchor_did:
+                # Re-anchor without new offsets: shift the reference frame so
+                # the physical (min-normalized) timing is unchanged.
+                members = [
+                    *data["speaker_ids"],
+                    *data.get("airplay_targets", []),
+                    *data.get("dlna_targets", []),
+                ]
+                offsets = {member: data["delays_ms"].get(member, 0) for member in members}
+                shift = offsets.get(anchor_did, 0)
+                data["delays_ms"] = {
+                    member: value - shift
+                    for member, value in offsets.items()
+                    if member != anchor_did and value != shift
+                }
+            data["anchor_did"] = anchor_did
+            # The anchor is the reference: its offset is always 0.
+            data["delays_ms"].pop(anchor_did, None)
+        # A stereo group needs at least two members (any mix of Xiaomi
+        # speakers and network devices); every speaker holds a channel
+        # (any mix allowed — all-right is valid). Unassigned speakers
+        # default to first=left, the rest=right.
+        if data["mode"] == "stereo":
+            member_count = (
+                len(data["speaker_ids"])
+                + len(data.get("airplay_targets") or [])
+                + len(data.get("dlna_targets") or [])
+            )
+            if member_count < 2:
+                raise ValueError("立体声组至少需要两个成员（音箱或网络设备）")
+            assigned = {
+                did: channel
+                for did, channel in data["channels"].items()
+                if did in data["speaker_ids"] and channel in ("left", "right", "both")
+            }
+            for index, did in enumerate(data["speaker_ids"]):
+                if did not in assigned:
+                    assigned[did] = "left" if index == 0 else "right"
+            data["channels"] = assigned
+        updated = SpeakerGroupConfig.model_validate(data)
+        self.groups[self.groups.index(group)] = updated
+        if name is not None:
+            for receiver in self.receivers:
+                if receiver.target_type == "group" and receiver.target_id == group_id:
+                    receiver.name = updated.name
+        self.save_to_file()
+        return updated
+
+    def target_references(self, target_type: str, target_id: str) -> list[dict]:
+        """Every entry pointing at a speaker/group, for pre-delete checks.
+
+        Returns ``[{"kind": "receiver"|"airplay2"|"group", "id", "name"}]`` —
+        classic receivers, AirPlay 2 instances, and (for speakers) the groups
+        the speaker belongs to.
+        """
+        refs: list[dict] = []
+        for receiver in self.receivers:
+            if receiver.target_type == target_type and receiver.target_id == target_id:
+                refs.append({"kind": "receiver", "id": receiver.id, "name": receiver.name})
+        for instance in self.airplay2_instances:
+            if instance.target_type == target_type and instance.target_id == target_id:
+                refs.append({"kind": "airplay2", "id": instance.id, "name": instance.name})
+        if target_type == "speaker":
+            for group in self.groups:
+                if target_id in group.speaker_ids:
+                    refs.append({"kind": "group", "id": group.id, "name": group.name})
+        return refs
+
+    def remove_group(self, group_id: str) -> bool:
+        if any(
+            item.target_type == "group" and item.target_id == group_id for item in self.receivers
+        ):
+            return False
+        # AirPlay 2 instances reference groups too — deleting underneath them
+        # leaves a dangling mapping whose runtime silently collapses.
+        if any(
+            item.target_type == "group" and item.target_id == group_id
+            for item in self.airplay2_instances
+        ):
+            return False
+        before = len(self.groups)
+        self.groups = [item for item in self.groups if item.id != group_id]
+        if len(self.groups) == before:
+            return False
+        self.save_to_file()
+        return True
+
+    def select_device(self, did: str | None) -> None:
+        """Persist selected device for single-receiver mode."""
+        self.selected_device_id = did
+        self.save_to_file()
+
+    def _get_or_create_speaker(self, did: str) -> SpeakerConfig:
+        """Return existing speaker config or create a new one."""
+        for speaker in self.speakers:
+            if speaker.did == did:
+                return speaker
+        speaker = SpeakerConfig(did=did)
+        self.speakers.append(speaker)
+        return speaker
+
+    def get_speaker(self, did: str) -> SpeakerConfig | None:
+        """Return persisted speaker config if it exists."""
+        for speaker in self.speakers:
+            if speaker.did == did:
+                return speaker
+        return None
+
+    def set_alias(self, did: str, alias: str) -> None:
+        """Set the speaker alias and keep its AirPlay receiver name in sync."""
+        speaker = self._get_or_create_speaker(did)
+        speaker.alias = alias
+        for receiver in self.receivers:
+            if receiver.target_type == "speaker" and receiver.target_id == did:
+                receiver.name = alias
+        self.save_to_file()
+
+    def set_enabled(self, did: str, enabled: bool) -> None:
+        """Set whether a speaker is enabled as an independent AirPlay target."""
+        speaker = self._get_or_create_speaker(did)
+        speaker.enabled = enabled
+        receiver_id = f"speaker-{did}"
+        existing = next((item for item in self.receivers if item.id == receiver_id), None)
+        if enabled and existing is None:
+            self.receivers.append(
+                ReceiverConfig(
+                    id=receiver_id,
+                    name=speaker.alias or did,
+                    target_type="speaker",
+                    target_id=did,
+                    enabled=True,
+                )
+            )
+        elif existing is not None:
+            existing.enabled = enabled
+            existing.name = speaker.alias or existing.name
+        self.save_to_file()
+
+    _merge_rewrote: bool = PrivateAttr(default=False)
+
+    def consume_merge_rewrite(self) -> bool:
+        """True (once) when the last merge_speakers rewrote a device id.
+
+        The bridge uses this to rebuild the pipelines whose stream ids and
+        targets still reference the obsolete id.
+        """
+        rewrote = self._merge_rewrote
+        self._merge_rewrote = False
+        return rewrote
+
+    def merge_speakers(self, discovered: list[dict]) -> list[SpeakerConfig]:
+        """Merge discovered Xiaomi devices with persisted config.
+
+        Newly discovered devices are added with alias = native name and enabled = false.
+        Returns the merged list in the same order as discovered devices.
+        """
+        persisted = {s.did: s for s in self.speakers}
+        by_miot = {s.miot_did: s for s in self.speakers if s.miot_did}
+        discovered_name_counts: dict[str, int] = {}
+        for device in discovered:
+            name = str(device.get("name") or "").strip()
+            if name:
+                discovered_name_counts[name] = discovered_name_counts.get(name, 0) + 1
+
+        merged: list[SpeakerConfig] = []
+        consumed: set[str] = set()
+        for device in discovered:
+            did = str(device.get("deviceID") or "").strip()
+            if not did:
+                continue
+            miot_did = str(device.get("miotDID") or "").strip()
+            hardware = str(device.get("hardware") or "").strip()
+            native_name = str(device.get("name") or "").strip()
+
+            existing = persisted.get(did) or (by_miot.get(miot_did) if miot_did else None)
+            if existing is None:
+                existing = SpeakerConfig(did=did, alias=native_name)
+            elif existing.did != did:
+                old_did = existing.did
+                existing.did = did
+                self._replace_speaker_reference(old_did, did)
+
+            # Legacy files did not persist miotDID.  If one currently-discovered
+            # speaker has this name, consolidate its obsolete same-name records.
+            legacy_duplicates = [
+                item for item in self.speakers
+                if item.did != did
+                and item.did not in consumed
+                and native_name
+                and discovered_name_counts.get(native_name) == 1
+                and item.alias == native_name
+                and not item.miot_did
+            ]
+            for duplicate in legacy_duplicates:
+                existing.enabled = existing.enabled or duplicate.enabled
+                self._replace_speaker_reference(duplicate.did, did)
+                consumed.add(duplicate.did)
+
+            if not existing.alias:
+                existing.alias = native_name
+            existing.miot_did = miot_did or existing.miot_did
+            existing.hardware = hardware or existing.hardware
+            consumed.add(did)
+            merged.append(existing)
+
+        # Preserve order: persisted speakers not currently discovered go at the end.
+        for speaker in self.speakers:
+            if speaker.did not in consumed:
+                merged.append(speaker)
+        self.speakers = merged
+        self.save_to_file()
+        return merged
+
+    def _replace_speaker_reference(self, old_did: str, new_did: str) -> None:
+        """Move every persisted relationship from an obsolete ID to a current one."""
+        if not old_did or old_did == new_did:
+            return
+        self._merge_rewrote = True
+        if self.selected_device_id == old_did:
+            self.selected_device_id = new_did
+        for receiver in self.receivers:
+            if receiver.target_type == "speaker" and receiver.target_id == old_did:
+                receiver.target_id = new_did
+        for instance in self.airplay2_instances:
+            if instance.target_type == "speaker" and instance.target_id == old_did:
+                instance.target_id = new_did
+        for group in self.groups:
+            group.speaker_ids = list(dict.fromkeys(
+                new_did if item == old_did else item for item in group.speaker_ids
+            ))
+            for mapping in (
+                group.delays_ms, group.channels, group.gains_db
+            ):
+                if old_did in mapping:
+                    value = mapping.pop(old_did)
+                    mapping.setdefault(new_did, value)
+            if group.anchor_did == old_did:
+                group.anchor_did = new_did
+
+
+settings = Settings()
+settings.load_from_file()
+settings._migrate_receivers()

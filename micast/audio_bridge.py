@@ -1,0 +1,1295 @@
+"""Audio bridge orchestrating PCM source → encoder → HTTP stream for one or more receivers."""
+
+import asyncio
+import contextlib
+import logging
+from collections.abc import Awaitable, Callable
+
+from micast.config import settings
+from micast.deployment import airplay2_mode
+from micast.local_airplay import LocalAirPlayProvider
+from micast.orchestration import DesiredReceiver, OrchestratorClient
+from micast.pcm_source import PCMSource, ReaderPCMSource, create_pcm_source
+from micast.pcm_tee import PCMTee
+from micast.receiver_manager import ReceiverManager
+from micast.speaker_pipeline import SpeakerPipeline
+from micast.stream_plan import PlanDiff, PlanSnapshot, compute_plan, diff_plans
+from micast.stream_server import StreamServer
+
+logger = logging.getLogger(__name__)
+
+# Stale-client sweeper: Xiaomi speakers keep retrying a stream URL they were
+# once told to play, so any teardown path we miss (canceled pending stop, a
+# speaker re-pulling an old URL on its own) leaves a client attached to a
+# silent stream forever — the topology then shows a permanent 滞留 edge.
+STREAM_SWEEP_INTERVAL_SECONDS = 15.0
+STREAM_IDLE_KICK_SECONDS = 60.0
+
+
+class AudioBridge:
+    """Owns the stream server, receivers, and per-receiver pipelines."""
+
+    def __init__(self):
+        self._stream_server = StreamServer()
+        self._receiver_manager = ReceiverManager()
+        self._local_provider = LocalAirPlayProvider()
+        self._pipelines: dict[str, SpeakerPipeline] = {}
+        self._airplay2_pipelines: dict[str, SpeakerPipeline] = {}
+        self._airplay2_runtime: dict[str, dict] = {}
+        self._airplay2_sources: dict[str, PCMSource] = {}
+        self._airplay2_tees: dict[str, PCMTee] = {}
+        self._tees: list[PCMTee] = []
+        self._running = False
+        self._status = "idle"
+        self._error_count = 0
+        self._restart_lock = asyncio.Lock()
+        self._restart_requested = False
+        self._audio_restart_requested = False
+        self._sweeper_task: asyncio.Task | None = None
+        # Receivers with a live sender session right now. Gates the pipelines'
+        # PCM-stall watchdog (no session → no bytes is normal, not a stall).
+        self._active_sessions: set[str] = set()
+        # External AirPlay targets (created lazily once the provider's shared
+        # Zeroconf exists); both are None in tests and on the airplay2 engine.
+        self._airplay_discovery = None
+        self._airplay_targets = None
+        self._target_taps: dict[str, asyncio.StreamReader] = {}
+        self._dlna_discovery = None
+        self._dlna_targets = None
+        self.on_session_start: Callable[[str], Awaitable[None]] | None = None
+        self.on_session_stop: Callable[[str], Awaitable[None]] | None = None
+        self.on_local_stream: Callable[..., Awaitable[None]] | None = None
+        self.on_audio_restarted: Callable[[], Awaitable[None]] | None = None
+        self.on_receiver_volume: Callable[[str, int], Awaitable[None]] | None = None
+        self._volume_modes: dict[str, str] = {}
+        self._sender_volumes: dict[str, int] = {}
+        self.on_volume_session_start: Callable[[str], Awaitable[None]] | None = None
+        # Stream-plan snapshot: the last config state the running pipelines were
+        # built from. Every config mutation funnels through apply_config_change,
+        # which diffs the fresh plan against this and rebuilds only what moved.
+        self._plan: PlanSnapshot | None = None
+        self._plan_update_requested = False
+        # Fired when a group's Xiaomi membership changed (group_id, removed dids);
+        # main.py wires its reconcile_group closure here.
+        self.on_group_membership_changed: Callable[[str, list[str]], Awaitable[None]] | None = None
+
+    @property
+    def status(self) -> dict:
+        return {
+            "status": self._status,
+            "pcm_source": (
+                "AirPlay 音频" if settings.airplay_engine == "local" else settings.pcm_source
+            ),
+            "airplay_engine": settings.airplay_engine,
+            "airplay_protocol": "classic" if settings.airplay_engine == "local" else "airplay2",
+            "audio": settings.audio.model_dump(),
+            "stream_url": self._default_stream_url(),
+            "error_count": self._error_count,
+            "receivers": self._receiver_statuses(),
+            "orchestration": self._orchestration_status(),
+            "airplay2_instances": list(self._airplay2_runtime.values()),
+            "diagnostics": self.diagnostics,
+            "now_playing": self._now_playing(),
+        }
+
+    def _now_playing(self) -> dict:
+        """Per-receiver DAAP track metadata + matched library audioID.
+
+        Lets the UI (and tests without a touch-screen speaker) see what the
+        sender reported and whether the lyrics/cover chain found a match.
+        """
+        matched = getattr(self, "lyrics_matched", {}) or {}
+        now = {}
+        for receiver_id, item in self._local_provider.receivers.items():
+            server = item.server
+            if not server:
+                continue
+            meta = getattr(server, "daap_meta", None) or {}
+            audio_id = matched.get(receiver_id)
+            if not meta and not audio_id:
+                continue
+            now[receiver_id] = {
+                "title": meta.get("title"),
+                "artist": meta.get("artist"),
+                "album": meta.get("album"),
+                "audio_id": audio_id,
+            }
+        return now
+
+    @property
+    def diagnostics(self) -> dict:
+        """Small, stable counters used to distinguish network, decode and consumer stalls."""
+        raop = {}
+        for receiver_id, item in self._local_provider.receivers.items():
+            server = item.server
+            if server:
+                active_errors = server.active_transport_errors
+                raop[receiver_id] = {
+                    "active_sessions": server.sessions,
+                    "total_sessions": server.total_sessions,
+                    "decode_errors": active_errors["decode_errors"],
+                    "dropped_packets": active_errors["dropped_packets"],
+                    "resend_requests": active_errors["resend_requests"],
+                    "historical_decode_errors": server.decode_errors,
+                    "historical_dropped_packets": server.dropped_packets,
+                    "input_buffer_ms": server.active_input_buffer_ms,
+                    "timing_requests": server.timing_requests,
+                    "timing_responses": server.timing_responses,
+                    "clients": server.active_clients,
+                }
+        streams = {
+            receiver_id: {
+                "clients": self._stream_server.client_count(receiver_id),
+                "bytes_sent": self._stream_server.total_bytes_sent.get(receiver_id, 0),
+                "dropped_chunks": self._stream_server.dropped_chunks.get(receiver_id, 0),
+                "flowing": self._stream_server.is_flowing(receiver_id),
+                "latency": self._stream_server.latency_metrics(receiver_id),
+            }
+            for receiver_id in self._stream_server.stream_ids()
+        }
+        return {
+            "raop": raop,
+            "streams": streams,
+            "sinks": self._stream_server.sink_latency_metrics(),
+            "airplay_targets": (self._airplay_targets.statuses() if self._airplay_targets else {}),
+            "dlna_targets": self._dlna_targets.statuses() if self._dlna_targets else {},
+        }
+
+    def _receiver_statuses(self) -> list[dict]:
+        if settings.airplay_engine == "local":
+            return [
+                {
+                    "did": item.id,
+                    "name": item.name,
+                    "status": item.status,
+                    "stream_url": item.stream_url,
+                    "detail": item.detail,
+                }
+                for item in self._local_provider.receivers.values()
+            ]
+        return [
+            {
+                "did": p.device_id,
+                "name": p.alias,
+                "status": p.status,
+                "stream_url": p.stream_url,
+                "detail": next(
+                    (
+                        receiver.detail
+                        for receiver in self._receiver_manager.receivers
+                        if receiver.device_id == p.device_id
+                    ),
+                    "",
+                ),
+            }
+            for p in self._pipelines.values()
+        ]
+
+    def _orchestration_status(self) -> dict:
+        if settings.airplay_engine == "local":
+            return {
+                "configured": True,
+                "status": self._status,
+                "detail": "经典 AirPlay 已就绪",
+            }
+        return self._receiver_manager.orchestration_status
+
+    def _default_stream_url(self) -> str:
+        if settings.airplay_engine == "local":
+            first = next(iter(self._local_provider.receivers.values()), None)
+            return first.stream_url if first else ""
+        if settings.receiver_mode == "single":
+            device_id = settings.selected_device_id or "default"
+            return (
+                f"http://{settings.effective_stream_host}:{settings.stream_port}/stream/{device_id}"
+            )
+        return f"http://{settings.effective_stream_host}:{settings.stream_port}/stream"
+
+    async def start(self) -> None:
+        """Start the bridge: stream server, receivers, and pipelines."""
+        if self._running:
+            return
+        self._running = True
+        self._status = "starting"
+        logger.info("Starting audio bridge")
+
+        try:
+            await self._start_engine()
+            self._status = self._derive_status()
+            self._plan = compute_plan(settings)
+        except Exception as e:
+            logger.exception("Failed to start audio bridge: %s", e)
+            self._status = "error"
+            self._error_count += 1
+
+        self._sweeper_task = asyncio.create_task(self._sweep_stale_stream_clients())
+
+    async def stop(self) -> None:
+        """Stop everything."""
+        if not self._running:
+            return
+        self._running = False
+        self._status = "stopping"
+        logger.info("Stopping audio bridge")
+
+        if self._sweeper_task:
+            self._sweeper_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._sweeper_task
+            self._sweeper_task = None
+
+        await self._stop_engine()
+
+        self._plan = None
+        self._status = "idle"
+
+    async def restart(self) -> None:
+        """Restart the bridge after config changes; rapid calls coalesce to one."""
+        self._restart_requested = True
+        if self._restart_lock.locked():
+            # A restart is already running and will see the latest settings.
+            return
+        async with self._restart_lock:
+            while self._restart_requested:
+                self._restart_requested = False
+                await self._restart_engine_locked()
+
+    async def _restart_engine_locked(self) -> None:
+        """Full engine teardown+start. Caller must hold ``_restart_lock``."""
+        logger.info("Restarting audio bridge due to config change")
+        await self._stop_engine()
+        self._status = "restarting"
+        try:
+            await self._start_engine()
+            self._status = self._derive_status()
+            self._plan = compute_plan(settings)
+        except Exception as e:
+            logger.exception("Failed to restart audio bridge: %s", e)
+            self._status = "error"
+            self._error_count += 1
+
+    async def apply_config_change(self) -> None:
+        """Single entry point for every config mutation.
+
+        Recomputes the stream plan, diffs it against what the running pipelines
+        were built from, and rebuilds only what moved (per the dispatch table in
+        ``_apply_plan_diff``). Rapid successive mutations (slider drags) coalesce
+        via the dirty flag: the plan is recomputed at apply time.
+        """
+        if not self._running:
+            return
+        self._plan_update_requested = True
+        if self._restart_lock.locked():
+            # A pass is already running and will see the latest settings.
+            return
+        async with self._restart_lock:
+            while self._plan_update_requested:
+                self._plan_update_requested = False
+                new_plan = compute_plan(settings)
+                diff = diff_plans(self._plan, new_plan)
+                if not diff.noop:
+                    logger.info("Applying stream plan change: %s", _diff_summary(diff))
+                await self._apply_plan_diff(diff)
+                self._plan = new_plan
+
+    async def _apply_plan_diff(self, diff: PlanDiff) -> None:
+        """Dispatch a plan diff to the narrowest rebuild path. Lock held."""
+        if diff.full_restart_required or diff.classic_added_removed:
+            await self._restart_engine_locked()
+            return
+
+        audio_hook = False
+        if settings.airplay_engine == "local":
+            if diff.classic_rebuild:
+                await self._rebuild_pipelines_locked()
+                audio_hook = True
+            elif diff.audio_only:
+                logger.info("Restarting audio encoders for config change")
+                for pipeline in self._pipelines.values():
+                    try:
+                        await pipeline.restart_encoder()
+                    except Exception:
+                        logger.exception(
+                            "Failed to restart pipeline %s", pipeline.device_id
+                        )
+                        self._error_count += 1
+                audio_hook = True
+
+        if diff.airplay2_added or diff.airplay2_removed:
+            if settings.airplay2_enabled:
+                await self._start_airplay2_pipelines()
+            else:
+                await self._stop_airplay2_pipelines()
+        if diff.airplay2_rebuild:
+            await self._rebuild_airplay2_instances_locked(diff.airplay2_rebuild)
+            # A retarget can retire the exact stream endpoints playing speakers
+            # are pulling (e.g. -Lq1 of the old group). The orphan GC above
+            # kicked them; now re-point every playing speaker at its current
+            # URL so the group comes back instead of going silent everywhere.
+            audio_hook = True
+
+        for entry_id in sorted(diff.external_airplay_changed):
+            await self._reconcile_entry_airplay_targets(entry_id)
+        for entry_id in sorted(diff.external_dlna_changed):
+            await self._reconcile_entry_dlna_targets(entry_id)
+
+        if diff.membership_changed and self.on_group_membership_changed:
+            for group_id, removed in sorted(diff.membership_changed.items()):
+                try:
+                    await self.on_group_membership_changed(group_id, removed)
+                except Exception:
+                    logger.exception("group-membership hook failed for %s", group_id)
+
+        if audio_hook and self.on_audio_restarted:
+            try:
+                await self.on_audio_restarted()
+            except Exception:
+                logger.exception("audio-restarted hook failed")
+
+    async def _reconcile_entry_airplay_targets(self, entry_id: str) -> None:
+        """Re-assert one entry's external AirPlay targets (classic or AirPlay 2).
+
+        Reconnects targets whose delay/channel moved (delay is a connect-time
+        pre-buffer) and starts/stops membership — without touching the Xiaomi
+        pull path, which re-reads holds live.
+        """
+        if not self._airplay_targets:
+            return
+        target_ids = settings.receiver_airplay_targets(entry_id)
+        tap = self._target_taps.get(entry_id)
+        if tap is None and target_ids:
+            # No PCM tap exists yet (the group had no targets when its
+            # pipelines were built) — rebuild just this entry to create it.
+            if entry_id in self._airplay2_runtime or entry_id in {
+                item.id for item in settings.airplay2_instances
+            }:
+                await self._rebuild_airplay2_instances_locked({entry_id})
+            elif settings.airplay_engine == "local":
+                await self._rebuild_pipelines_locked()
+            tap = self._target_taps.get(entry_id)
+        if tap is None:
+            return
+        await self._airplay_targets.start_targets(
+            entry_id,
+            target_ids,
+            tap,
+            settings.receiver_airplay_delays(entry_id),
+            settings.receiver_network_channels(entry_id),
+        )
+
+    async def _reconcile_entry_dlna_targets(self, entry_id: str) -> None:
+        """Re-assert one entry's DLNA renderers (classic or AirPlay 2)."""
+        if not self._dlna_targets:
+            return
+        await self._dlna_targets.reconcile(
+            entry_id,
+            settings.receiver_dlna_targets(entry_id),
+            settings.receiver_network_channels(entry_id),
+        )
+
+    async def restart_audio(self) -> None:
+        """Apply audio encoding changes without dropping sessions or streams.
+
+        Only the per-receiver encoder is rebuilt; phones stay connected and
+        speakers keep their HTTP connections. Playing speakers are then re-told
+        to play (a new connection is required for the new codec to be picked up).
+
+        Rapid calls (e.g. dragging a delay slider) coalesce to one restart —
+        each encoder restart briefly mutes the stream, so serializing every
+        tick would keep the audio torn for the whole drag.
+        """
+        if settings.airplay_engine != "local":
+            await self.restart()
+            return
+        self._audio_restart_requested = True
+        if self._restart_lock.locked():
+            # A restart is already running and will see the latest settings.
+            return
+        async with self._restart_lock:
+            while self._audio_restart_requested:
+                self._audio_restart_requested = False
+                logger.info("Restarting audio encoders for config change")
+                for pipeline in self._pipelines.values():
+                    try:
+                        await pipeline.restart_encoder()
+                    except Exception:
+                        logger.exception("Failed to restart pipeline %s", pipeline.device_id)
+                        self._error_count += 1
+                if self.on_audio_restarted:
+                    try:
+                        await self.on_audio_restarted()
+                    except Exception:
+                        logger.exception("audio-restarted hook failed")
+
+    async def reconcile_receivers(self) -> None:
+        """Apply receiver definition changes without restarting unchanged local receivers."""
+        if settings.airplay_engine != "local":
+            await self.restart()
+            return
+        await self.restart()
+
+    async def reconcile_airplay2(self) -> None:
+        """Incrementally publish AirPlay 2 instances without disturbing healthy inputs."""
+        async with self._restart_lock:
+            if settings.airplay2_enabled:
+                await self._start_airplay2_pipelines()
+            else:
+                await self._stop_airplay2_pipelines()
+
+    async def rebuild_airplay2_group(self, group_id: str) -> None:
+        """Rebuild AirPlay 2 pipelines mapped to a changed speaker group."""
+        await self.rebuild_airplay2_groups({group_id})
+
+    async def rebuild_airplay2_groups(self, group_ids: set[str]) -> None:
+        """Rebuild mapped AirPlay 2 instances once for one or more groups."""
+        affected = {
+            item.id
+            for item in settings.airplay2_instances
+            if item.enabled and item.target_type == "group" and item.target_id in group_ids
+        }
+        await self._rebuild_airplay2_instances(affected)
+
+    async def rebuild_airplay2_for_speaker(self, did: str) -> None:
+        """Apply an EQ change to direct and group AirPlay 2 mappings."""
+        group_ids = {group.id for group in settings.groups if did in group.speaker_ids}
+        affected = {
+            item.id
+            for item in settings.airplay2_instances
+            if item.enabled
+            and (
+                (item.target_type == "speaker" and item.target_id == did)
+                or (item.target_type == "group" and item.target_id in group_ids)
+            )
+        }
+        await self._rebuild_airplay2_instances(affected)
+
+    async def _rebuild_airplay2_instances(self, affected: set[str]) -> None:
+        if not settings.airplay2_enabled:
+            return
+        if not affected:
+            return
+        async with self._restart_lock:
+            await self._rebuild_airplay2_instances_locked(affected)
+
+    async def _rebuild_airplay2_instances_locked(self, affected: set[str]) -> None:
+        """Stop then restart the given AirPlay 2 instances. Lock held."""
+        # Capture the OLD stream ids first: a retarget can change the variant
+        # plan (e.g. stereo -Lq1 → single base), and speakers still attached to
+        # an endpoint whose plan no longer exists would pull silence forever.
+        stale = {
+            key
+            for key in getattr(self, "_airplay2_pipelines", {})
+            for instance_id in affected
+            if key == instance_id or key.startswith(f"{instance_id}-")
+        }
+        for instance_id in sorted(affected):
+            await self._stop_airplay2_pipeline(instance_id)
+        await self._start_airplay2_pipelines()
+        stream_server = getattr(self, "_stream_server", None)
+        if stream_server is None:
+            return
+        active = set(getattr(self, "_pipelines", {})) | set(
+            getattr(self, "_airplay2_pipelines", {})
+        )
+        for stream_id in stale - active:
+            self._stream_server.kick_clients(stream_id)
+            self._stream_server.unregister_stream(stream_id)
+
+    async def stop_airplay2(self) -> None:
+        """Withdraw every entry from the compose-owned orchestrator."""
+        if settings.orchestrator_url and settings.orchestrator_token:
+            await OrchestratorClient(
+                settings.orchestrator_url, settings.orchestrator_token
+            ).reconcile([])
+
+    async def shutdown_airplay2(self) -> None:
+        """Explicitly withdraw every managed AirPlay 2 instance."""
+        try:
+            await self.stop_airplay2()
+        except Exception as exc:
+            logger.exception("Failed to clear the internal AirPlay 2 orchestrator")
+            raise RuntimeError("内部编排服务未能停止") from exc
+        await self._stop_airplay2_pipelines()
+
+    async def _start_pipelines(self) -> None:
+        for receiver in self._receiver_manager.receivers:
+            pipeline = SpeakerPipeline(
+                device_id=receiver.device_id,
+                alias=receiver.name,
+                pcm_source=receiver.pcm_source,
+                stream_server=self._stream_server,
+                on_session_start=self.on_session_start,
+                input_sample_rate=48000,
+                pace_source=False,
+            )
+            self._pipelines[receiver.device_id] = pipeline
+            if receiver.status == "error":
+                pipeline._status = "error"
+                self._error_count += 1
+                continue
+            try:
+                await pipeline.start()
+            except Exception:
+                logger.exception("Failed to start pipeline for %s", receiver.device_id)
+                self._error_count += 1
+
+    async def _start_engine(self) -> None:
+        if settings.airplay_engine == "local":
+            await self._stream_server.start()
+            desired = [(item.id, item.name) for item in settings.active_receivers()]
+            await self._local_provider.start(
+                desired,
+                settings.effective_stream_host,
+                self._local_session_start,
+                self._local_session_stop,
+                self._local_volume,
+            )
+            await self._ensure_airplay_discovery()
+            for item in self._local_provider.receivers.values():
+                if item.status != "running" or not item.server:
+                    continue
+                await self._create_local_pipelines(item)
+            if settings.airplay2_enabled:
+                await self._start_airplay2_pipelines()
+            return
+        await self._stream_server.start()
+        await self._receiver_manager.start()
+        await self._start_pipelines()
+
+    async def _ensure_airplay_discovery(self) -> None:
+        """(Re)bind LAN AirPlay discovery to the provider's shared Zeroconf."""
+        from micast.airplay_discovery import AirPlayDiscovery
+        from micast.airplay_targets import AirPlayTargetManager
+        from micast.dlna_client import DlnaDiscovery, DlnaTargetManager
+
+        if self._dlna_targets is None:
+            self._dlna_discovery = DlnaDiscovery()
+            self._dlna_targets = DlnaTargetManager(self._dlna_discovery)
+            await self._dlna_discovery.start()
+
+        zeroconf = self._local_provider.zeroconf
+        if zeroconf is None:
+            return
+        if self._airplay_targets is None:
+            self._airplay_discovery = AirPlayDiscovery(
+                zeroconf, own_ids=lambda: self._local_provider.own_macs
+            )
+            self._airplay_targets = AirPlayTargetManager(self._airplay_discovery)
+            await self._airplay_discovery.start()
+        else:
+            await self._airplay_discovery.rebind(zeroconf)
+
+    @property
+    def airplay_discovery(self):
+        return self._airplay_discovery
+
+    def local_server(self, receiver_id: str):
+        """The RaopServer behind a local receiver (DAAP metadata source)."""
+        item = self._local_provider.receivers.get(receiver_id)
+        return item.server if item else None
+
+    @property
+    def airplay_target_manager(self):
+        return self._airplay_targets
+
+    @property
+    def dlna_discovery(self):
+        return self._dlna_discovery
+
+    @property
+    def dlna_target_manager(self):
+        return self._dlna_targets
+
+    async def reconcile_dlna_targets(self, group_id: str) -> None:
+        """Apply a dlna_targets membership change to a live session."""
+        if not self._dlna_targets:
+            return
+        for receiver in settings.active_receivers():
+            if receiver.target_type != "group" or receiver.target_id != group_id:
+                continue
+            await self._dlna_targets.reconcile(
+                receiver.id,
+                settings.receiver_dlna_targets(receiver.id),
+                settings.receiver_network_channels(receiver.id),
+            )
+
+    async def stop_dlna_targets(self, receiver_id: str) -> None:
+        if self._dlna_targets:
+            await self._dlna_targets.stop_targets(receiver_id)
+
+    async def reconcile_airplay_targets(self, group_id: str) -> None:
+        """Apply an airplay_targets membership change to live sessions without
+        touching pipelines or the Xiaomi path."""
+        if not self._airplay_targets:
+            return
+        for receiver in settings.active_receivers():
+            if receiver.target_type != "group" or receiver.target_id != group_id:
+                continue
+            target_ids = settings.receiver_airplay_targets(receiver.id)
+            tap = self._target_taps.get(receiver.id)
+            if tap is None and target_ids:
+                # No PCM tap exists yet (the group had no targets when its
+                # pipelines were built) — rebuild once to create it.
+                await self.rebuild_pipelines()
+                tap = self._target_taps.get(receiver.id)
+            if tap is None:
+                continue
+            await self._airplay_targets.start_targets(
+                receiver.id,
+                target_ids,
+                tap,
+                settings.receiver_airplay_delays(receiver.id),
+                settings.receiver_network_channels(receiver.id),
+            )
+
+    async def stop_airplay_targets(self, receiver_id: str) -> None:
+        if self._airplay_targets:
+            await self._airplay_targets.stop_targets(receiver_id)
+
+    async def _start_airplay2_pipelines(self) -> None:
+        active_instances = {item.id: item for item in settings.airplay2_instances if item.enabled}
+        tracked = set(self._airplay2_runtime) | set(self._airplay2_sources)
+        for instance_id in list(tracked):
+            if instance_id not in active_instances:
+                await self._stop_airplay2_pipeline(instance_id)
+                self._airplay2_runtime.pop(instance_id, None)
+
+        desired = [
+            DesiredReceiver(key=item.id, device_id=item.id, name=item.name, protocol="airplay2")
+            for item in active_instances.values()
+        ]
+        if not desired:
+            return
+        if airplay2_mode() == "single":
+            instance = next(iter(active_instances.values()))
+            group, stereo, variants = self._airplay2_variant_plan(instance)
+            desired_ids = {f"{instance.id}{v['suffix']}" for v in variants}
+            existing_ids = {
+                key
+                for key in self._airplay2_pipelines
+                if key == instance.id or key.startswith(f"{instance.id}-")
+            }
+            if existing_ids == desired_ids and all(
+                self._airplay2_pipelines[key].status == "running" for key in existing_ids
+            ):
+                return
+            if existing_ids:
+                await self._stop_airplay2_pipeline(instance.id)
+            runtime = {"id": instance.id, "status": "starting", "detail": "正在启动"}
+            self._airplay2_runtime[instance.id] = runtime
+            source = create_pcm_source(settings.airplay2_pcm_source)
+            self._airplay2_sources[instance.id] = source
+            try:
+                reader = await source.start()
+            except Exception as exc:
+                runtime.update(status="error", detail=str(exc))
+                logger.exception("Single AirPlay 2 PCM source failed")
+                return
+            await self._start_airplay2_variant_pipelines(
+                instance, group, stereo, variants, reader,
+                input_sample_rate=None, pace_source=True,
+                input_volume=None, runtime=runtime,
+            )
+            if runtime["status"] == "starting":
+                runtime.update(status="running", detail="运行正常")
+            return
+        try:
+            actual = await OrchestratorClient(
+                settings.orchestrator_url, settings.orchestrator_token
+            ).reconcile(desired)
+        except Exception as exc:
+            logger.exception("Internal AirPlay 2 orchestrator reconcile failed")
+            for item in active_instances.values():
+                pipeline = self._airplay2_pipelines.get(item.id)
+                self._airplay2_runtime[item.id] = (
+                    {"id": item.id, "status": "running", "detail": ""}
+                    if pipeline and pipeline.status == "running"
+                    else {"id": item.id, "status": "error", "detail": str(exc)}
+                )
+            return
+        for result in actual:
+            runtime = {"id": result.device_id, "status": result.status, "detail": result.error}
+            self._airplay2_runtime[result.device_id] = runtime
+            if result.status != "running" or not result.pcm_host:
+                continue
+            instance = active_instances.get(result.device_id)
+            if not instance:
+                continue
+            group, stereo, variants = self._airplay2_variant_plan(instance)
+            desired_ids = {f"{instance.id}{v['suffix']}" for v in variants}
+            existing_ids = {
+                key
+                for key in self._airplay2_pipelines
+                if key == instance.id or key.startswith(f"{instance.id}-")
+            }
+            if existing_ids == desired_ids and all(
+                self._airplay2_pipelines[key].status == "running" for key in existing_ids
+            ):
+                continue
+            if existing_ids:
+                await self._stop_airplay2_pipeline(instance.id)
+
+            try:
+                source = create_pcm_source(f"tcp:{result.pcm_host}:{result.pcm_port}")
+                source_reader = await source.start()
+            except Exception as exc:
+                logger.exception("AirPlay 2 PCM source connect failed for %s", instance.id)
+                runtime.update(status="error", detail=str(exc))
+                continue
+            self._airplay2_sources[instance.id] = source
+
+            # Fail quiet until a validated receiver callback supplies volume.
+            known_volume = self._sender_volumes.get(instance.id)
+            input_volume = (
+                100
+                if known_volume is not None and self._volume_modes.get(instance.id) == "linked"
+                else known_volume or 0
+            )
+            await self._start_airplay2_variant_pipelines(
+                instance, group, stereo, variants, source_reader,
+                input_sample_rate=48000, pace_source=False,
+                input_volume=input_volume, runtime=runtime,
+            )
+
+    def _airplay2_variant_plan(self, instance) -> tuple:
+        """Resolve an instance's (group, stereo, stream variants) plan.
+
+        Stereo groups get one channel-split stream per side; anything else
+        collapses to the base (and EQ) variants — same rule local classic
+        receivers follow.
+        """
+        group = settings.group_for_receiver(instance.id)
+        variants = settings.receiver_stream_variants(instance.id)
+        # Stereo mode needs at least one channel-split stream.
+        stereo = bool(group and group.mode == "stereo" and any(v["base"] for v in variants))
+        if not stereo:
+            variants = [v for v in variants if v["base"] == ""] or [
+                {"suffix": "", "base": "", "channel": None, "eq": None}
+            ]
+        return group, stereo, variants
+
+    async def _start_airplay2_variant_pipelines(
+        self,
+        instance,
+        group,
+        stereo: bool,
+        variants: list[dict],
+        reader,
+        *,
+        input_sample_rate: int | None,
+        pace_source: bool,
+        input_volume: int | None,
+        runtime: dict,
+    ) -> None:
+        """Fan one AirPlay 2 instance's PCM reader out into its stream variants.
+
+        Shared by single and orchestrated deployments so a stereo-group target
+        behaves identically in both: the reader is teed and each channel/EQ
+        pipeline pans or shapes its side.
+        """
+        readers = [reader]
+        # External AirPlay targets get one extra tee output carrying the
+        # un-EQ'd base mix, exactly like the classic path's tap.
+        wants_tap = bool(settings.receiver_airplay_targets(instance.id))
+        if len(variants) > 1 or wants_tap:
+            tee = PCMTee(reader, outputs=len(variants) + (1 if wants_tap else 0))
+            tee.start()
+            self._airplay2_tees[instance.id] = tee
+            readers = list(tee.outputs)
+        if wants_tap:
+            self._target_taps[instance.id] = readers[-1]
+            readers = readers[:-1]
+        else:
+            self._target_taps.pop(instance.id, None)
+        for index, variant in enumerate(variants):
+            stream_id = f"{instance.id}{variant['suffix']}"
+            label = {"left": "左声道", "right": "右声道"}.get(variant["channel"])
+            alias = f"{instance.name} ({label})" if label else instance.name
+            if variant["eq"]:
+                alias = f"{alias} · EQ"
+            pipeline = SpeakerPipeline(
+                device_id=instance.id,
+                alias=alias,
+                pcm_source=ReaderPCMSource(readers[index]),
+                stream_server=self._stream_server,
+                on_session_start=self.on_session_start,
+                stream_id=stream_id,
+                group_id=group.id if stereo else None,
+                channel=variant["channel"] if stereo else None,
+                eq_bands=variant["eq"],
+                input_sample_rate=input_sample_rate,
+                pace_source=pace_source,
+                session_active=self._session_active_for(instance.id),
+            )
+            self._airplay2_pipelines[stream_id] = pipeline
+            if input_volume is not None:
+                pipeline.set_input_volume(input_volume)
+            try:
+                await pipeline.start()
+            except Exception as exc:
+                logger.exception("AirPlay 2 pipeline %s failed", stream_id)
+                runtime.update(status="error", detail=str(exc))
+
+    async def _create_local_pipelines(self, item) -> None:
+        """Create the pipeline(s) for one running local receiver.
+
+        One variant per (stereo channel, EQ signature): speakers with the same
+        EQ share a stream; a speaker with its own EQ gets a split stream
+        (``{rid}-q1`` / ``{rid}-Lq1`` …) fed by a tee of the receiver's PCM.
+        """
+        group = settings.group_for_receiver(item.id)
+        variants = settings.receiver_stream_variants(item.id)
+        # Stereo mode needs at least one channel-split stream — from speakers
+        # holding channels and/or network devices with a channel assignment
+        # (a group of only network devices is stereo-capable too).
+        stereo = bool(group and group.mode == "stereo" and any(v["base"] for v in variants))
+        if not stereo:
+            # Channel split is a stereo-group feature; ignore stray channel
+            # assignments and collapse to the EQ variants of the base stream.
+            variants = [v for v in variants if v["base"] == ""] or [
+                {"suffix": "", "base": "", "channel": None, "eq": None}
+            ]
+
+        readers = [item.server.pcm_reader]
+        # External AirPlay targets get one extra tee output carrying the
+        # un-EQ'd base mix (EQ is per Xiaomi speaker and stays on their streams).
+        wants_tap = bool(settings.receiver_airplay_targets(item.id))
+        if len(variants) > 1 or wants_tap:
+            tee = PCMTee(item.server.pcm_reader, outputs=len(variants) + (1 if wants_tap else 0))
+            tee.start()
+            self._tees.append(tee)
+            readers = tee.outputs
+        if wants_tap:
+            self._target_taps[item.id] = readers[-1]
+            readers = readers[:-1]
+        else:
+            self._target_taps.pop(item.id, None)
+
+        base_url = (
+            f"http://{settings.effective_stream_host}:{settings.stream_port}/stream/{item.id}"
+        )
+        for index, variant in enumerate(variants):
+            stream_id = f"{item.id}{variant['suffix']}"
+            label = {"left": "左声道", "right": "右声道"}.get(variant["channel"])
+            alias = f"{item.name} ({label})" if label else item.name
+            if variant["eq"]:
+                alias = f"{alias} · EQ"
+            pipeline = SpeakerPipeline(
+                device_id=item.id,
+                alias=alias,
+                pcm_source=ReaderPCMSource(readers[index]),
+                stream_server=self._stream_server,
+                input_sample_rate=44100,
+                stream_id=stream_id,
+                group_id=group.id if stereo else None,
+                channel=variant["channel"] if stereo else None,
+                eq_bands=variant["eq"],
+                session_active=self._session_active_for(item.id),
+            )
+            self._pipelines[stream_id] = pipeline
+            pipeline.set_input_volume(
+                100
+                if self._volume_modes.get(item.id) == "linked"
+                else self._sender_volumes.get(item.id, 100)
+            )
+            try:
+                await pipeline.start()
+            except Exception as exc:
+                item.status = "error"
+                item.detail = str(exc)
+        item.stream_url = base_url
+        if len(variants) > 1:
+            logger.info(
+                "Receiver %s: %d stream variants (%s)",
+                item.id,
+                len(variants),
+                ", ".join(v["suffix"] or "(base)" for v in variants),
+            )
+
+    async def rebuild_pipelines(self) -> None:
+        """Rebuild pipelines after a topology change (mirror ↔ stereo).
+
+        Unlike a full restart, RAOP servers and phone sessions stay up, and
+        stream endpoints are kept registered so connected speakers do not get
+        disconnected mid-play. Playing speakers are re-told their (possibly
+        new per-channel) stream URL via the audio-restarted hook.
+        """
+        if settings.airplay_engine != "local":
+            await self.restart()
+            return
+        async with self._restart_lock:
+            await self._rebuild_pipelines_locked()
+        if self.on_audio_restarted:
+            try:
+                await self.on_audio_restarted()
+            except Exception:
+                logger.exception("audio-restarted hook failed")
+
+    async def _rebuild_pipelines_locked(self) -> None:
+        """Rebuild all local pipelines, keeping streams registered. Lock held."""
+        logger.info("Rebuilding pipelines for topology change")
+        await self._stop_pipelines(keep_streams=True)
+        for item in self._local_provider.receivers.values():
+            if item.status != "running" or not item.server:
+                continue
+            try:
+                await self._create_local_pipelines(item)
+            except Exception:
+                logger.exception("Failed to rebuild pipeline for %s", item.id)
+                self._error_count += 1
+        # Drop endpoints that no longer exist (e.g. -L/-R after stereo→mirror).
+        active_stream_ids = set(self._pipelines) | set(self._airplay2_pipelines)
+        for stream_id in self._stream_server.stream_ids():
+            if stream_id not in active_stream_ids:
+                self._stream_server.unregister_stream(stream_id)
+        self._plan = compute_plan(settings)
+
+    async def _local_session_start(self, receiver_id: str, resume: bool = False) -> None:
+        self._active_sessions.add(receiver_id)
+        if not resume:
+            self._volume_modes[receiver_id] = settings.sender_volume_mode
+            if settings.sender_volume_mode == "independent" and self._airplay_targets:
+                self._airplay_targets.independent_volume(receiver_id)
+        has_pipeline = any(
+            key == receiver_id or key.startswith(f"{receiver_id}-") for key in self._pipelines
+        )
+        if has_pipeline and self.on_local_stream:
+            # No cache-buster here: the channel suffix (-L/-R) is appended by
+            # the caller and must stay inside the path, before any query.
+            url = (
+                f"http://{settings.effective_stream_host}:{settings.stream_port}"
+                f"/stream/{receiver_id}"
+            )
+            # A resume after a network blip re-asserts only targets this
+            # receiver still owns; a fresh session may steal from others.
+            await self.on_local_stream(receiver_id, url, steal=not resume)
+            if receiver_id in self._sender_volumes:
+                await self._local_volume(receiver_id, self._sender_volumes[receiver_id])
+            if not resume and self.on_volume_session_start:
+                asyncio.create_task(self.on_volume_session_start(receiver_id))
+        tap = self._target_taps.get(receiver_id)
+        if tap is None and self._airplay_targets and settings.receiver_airplay_targets(receiver_id):
+            # A session on an entry whose pipelines predate the target list —
+            # build the missing tap on the spot instead of dropping the target.
+            await self._rebuild_entry_for_tap(receiver_id)
+            tap = self._target_taps.get(receiver_id)
+        await self._start_entry_targets(receiver_id, resume=resume)
+        if receiver_id in self._sender_volumes:
+            await self._local_volume(receiver_id, self._sender_volumes[receiver_id])
+
+    async def _rebuild_entry_for_tap(self, entry_id: str) -> None:
+        """Rebuild one entry's pipelines so its external-target PCM tap exists."""
+        is_airplay2 = any(
+            key == entry_id or key.startswith(f"{entry_id}-")
+            for key in self._airplay2_pipelines
+        ) or entry_id in self._airplay2_runtime
+        if is_airplay2:
+            await self._rebuild_airplay2_instances({entry_id})
+        elif settings.airplay_engine == "local":
+            await self.rebuild_pipelines()
+
+    async def _start_entry_targets(self, entry_id: str, *, resume: bool) -> None:
+        """Start the external AirPlay/DLNA members of an entry's group.
+
+        Shared by the classic local session path and the AirPlay 2 session
+        callback so a mapped group's network members play regardless of which
+        ingress the phone used.
+        """
+        tap = self._target_taps.get(entry_id)
+        if tap is not None and self._airplay_targets:
+            await self._airplay_targets.start_targets(
+                entry_id,
+                settings.receiver_airplay_targets(entry_id),
+                tap,
+                settings.receiver_airplay_delays(entry_id),
+                settings.receiver_network_channels(entry_id),
+                initial_volume=(
+                    settings.default_volume
+                    if not resume
+                    and settings.default_volume_enabled
+                    and self._volume_modes.get(entry_id) == "independent"
+                    else None
+                ),
+            )
+        dlna_ids = settings.receiver_dlna_targets(entry_id)
+        if dlna_ids and self._dlna_targets:
+            # DLNA renderers pull the HTTP stream — no PCM tap needed.
+            cast_url = (
+                f"http://{settings.effective_stream_host}:{settings.stream_port}"
+                f"/stream/{entry_id}"
+            )
+            await self._dlna_targets.play_targets(
+                entry_id, dlna_ids, cast_url, settings.receiver_network_channels(entry_id)
+            )
+            if (
+                not resume
+                and settings.default_volume_enabled
+                and self._volume_modes.get(entry_id) == "independent"
+            ):
+                await self._dlna_targets.set_volume(entry_id, settings.default_volume)
+
+    async def _local_session_stop(self, receiver_id: str) -> None:
+        self._active_sessions.discard(receiver_id)
+        if self.on_session_stop:
+            try:
+                await self.on_session_stop(receiver_id)
+            except Exception:
+                logger.exception("session_stop hook failed for %s", receiver_id)
+
+    def _session_active_for(self, receiver_id: str) -> Callable[[], bool]:
+        return lambda: receiver_id in self._active_sessions
+
+    def stream_starved(self, stream_id: str) -> bool:
+        """The stream's pipeline stopped producing bytes during a live sender
+        session — a connected speaker is then pulling a worthless stream. A
+        paused sender looks identical at this layer, so callers must treat this
+        as "worth a restore nudge", not as proof of failure."""
+        pipeline = self._pipelines.get(stream_id) or self._airplay2_pipelines.get(stream_id)
+        if pipeline is None or pipeline.device_id not in self._active_sessions:
+            return False
+        silence = pipeline.source_silence_seconds
+        return silence is not None and silence > 10.0
+
+    async def _local_volume(self, receiver_id: str, percent: int) -> None:
+        """Apply a sender's volume through the loudness stack for `receiver_id`.
+
+        Loudness is four deliberate layers — sender digital gain (this method,
+        applied to raw PCM via ``apply_pcm_gain``), per-speaker EQ, per-speaker
+        trim (``gains_db``), and the physical amplifier — and two modes:
+
+        * ``independent`` — sender volume stays digital (stream gain only);
+          the physical speaker volume is a separate, per-device concern.
+        * ``linked`` — sender volume drives the physical speakers' own volume
+          (``DeviceManager.owned_targets``, or the external target managers)
+          and the stream gain is pinned to 100% to avoid double attenuation.
+
+        DLNA keeps its own session latch of the same mode in
+        ``DlnaService.state.volume_mode``; owner keys are namespaced per
+        ingress (``dlna:{id}`` vs bare ``id``) so the two paths never steal
+        each other's speakers.
+        """
+        self._sender_volumes[receiver_id] = percent
+        mode = self._volume_modes.setdefault(receiver_id, settings.sender_volume_mode)
+        pipelines = {**self._pipelines, **getattr(self, "_airplay2_pipelines", {})}
+        for key, pipeline in pipelines.items():
+            if key == receiver_id or key.startswith(f"{receiver_id}-"):
+                pipeline.set_input_volume(100 if mode == "linked" else percent)
+        if self._airplay_targets:
+            self._airplay_targets.set_input_volume(
+                receiver_id, 100 if mode == "linked" else percent
+            )
+            if mode == "linked":
+                await self._airplay_targets.set_volume(receiver_id, percent)
+            else:
+                self._airplay_targets.independent_volume(receiver_id)
+        if mode == "linked" and getattr(self, "_dlna_targets", None):
+            await self._dlna_targets.set_volume(receiver_id, percent)
+        logger.info("AirPlay %s stream volume -> %s%%", receiver_id, percent)
+        if self.on_receiver_volume:
+            await self.on_receiver_volume(receiver_id, percent)
+
+    async def _stop_engine(self) -> None:
+        if self._airplay_targets:
+            await self._airplay_targets.stop_all()
+        if self._dlna_targets:
+            await self._dlna_targets.stop_all()
+        if self._airplay_discovery:
+            await self._airplay_discovery.stop()
+        self._target_taps.clear()
+        await self._local_provider.stop()
+        await self._stop_airplay2_pipelines()
+        await self._stop_pipelines()
+        await self._receiver_manager.stop()
+        await self._stream_server.stop()
+
+    def _derive_status(self) -> str:
+        receivers = (
+            list(self._local_provider.receivers.values())
+            if settings.airplay_engine == "local"
+            else self._receiver_manager.receivers
+        )
+        if not receivers:
+            return "idle"
+        failed = sum(receiver.status == "error" for receiver in receivers)
+        if failed == len(receivers):
+            return "error"
+        if failed:
+            return "degraded"
+        return "running"
+
+    async def _stop_pipelines(self, keep_streams: bool = False) -> None:
+        for pipeline in list(self._pipelines.values()):
+            try:
+                await pipeline.stop(keep_stream=keep_streams)
+            except Exception:
+                logger.exception("Error stopping pipeline for %s", pipeline.device_id)
+        self._pipelines.clear()
+        for tee in self._tees:
+            await tee.stop()
+        self._tees.clear()
+
+    async def _stop_airplay2_pipelines(self) -> None:
+        instance_ids = (
+            set(self._airplay2_runtime) | set(self._airplay2_sources) | set(self._airplay2_tees)
+        )
+        for instance_id in instance_ids:
+            await self._stop_airplay2_pipeline(instance_id)
+        self._airplay2_runtime.clear()
+
+    async def _stop_airplay2_pipeline(self, instance_id: str) -> None:
+        stream_ids = [
+            key
+            for key in self._airplay2_pipelines
+            if key == instance_id or key.startswith(f"{instance_id}-")
+        ]
+        for stream_id in stream_ids:
+            pipeline = self._airplay2_pipelines.pop(stream_id, None)
+            if not pipeline:
+                continue
+            try:
+                await pipeline.stop()
+            except Exception:
+                logger.exception("Error stopping AirPlay 2 pipeline %s", pipeline.device_id)
+        # External members of the instance's group stop with it.
+        if self._airplay_targets:
+            await self._airplay_targets.stop_targets(instance_id)
+        if self._dlna_targets:
+            await self._dlna_targets.stop_targets(instance_id)
+        self._target_taps.pop(instance_id, None)
+        tee = self._airplay2_tees.pop(instance_id, None)
+        if tee:
+            try:
+                await tee.stop()
+            except Exception:
+                logger.exception("Error stopping AirPlay 2 PCM tee for %s", instance_id)
+        source = self._airplay2_sources.pop(instance_id, None)
+        if source:
+            try:
+                await source.stop()
+            except Exception:
+                logger.exception("Error stopping AirPlay 2 PCM source for %s", instance_id)
+
+    async def session_start(self, device_id: str | None = None) -> None:
+        """Called when an AirPlay session begins on a receiver."""
+        if device_id is None:
+            # Single-receiver fallback: use the only pipeline.
+            if len(self._pipelines) == 1:
+                device_id = next(iter(self._pipelines.keys()))
+            else:
+                logger.warning("session_start called without device_id in multi-receiver mode")
+                return
+        pipeline = self._pipelines.get(device_id) or self._airplay2_pipelines.get(device_id)
+        if pipeline:
+            self._active_sessions.add(device_id)
+            self._volume_modes[device_id] = settings.sender_volume_mode
+            await pipeline.session_start()
+            if device_id in self._airplay2_pipelines:
+                # AirPlay 2 ingress: start the mapped group's external
+                # AirPlay/DLNA members too (classic sessions do this in
+                # _local_session_start; this callback is their only trigger).
+                tap_missing = self._target_taps.get(device_id) is None
+                if tap_missing and settings.receiver_airplay_targets(device_id):
+                    await self._rebuild_entry_for_tap(device_id)
+                await self._start_entry_targets(device_id, resume=False)
+            if device_id in self._sender_volumes:
+                await self._local_volume(device_id, self._sender_volumes[device_id])
+        else:
+            logger.warning("session_start for unknown receiver: %s", device_id)
+
+    async def session_stop(self, device_id: str | None = None) -> None:
+        """Called when an AirPlay session ends on a receiver."""
+        if device_id is None:
+            if len(self._pipelines) == 1:
+                device_id = next(iter(self._pipelines.keys()))
+            else:
+                return
+        self._active_sessions.discard(device_id)
+        if self.on_session_stop:
+            try:
+                await self.on_session_stop(device_id)
+            except Exception:
+                logger.exception("session_stop hook failed for %s", device_id)
+
+    async def disconnect_sessions(self, receiver_id: str | None = None) -> int:
+        """Disconnect active AirPlay senders while leaving receivers advertised."""
+        if settings.airplay_engine != "local":
+            return 0
+        return await self._local_provider.disconnect(receiver_id)
+
+    def stream_client_count(self, stream_id: str) -> int:
+        """How many speakers are currently pulling a stream (ground truth for
+        "is audio really flowing out")."""
+        return self._stream_server.client_count(stream_id)
+
+    def drop_stream_clients(self, receiver_id: str) -> None:
+        """Close speaker-side HTTP connections of a receiver's streams.
+
+        Called when a session ends: a paused speaker otherwise keeps the socket
+        open forever, silently waiting for data that will never come (and the
+        topology would show a flow that isn't there)."""
+        for stream_id in self._stream_server.stream_ids():
+            if stream_id == receiver_id or stream_id.startswith(f"{receiver_id}-"):
+                self._stream_server.kick_clients(stream_id)
+
+    async def _sweep_stale_stream_clients(self) -> None:
+        """Last-resort cleanup for speaker connections the teardown path missed.
+
+        The normal disconnect flow (delayed stop → speaker stop + client kick)
+        works, but a kicked speaker retries its last URL a few times and can
+        re-attach AFTER the kick, and a canceled pending stop never kicks at
+        all. Anything left with no data flow and no owning session is stale.
+        """
+        while True:
+            await asyncio.sleep(STREAM_SWEEP_INTERVAL_SECONDS)
+            try:
+                self._sweep_stale_once()
+            except Exception:
+                logger.exception("Stale stream client sweep failed")
+
+    def _sweep_stale_once(self) -> None:
+        receiver_ids = [receiver.id for receiver in settings.active_receivers()]
+        for stream_id in self._stream_server.stream_ids():
+            if not self._stream_server.client_count(stream_id):
+                continue
+            if self._stream_server.is_flowing(stream_id, window=STREAM_IDLE_KICK_SECONDS):
+                continue
+            owner = _stream_owner(stream_id, receiver_ids)
+            if owner is None or owner not in self._local_provider.receivers:
+                continue  # not a local-engine receiver (e.g. AirPlay 2 pipeline)
+            server = self._local_provider.receivers[owner].server
+            if server and server.sessions > 0:
+                continue  # paused phone session: the waiting speaker is wanted
+            self._stream_server.kick_clients(stream_id)
+
+
+def _stream_owner(stream_id: str, receiver_ids: list[str]) -> str | None:
+    """Map a stream id back to its receiver: variants are `<receiver_id>-L/-R/-qN`."""
+    matches = [rid for rid in receiver_ids if stream_id == rid or stream_id.startswith(f"{rid}-")]
+    return max(matches, key=len) if matches else None
+
+
+def _diff_summary(diff: PlanDiff) -> str:
+    parts = []
+    if diff.full_restart_required:
+        parts.append("full-restart")
+    if diff.classic_added_removed:
+        parts.append("classic-set")
+    if diff.classic_rebuild:
+        parts.append("classic-rebuild")
+    if diff.audio_only:
+        parts.append("audio-format")
+    if diff.airplay2_added:
+        parts.append(f"airplay2+{sorted(diff.airplay2_added)}")
+    if diff.airplay2_removed:
+        parts.append(f"airplay2-{sorted(diff.airplay2_removed)}")
+    if diff.airplay2_rebuild:
+        parts.append(f"airplay2-rebuild{sorted(diff.airplay2_rebuild)}")
+    if diff.external_airplay_changed:
+        parts.append(f"airplay-targets{sorted(diff.external_airplay_changed)}")
+    if diff.external_dlna_changed:
+        parts.append(f"dlna-targets{sorted(diff.external_dlna_changed)}")
+    if diff.membership_changed:
+        parts.append(f"membership{sorted(diff.membership_changed)}")
+    if diff.delay_only:
+        parts.append("delay-only(live)")
+    return ", ".join(parts)

@@ -1,0 +1,161 @@
+"""Device discovery routes."""
+
+import asyncio
+
+from fastapi import APIRouter, HTTPException
+
+from micast.audio_bridge import AudioBridge
+from micast.config import EQ_BAND_COUNT, EQ_BANDS_HZ, EQ_PRESETS, settings
+from micast.xiaomi.auth import XiaomiAuthError
+from micast.xiaomi.device_manager import DeviceManager
+
+router = APIRouter(prefix="/api/devices", tags=["devices"])
+
+# Fallback names for common Xiaomi speaker hardware codes
+_HARDWARE_NAMES: dict[str, str] = {
+    "LX06": "小爱音箱 Pro",
+    "LX01": "小爱音箱 mini",
+    "L06A": "小爱音箱",
+    "L06B": "小爱音箱 mini",
+    "L06C": "小爱音箱 Play",
+    "L09G": "小爱音箱 HD",
+    "S12": "小爱音箱 Art",
+    "S12A": "小爱音箱 Art 电池版",
+    "L16A": "Xiaomi Sound",
+    "OH2P": "Xiaomi 智能音箱 Pro",
+    "OH2": "Xiaomi 智能音箱",
+    "L05B": "小爱音箱 Play",
+    "L05C": "小爱音箱 Play",
+    "L15A": "Xiaomi Sound Pro",
+    "L17A": "Xiaomi Sound Move",
+}
+
+
+def _clean_name(raw: str | None, hardware: str | None) -> str:
+    """Prefer a verified hardware mapping when Xiaomi returns a poor device name."""
+    if hardware and hardware in _HARDWARE_NAMES:
+        return _HARDWARE_NAMES[hardware]
+    if raw and raw.strip():
+        return raw
+    return hardware or "未知设备"
+
+
+def install(device_manager: DeviceManager, bridge: AudioBridge | None = None) -> APIRouter:
+    @router.get("")
+    async def get_devices():
+        try:
+            devices = await device_manager.list_devices()
+            if bridge and device_manager.consume_merge_rewrite():
+                # A device id migrated under us: stream ids and pipeline
+                # targets still reference the old did — rebuild the affected
+                # entries now instead of after the next unrelated restart.
+                await bridge.apply_config_change()
+            device_ids = [d.get("deviceID") for d in devices]
+            volumes = await asyncio.gather(
+                *(
+                    device_manager.get_volume(did, refresh=True) if did else _no_volume()
+                    for did in device_ids
+                )
+            )
+            result = []
+            for d, volume in zip(devices, volumes, strict=True):
+                did = d.get("deviceID")
+                speaker = settings.get_speaker(did)
+                native_name = _clean_name(d.get("name"), d.get("hardware"))
+                alias = device_manager.get_alias(did) if did else native_name
+                result.append(
+                    {
+                        "did": did,
+                        "name": native_name,
+                        "alias": alias,
+                        "model": d.get("hardware"),
+                        "presence": d.get("presence", "unknown"),
+                        "play_error": device_manager.play_errors().get(did),
+                        "playing": device_manager.is_playing(did),
+                        "muted": device_manager.is_muted(did),
+                        "enabled": speaker.enabled if speaker else False,
+                        "selected": did == settings.selected_device_id,
+                        "volume": volume,
+                        "eq": {
+                            "enabled": speaker.eq_enabled if speaker else False,
+                            "bands": list(speaker.eq_bands) if speaker else [0.0] * EQ_BAND_COUNT,
+                            "preset": speaker.eq_preset if speaker else "",
+                        },
+                    }
+                )
+            return result
+        except XiaomiAuthError as e:
+            raise HTTPException(status_code=401, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+    @router.get("/eq/presets")
+    async def get_eq_presets():
+        return {"bands_hz": list(EQ_BANDS_HZ), "presets": EQ_PRESETS}
+
+    @router.post("/eq")
+    async def set_eq(payload: dict):
+        did = payload.get("did")
+        enabled = payload.get("enabled")
+        bands = payload.get("bands")
+        if not did or not isinstance(enabled, bool) or not isinstance(bands, list):
+            raise HTTPException(status_code=400, detail="did, enabled and bands required")
+        try:
+            speaker = settings.set_speaker_eq(
+                did, enabled=enabled, bands=bands, preset=str(payload.get("preset", ""))
+            )
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        # EQ changes which stream a speaker pulls (split by EQ signature), so
+        # pipelines are rebuilt and playing speakers re-pointed, not just the
+        # encoder restarted. Rapid slider drags are debounced by the UI.
+        if bridge:
+            await bridge.apply_config_change()
+        return {
+            "did": did,
+            "eq": {
+                "enabled": speaker.eq_enabled,
+                "bands": list(speaker.eq_bands),
+                "preset": speaker.eq_preset,
+            },
+        }
+
+    @router.post("/select")
+    async def select_device(payload: dict):
+        did = payload.get("did")
+        if did is None:
+            raise HTTPException(status_code=400, detail="did required")
+        ok = device_manager.select_device(did)
+        if not ok:
+            raise HTTPException(status_code=404, detail="device not found")
+        if bridge and settings.receiver_mode == "single":
+            await bridge.restart()
+        return {"selected": did}
+
+    @router.post("/alias")
+    async def set_alias(payload: dict):
+        did = payload.get("did")
+        alias = str(payload.get("alias", "")).strip()
+        if not did or not alias:
+            raise HTTPException(status_code=400, detail="did and alias required")
+        device_manager.set_alias(did, alias)
+        if bridge:
+            await bridge.apply_config_change()
+        return {"did": did, "alias": alias}
+
+    @router.post("/enabled")
+    async def set_enabled(payload: dict):
+        did = payload.get("did")
+        enabled = payload.get("enabled")
+        if not did or not isinstance(enabled, bool):
+            raise HTTPException(status_code=400, detail="did and enabled boolean required")
+        device_manager.set_enabled(did, enabled)
+        if bridge:
+            await bridge.apply_config_change()
+        return {"did": did, "enabled": enabled}
+
+    return router
+
+
+async def _no_volume() -> None:
+    return None

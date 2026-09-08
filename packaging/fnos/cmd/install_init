@@ -1,0 +1,8 @@
+#!/bin/bash
+set -u
+
+PYTHON_BIN="/var/apps/python312/target/bin/python3"
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "缺少飞牛 Python 3.12 运行时。" > "$TRIM_TEMP_LOGFILE"
+  exit 1
+fi

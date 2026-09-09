@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # speaker re-pulling an old URL on its own) leaves a client attached to a
 # silent stream forever — the topology then shows a permanent 滞留 edge.
 STREAM_SWEEP_INTERVAL_SECONDS = 15.0
-STREAM_IDLE_KICK_SECONDS = 60.0
+STREAM_IDLE_KICK_SECONDS = 10.0
 
 
 class AudioBridge:
@@ -1269,17 +1269,19 @@ class AudioBridge:
 
     def _sweep_stale_once(self) -> None:
         receiver_ids = [receiver.id for receiver in settings.active_receivers()]
+        receiver_ids.extend(
+            instance.id for instance in settings.airplay2_instances if instance.enabled
+        )
         for stream_id in self._stream_server.stream_ids():
             if not self._stream_server.client_count(stream_id):
                 continue
             if self._stream_server.is_flowing(stream_id, window=STREAM_IDLE_KICK_SECONDS):
                 continue
             owner = _stream_owner(stream_id, receiver_ids)
-            if owner is None or owner not in self._local_provider.receivers:
-                continue  # not a local-engine receiver (e.g. AirPlay 2 pipeline)
-            server = self._local_provider.receivers[owner].server
-            if server and server.sessions > 0:
-                continue  # paused phone session: the waiting speaker is wanted
+            if owner is None:
+                continue
+            if owner in self._active_sessions:
+                continue  # paused sender session: the waiting speaker is wanted
             self._stream_server.kick_clients(stream_id)
 
 

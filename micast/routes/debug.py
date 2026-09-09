@@ -454,7 +454,7 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
             "stream_url": bridge.status["stream_url"],
             "audio_config": settings.audio.model_dump(),
             "bridge_status": bridge.status,
-            "stream_clients": bridge._stream_server.total_clients(),
+            "stream_clients": bridge._stream_server.total_flowing_clients(),
             "stream_bytes_sent": bridge._stream_server.total_bytes(),
             "diagnostics": bridge.diagnostics,
             "logs": runtime_logs.snapshot(),

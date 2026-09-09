@@ -68,9 +68,15 @@ interface DevicesProps {
 
 export function renderDevicesView(props: DevicesProps): string {
   const { devices, expandedDid, status, loggedIn, loadError, playback } = props;
-  const isRunning = status === "running";
-  const statusClass = isRunning ? "running" : status === "error" ? "error" : status === "degraded" ? "warning" : "";
-  const statusText = isRunning ? "可用" : status === "error" ? "不可用" : status === "degraded" ? "部分可用" : "检查中";
+  const onlineCount = devices.filter((item) => item.presence === "online").length;
+  const offlineCount = devices.filter((item) => item.presence === "offline").length;
+  const unknownCount = devices.length - onlineCount - offlineCount;
+  const statusClass = onlineCount > 0
+    ? offlineCount > 0 || unknownCount > 0 ? "warning" : "running"
+    : devices.length ? (offlineCount === devices.length ? "error" : "warning") : "";
+  const statusText = devices.length
+    ? offlineCount > 0 ? `${offlineCount} 台离线` : unknownCount > 0 ? `${unknownCount} 台待确认` : "全部在线"
+    : status === "error" ? "加载失败" : "尚无设备";
 
   return `
     <div class="page-heading">
@@ -84,7 +90,7 @@ export function renderDevicesView(props: DevicesProps): string {
         <div class="cell-icon blue">${icon("wave")}</div>
         <div class="cell-content">
           <span class="cell-title">${devices.length ? `已发现 ${devices.length} 台音箱` : "尚未发现音箱"}</span>
-          <span class="cell-subtitle">${devices.length ? `${devices.filter((item) => item.presence === "online").length} 台在线` : "登录后会自动显示可用音箱"}</span>
+          <span class="cell-subtitle">${devices.length ? `${onlineCount} 台在线${offlineCount ? `，${offlineCount} 台离线` : ""}${unknownCount ? `，${unknownCount} 台待确认` : ""}` : "登录后会自动显示账号下的音箱"}</span>
         </div>
         <span class="status-pill ${statusClass}" data-status-label>${statusText}</span>
       </div>

@@ -2,11 +2,10 @@
 
 import asyncio
 import time
-from types import SimpleNamespace
 
 from micast.audio_bridge import AudioBridge, _stream_owner
 from micast.audio_encoder import raw_pcm_format
-from micast.config import ReceiverConfig, settings
+from micast.config import AirPlay2InstanceConfig, ReceiverConfig, settings
 
 
 def _bridge(monkeypatch, *receiver_ids: str) -> AudioBridge:
@@ -25,12 +24,6 @@ def _attach_client(bridge: AudioBridge, stream_id: str) -> asyncio.Queue:
     return queue
 
 
-def _set_sessions(bridge: AudioBridge, receiver_id: str, count: int) -> None:
-    bridge._local_provider.receivers[receiver_id] = SimpleNamespace(
-        server=SimpleNamespace(sessions=count)
-    )
-
-
 def test_stream_owner_matches_longest_receiver_prefix():
     ids = ["speaker-abc", "speaker", "r1"]
     assert _stream_owner("speaker-abc-q1", ids) == "speaker-abc"
@@ -43,8 +36,6 @@ def test_idle_client_without_session_is_kicked(monkeypatch):
     bridge = _bridge(monkeypatch, "r1")
     queue = _attach_client(bridge, "r1")
     variant_queue = _attach_client(bridge, "r1-L")
-    _set_sessions(bridge, "r1", 0)
-
     bridge._sweep_stale_once()
 
     assert queue.get_nowait() is None  # EOF marker from the kick
@@ -54,7 +45,7 @@ def test_idle_client_without_session_is_kicked(monkeypatch):
 def test_idle_client_with_active_session_is_kept(monkeypatch):
     bridge = _bridge(monkeypatch, "r1")
     queue = _attach_client(bridge, "r1")
-    _set_sessions(bridge, "r1", 1)  # paused phone: speaker is waiting by design
+    bridge._active_sessions.add("r1")  # paused sender: speaker is waiting by design
 
     bridge._sweep_stale_once()
 
@@ -64,7 +55,6 @@ def test_idle_client_with_active_session_is_kept(monkeypatch):
 def test_flowing_stream_is_never_kicked(monkeypatch):
     bridge = _bridge(monkeypatch, "r1")
     queue = _attach_client(bridge, "r1")
-    _set_sessions(bridge, "r1", 0)
     bridge._stream_server._last_broadcast["r1"] = time.monotonic()
 
     bridge._sweep_stale_once()
@@ -75,8 +65,28 @@ def test_flowing_stream_is_never_kicked(monkeypatch):
 def test_unknown_owner_stream_is_left_alone(monkeypatch):
     bridge = _bridge(monkeypatch, "r1")
     queue = _attach_client(bridge, "airplay2-xyz")
-    _set_sessions(bridge, "r1", 0)
-
     bridge._sweep_stale_once()
 
     assert queue.empty()
+
+
+def test_idle_airplay2_client_without_active_session_is_kicked(monkeypatch):
+    bridge = _bridge(monkeypatch, "r1")
+    monkeypatch.setattr(
+        settings,
+        "airplay2_instances",
+        [
+            AirPlay2InstanceConfig(
+                id="airplay2-xyz",
+                name="MiCast",
+                enabled=True,
+                target_type="speaker",
+                target_id="speaker-1",
+            )
+        ],
+    )
+    queue = _attach_client(bridge, "airplay2-xyz")
+
+    bridge._sweep_stale_once()
+
+    assert queue.get_nowait() is None

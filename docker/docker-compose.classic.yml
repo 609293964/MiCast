@@ -9,7 +9,7 @@
 # 然后打开 http://<NAS-IP>:3000/app/micast/ ，扫码登录米家即可。
 services:
   micast:
-    image: ${MICAST_IMAGE:-micast:0.2.0}
+    image: ${MICAST_IMAGE:-micast:0.2.1}
     build:
       context: ..
       dockerfile: docker/Dockerfile

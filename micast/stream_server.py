@@ -281,6 +281,15 @@ class StreamServer:
     def total_clients(self) -> int:
         return sum(len(clients) for clients in self._clients.values())
 
+    def total_flowing_clients(self) -> int:
+        """HTTP consumers currently receiving fresh audio, excluding sockets
+        left open by paused or stopped speakers."""
+        return sum(
+            len(clients)
+            for stream_id, clients in self._clients.items()
+            if self.is_flowing(stream_id)
+        )
+
     def sink_connected(self, receiver_id: str, sink: str) -> bool:
         """Whether a current HTTP client already serves this grouped sink."""
         return any(

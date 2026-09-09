@@ -136,9 +136,17 @@ class DlnaDiscovery:
             path.endswith(f"/dlna/{receiver_id}/description.xml") for receiver_id in own_ids
         ):
             return
-        if location not in self._pending_locations and all(
-            location != device.location for device in self._devices.values()
-        ):
+        # Every search response is a fresh liveness observation. The old code
+        # ignored known locations without touching last_seen, so every healthy
+        # renderer was reported offline after the stale window elapsed.
+        known = next(
+            (device for device in self._devices.values() if device.location == location),
+            None,
+        )
+        if known is not None:
+            known.last_seen = time.monotonic()
+            return
+        if location not in self._pending_locations:
             self._pending_locations.add(location)
 
     async def _scan_loop(self) -> None:

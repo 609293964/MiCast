@@ -410,6 +410,7 @@ export function renderReceiversView(state: State): string {
                   <div>
                     <div class="device-name">${escapeHtml(r.name)}</div>
                     <span class="protocol-badge">经典 AirPlay</span>
+                    ${dlnaEnabled ? `<span class="protocol-badge">DLNA</span>` : ""}
                     ${detail ? `<span class="caption">${escapeHtml(detail)}</span>` : ""}
                   </div>
                 <span class="status-pill ${available ? "running" : r.status === "error" ? "error" : ""}">

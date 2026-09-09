@@ -78,10 +78,11 @@ export function renderConnectionChecks(debug: DebugState | null, state: State): 
   const streams = Object.values(debug?.diagnostics?.streams || {});
   const sum = (values: number[]) => values.reduce((total, value) => total + value, 0);
   const activeSessions = sum(raop.map((item) => item.active_sessions));
-  const streamClients = debug?.stream_clients ?? 0;
+  const streamClients = sum(streams.filter((item) => item.flowing).map((item) => item.clients));
+  const playbackActive = activeSessions > 0 || streamClients > 0;
   const transportErrors = sum(raop.map((item) => item.dropped_packets + item.decode_errors)) + sum(streams.map((item) => item.dropped_chunks));
   const inputBufferMs = Math.max(0, ...raop.map((item) => item.input_buffer_ms || 0));
-  const streamLatency = Math.max(0, ...streams.filter((item) => item.clients > 0).map((item) => item.latency?.estimated_ms || 0));
+  const streamLatency = Math.max(0, ...streams.filter((item) => item.flowing).map((item) => item.latency?.estimated_ms || 0));
   const latencyMs = inputBufferMs + streamLatency;
   const latencyLabel = activeSessions === 0
     ? "等待音频"
@@ -91,7 +92,7 @@ export function renderConnectionChecks(debug: DebugState | null, state: State): 
   const latencyState = streamClients === 0 ? "未测量" : latencyMs <= 500 ? "稳定" : latencyMs <= 1000 ? "较高" : "过高";
   return `
       <div class="cell">
-        <div class="cell-icon ${activeSessions > 0 ? "green" : "gray"}">${activeSessions > 0 ? "1" : "—"}</div>
+        <div class="cell-icon ${activeSessions > 0 ? "green" : "gray"}">${icon("antenna")}</div>
         <div class="cell-content">
           <span class="cell-title">音频输入</span>
           <span class="cell-subtitle">${activeSessions > 0 ? `${activeSessions} 个手机正在传输音频` : "目前没有手机传输音频"}</span>
@@ -99,7 +100,7 @@ export function renderConnectionChecks(debug: DebugState | null, state: State): 
         <span class="plain-state ${activeSessions > 0 ? "success" : ""}">${activeSessions > 0 ? "已连接" : "等待播放"}</span>
       </div>
       <div class="cell">
-        <div class="cell-icon ${streamClients > 0 ? "green" : "gray"}">${streamClients > 0 ? "2" : "—"}</div>
+        <div class="cell-icon ${streamClients > 0 ? "green" : "gray"}">${icon("speaker")}</div>
         <div class="cell-content">
           <span class="cell-title">音箱输出</span>
           <span class="cell-subtitle">${streamClients > 0 ? `${streamClients} 台音箱正在接收音频` : "当前没有音箱接收 MiCast 音频"}</span>
@@ -107,12 +108,12 @@ export function renderConnectionChecks(debug: DebugState | null, state: State): 
         <span class="plain-state ${streamClients > 0 ? "success" : ""}">${streamClients > 0 ? "正在接收" : "未连接"}</span>
       </div>
       <div class="cell">
-        <div class="cell-icon ${transportErrors > 0 ? "red" : "green"}">${transportErrors > 0 ? "!" : "✓"}</div>
+        <div class="cell-icon ${playbackActive && transportErrors > 0 ? "red" : playbackActive ? "green" : "gray"}">${playbackActive && transportErrors > 0 ? "!" : playbackActive ? "✓" : "—"}</div>
         <div class="cell-content">
           <span class="cell-title">音频传输质量</span>
-          <span class="cell-subtitle">${transportErrors > 0 ? `检测到 ${transportErrors} 个丢包、解码或流错误` : "暂未检测到丢包或解码错误"}</span>
+          <span class="cell-subtitle">${!playbackActive ? "开始播放后检查当前传输质量" : transportErrors > 0 ? `当前会话检测到 ${transportErrors} 个丢包、解码或流错误` : "当前传输未检测到丢包或解码错误"}</span>
         </div>
-        <span class="plain-state ${transportErrors > 0 ? "error" : "success"}">${transportErrors > 0 ? "需要检查" : "正常"}</span>
+        <span class="plain-state ${playbackActive ? (transportErrors > 0 ? "error" : "success") : ""}">${!playbackActive ? "等待播放" : transportErrors > 0 ? "需要检查" : "正常"}</span>
       </div>
       <div class="cell">
         <div class="cell-icon ${streamClients > 0 ? (latencyMs > 1000 ? "red" : "green") : "gray"}">${icon("clock")}</div>
@@ -257,11 +258,13 @@ export function renderStreamRows(debug: DebugState | null, state: State): string
       const name = tags.length ? `${baseName} · ${tags.join(" · ")}` : baseName;
       const sessions = raop[id]?.active_sessions ?? raop[baseId]?.active_sessions ?? 0;
       const mb = (s.bytes_sent / 1048576).toFixed(1);
-      const active = s.clients > 0;
+      const active = s.clients > 0 && s.flowing;
       const subtitle = active
         ? `${s.clients} 台音箱取流中 · 已发 ${mb} MB${s.dropped_chunks ? ` · 丢弃 ${s.dropped_chunks}` : ""}`
         : sessions > 0
           ? `手机已连接，暂无音箱取流 · 已发 ${mb} MB`
+          : s.clients > 0
+            ? `连接正在清理，当前无音频 · 已发 ${mb} MB`
           : `空闲 · 已发 ${mb} MB`;
       return `
         <div class="cell">

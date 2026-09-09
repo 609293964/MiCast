@@ -1,11 +1,13 @@
 appname=micast
-version=0.2.0
+version=0.2.1
 display_name=MiCast
 desc=把手机、电脑上的音频投放到一台或多台小米智能音箱。支持跨型号组播、多音箱同步和立体声组合，通过 AirPlay / DLNA 即连即播。
 source=thirdparty
 platform=x86
 maintainer=DyMode
+maintainer_url=https://github.com/DyMode/MiCast
 distributor=DyMode
+distributor_url=https://github.com/DyMode/MiCast
 os_min_version=1.2.0602
 install_dep_apps=python312
 desktop_uidir=ui

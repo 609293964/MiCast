@@ -159,7 +159,7 @@ export interface Status {
   };
   diagnostics: {
     raop: Record<string, { active_sessions: number; total_sessions: number; decode_errors: number; dropped_packets: number; resend_requests: number; timing_requests: number; timing_responses: number; input_buffer_ms: number }>;
-    streams: Record<string, { clients: number; bytes_sent: number; dropped_chunks: number; latency: LatencyMetrics }>;
+    streams: Record<string, { clients: number; bytes_sent: number; dropped_chunks: number; flowing: boolean; latency: LatencyMetrics }>;
     sinks: Record<string, Record<string, SinkLatencyMetrics>>;
   };
 }
@@ -229,7 +229,7 @@ export interface DebugState {
   stream_bytes_sent: number;
   diagnostics: {
     raop: Record<string, { active_sessions: number; total_sessions: number; decode_errors: number; dropped_packets: number; resend_requests: number; timing_requests: number; timing_responses: number; input_buffer_ms: number }>;
-    streams: Record<string, { clients: number; bytes_sent: number; dropped_chunks: number; latency: LatencyMetrics }>;
+    streams: Record<string, { clients: number; bytes_sent: number; dropped_chunks: number; flowing: boolean; latency: LatencyMetrics }>;
   };
   logs: Array<{ time: string; level: string; logger: string; message: string }>;
 }

@@ -3077,6 +3077,9 @@ html.is-embedded {
   background: radial-gradient(ellipse at 30% 20%, #0a1622 0%, #060d14 60%, #04080d 100%);
   border: 1px solid rgba(56, 189, 248, 0.12);
 }
+.topology-stage:has(.topology-empty:not([hidden])) {
+  height: clamp(18rem, 36dvh, 22rem);
+}
 .topology-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 .topology-hud {
   position: absolute;
@@ -3309,8 +3312,12 @@ html.is-embedded {
   /* Link map: the empty state must not compete with inactive nodes and the legend. */
   .topology-stage {
     height: auto;
-    min-height: 24rem;
+    min-height: 20rem;
     border-radius: 0.875rem;
+  }
+  .topology-stage:has(.topology-empty:not([hidden])) {
+    height: auto;
+    min-height: 17rem;
   }
   .topology-legend {
     left: auto;

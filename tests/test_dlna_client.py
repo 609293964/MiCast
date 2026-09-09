@@ -3,7 +3,7 @@
 
 from micast.airplay_discovery import classify_device
 from micast.config import Settings, SpeakerGroupConfig
-from micast.dlna_client import DlnaDiscovery, _soap_action
+from micast.dlna_client import DlnaDevice, DlnaDiscovery, _soap_action
 
 DESCRIPTION = """<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
@@ -46,6 +46,23 @@ def test_discovery_ignores_own_description_before_fetch(monkeypatch):
     discovery = DlnaDiscovery()
     discovery.note_location("http://192.168.0.12:3000/dlna/living/description.xml")
 
+    assert discovery._pending_locations == set()
+
+
+def test_known_dlna_response_refreshes_liveness():
+    location = "http://192.168.0.20/device.xml"
+    discovery = DlnaDiscovery()
+    discovery._devices["uuid:renderer"] = DlnaDevice(
+        id="uuid:renderer",
+        name="客厅电视",
+        location=location,
+        control_url="http://192.168.0.20/control",
+        last_seen=1,
+    )
+
+    discovery.note_location(location)
+
+    assert discovery._devices["uuid:renderer"].last_seen > 1
     assert discovery._pending_locations == set()
 
 

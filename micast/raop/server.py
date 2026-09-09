@@ -16,6 +16,8 @@ from micast.raop.transport import RaopSession
 
 logger = logging.getLogger(__name__)
 
+RAOP_HANDSHAKE_TIMEOUT_SECONDS = 30.0
+
 _reserved_rtsp_ports: set[int] = set()
 _reserved_udp_bases: set[int] = set()
 
@@ -77,6 +79,11 @@ class RaopServer:
             for item in self._sessions_by_writer.values()
         ]
 
+    @property
+    def recording_sessions(self) -> int:
+        """Sessions that reached RECORD and can legitimately produce PCM."""
+        return sum(1 for item in self._sessions_by_writer.values() if item.recording)
+
     async def start(self) -> None:
         self._server, self.port = await _start_rtsp_server(self._client)
         self._service = ServiceInfo(
@@ -113,6 +120,7 @@ class RaopServer:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        await self.disconnect_clients()
         _reserved_rtsp_ports.discard(self.port)
         if not self._reader.at_eof():
             self._reader.feed_eof()
@@ -163,7 +171,20 @@ class RaopServer:
         logger.info("AirPlay client connected to %s from %s", self.name, peer)
         try:
             while not reader.at_eof():
-                chunk = await reader.read(65536)
+                try:
+                    read = reader.read(65536)
+                    chunk = (
+                        await read
+                        if session.recording
+                        else await asyncio.wait_for(read, RAOP_HANDSHAKE_TIMEOUT_SECONDS)
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "AirPlay %s handshake stalled before RECORD; closing %s",
+                        self.name,
+                        peer,
+                    )
+                    break
                 if not chunk:
                     break
                 buffer += chunk

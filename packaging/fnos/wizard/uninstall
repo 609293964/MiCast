@@ -1,0 +1,37 @@
+[
+  {
+    "stepTitle": "卸载 MiCast",
+    "items": [
+      {
+        "type": "radio",
+        "field": "wizard_data_policy",
+        "label": "本地数据处理方式",
+        "initValue": "keep_config",
+        "options": [
+          {
+            "label": "保留设备配置，删除账号与凭证（推荐）",
+            "value": "keep_config"
+          },
+          {
+            "label": "保留全部数据，方便重新安装",
+            "value": "keep_all"
+          },
+          {
+            "label": "删除全部数据",
+            "value": "remove_all"
+          }
+        ],
+        "rules": [
+          {
+            "required": true,
+            "message": "请选择数据处理方式"
+          }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "设备配置包括音箱别名、组合、播放入口、均衡器和延迟。米家登录凭证仅在“保留全部数据”时保留。"
+      }
+    ]
+  }
+]

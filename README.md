@@ -48,12 +48,17 @@ iPhone / iPad / Mac / DLNA 客户端
 .\scripts\start-local.cmd
 ```
 
+Windows 提供两种发行方式：安装版将设置保存在 `%APPDATA%\MiCast`，日志和运行文件保存在
+`%LOCALAPPDATA%\MiCast`；便携版压缩包包含 `portable.flag`，所有数据保存在程序同目录的
+`data` 文件夹。源码开发版使用 `%APPDATA%\MiCast-Dev`，首次运行会复制旧版仓库
+`config` 目录中的现有设置，但不会删除旧文件。
+
 首次打开后按页面引导设置管理访问方式并连接米家。Windows 版提供经典 AirPlay 与 DLNA 接收。
 
-构建单文件程序：
+同时构建便携压缩包与安装版（安装版需要 Inno Setup 6）：
 
 ```powershell
-pwsh -NoProfile -File scripts/build-windows.ps1
+pwsh -NoProfile -File scripts/build-windows-distributions.ps1
 ```
 
 ## 飞牛 fnOS

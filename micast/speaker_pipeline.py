@@ -46,6 +46,7 @@ class SpeakerPipeline:
         eq_bands: list[float] | None = None,
         pace_source: bool = True,
         session_active: Callable[[], bool] | None = None,
+        on_source_stall: Callable[[str], Awaitable[None]] | None = None,
     ):
         self.device_id = device_id
         self.alias = alias
@@ -61,6 +62,7 @@ class SpeakerPipeline:
         # Ground truth for the stall watchdog: True while a sender session is
         # live on this pipeline's receiver. None disables stall detection.
         self._session_active = session_active
+        self._on_source_stall = on_source_stall
         self._stall_task: asyncio.Task | None = None
         self._source_restart_lock = asyncio.Lock()
         self._last_feed_at = 0.0
@@ -292,6 +294,11 @@ class SpeakerPipeline:
                     self._stream_id,
                     silence,
                 )
+                if self._on_source_stall is not None:
+                    # A ReaderPCMSource cannot repair its upstream RAOP/TCP
+                    # producer by restarting around the same dead reader.
+                    asyncio.create_task(self._on_source_stall(self._stream_id))
+                    return
                 await self._restart_source()
         except asyncio.CancelledError:
             pass

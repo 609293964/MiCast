@@ -45,6 +45,7 @@ class AudioBridge:
         self._restart_lock = asyncio.Lock()
         self._restart_requested = False
         self._audio_restart_requested = False
+        self._stall_recovery_requested = False
         self._sweeper_task: asyncio.Task | None = None
         # Receivers with a live sender session right now. Gates the pipelines'
         # PCM-stall watchdog (no session → no bytes is normal, not a stall).
@@ -125,7 +126,8 @@ class AudioBridge:
             if server:
                 active_errors = server.active_transport_errors
                 raop[receiver_id] = {
-                    "active_sessions": server.sessions,
+                    "active_sessions": getattr(server, "recording_sessions", server.sessions),
+                    "connected_sessions": server.sessions,
                     "total_sessions": server.total_sessions,
                     "decode_errors": active_errors["decode_errors"],
                     "dropped_packets": active_errors["dropped_packets"],
@@ -521,6 +523,8 @@ class AudioBridge:
                 on_session_start=self.on_session_start,
                 input_sample_rate=48000,
                 pace_source=False,
+                session_active=self._session_active_for(receiver.device_id),
+                on_source_stall=self._recover_stalled_source,
             )
             self._pipelines[receiver.device_id] = pipeline
             if receiver.status == "error":
@@ -820,6 +824,7 @@ class AudioBridge:
                 input_sample_rate=input_sample_rate,
                 pace_source=pace_source,
                 session_active=self._session_active_for(instance.id),
+                on_source_stall=self._recover_stalled_source,
             )
             self._airplay2_pipelines[stream_id] = pipeline
             if input_volume is not None:
@@ -885,6 +890,7 @@ class AudioBridge:
                 channel=variant["channel"] if stereo else None,
                 eq_bands=variant["eq"],
                 session_active=self._session_active_for(item.id),
+                on_source_stall=self._recover_stalled_source,
             )
             self._pipelines[stream_id] = pipeline
             pipeline.set_input_volume(
@@ -1039,6 +1045,17 @@ class AudioBridge:
     def _session_active_for(self, receiver_id: str) -> Callable[[], bool]:
         return lambda: receiver_id in self._active_sessions
 
+    async def _recover_stalled_source(self, stream_id: str) -> None:
+        """Replace the upstream receiver after PCM stalls in a live session."""
+        if self._stall_recovery_requested:
+            return
+        self._stall_recovery_requested = True
+        logger.warning("Rebuilding AirPlay receiver after PCM stall on %s", stream_id)
+        try:
+            await self.restart()
+        finally:
+            self._stall_recovery_requested = False
+
     def stream_starved(self, stream_id: str) -> bool:
         """The stream's pipeline stopped producing bytes during a live sender
         session — a connected speaker is then pulling a worthless stream. A
@@ -1089,6 +1106,10 @@ class AudioBridge:
             await self.on_receiver_volume(receiver_id, percent)
 
     async def _stop_engine(self) -> None:
+        # Receiver teardown invalidates every sender session. Leaving these
+        # latches set makes freshly-created silent pipelines immediately look
+        # stalled and creates a restart loop.
+        self._active_sessions.clear()
         if self._airplay_targets:
             await self._airplay_targets.stop_all()
         if self._dlna_targets:

@@ -12,12 +12,13 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from xml.sax.saxutils import escape as _xml_escape
 
 import httpx
 
 from micast.airplay_discovery import classify_device
+from micast.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,20 @@ class DlnaDiscovery:
         return device if device and device.control_url else None
 
     def note_location(self, location: str) -> None:
+        # Ignore our own renderer descriptions before attempting HTTP. This
+        # also suppresses stale SSDP replies from receivers removed moments
+        # ago, whose description route correctly no longer exists.
+        path = urlparse(location).path
+        parsed = urlparse(location)
+        own_ids = {receiver.id for receiver in settings.receivers}
+        own_path = path.startswith("/dlna/") and path.endswith("/description.xml")
+        own_address = parsed.hostname == settings.effective_stream_host and (
+            parsed.port or 80
+        ) == settings.port
+        if (own_path and own_address) or any(
+            path.endswith(f"/dlna/{receiver_id}/description.xml") for receiver_id in own_ids
+        ):
+            return
         if location not in self._pending_locations and all(
             location != device.location for device in self._devices.values()
         ):

@@ -1,6 +1,8 @@
 # MiCast controller image. AirPlay receivers run in isolated managed containers.
 
-FROM node:20-alpine AS web-build
+# The web bundle is architecture-independent. Build it on the runner's native
+# platform so an arm64 image build never runs npm under QEMU.
+FROM --platform=$BUILDPLATFORM node:20-alpine AS web-build
 WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci

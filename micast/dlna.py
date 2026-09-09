@@ -34,6 +34,8 @@ CONNECTION_MANAGER = "urn:schemas-upnp-org:service:ConnectionManager:1"
 class DlnaTransportState:
     uri: str = ""
     metadata: str = ""
+    next_uri: str = ""
+    next_metadata: str = ""
     state: str = "STOPPED"
     volume: int = 50
     muted: bool = False
@@ -69,6 +71,9 @@ class DlnaService:
         self._transport: asyncio.DatagramTransport | None = None
         self._protocol: _SsdpProtocol | None = None
         self._announce_task: asyncio.Task | None = None
+        self._advertised: dict[str, ReceiverConfig] = {}
+        self._boot_id = 1
+        self._location_host = ""
         self.status = "stopped"
         self.detail = "DLNA 已关闭"
 
@@ -90,8 +95,15 @@ class DlnaService:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("", SSDP_PORT))
-            membership = socket.inet_aton(SSDP_ADDRESS) + socket.inet_aton("0.0.0.0")
+            interface_ip = _multicast_interface_ip()
+            membership = socket.inet_aton(SSDP_ADDRESS) + socket.inet_aton(interface_ip)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+            if interface_ip != "0.0.0.0":
+                sock.setsockopt(
+                    socket.IPPROTO_IP,
+                    socket.IP_MULTICAST_IF,
+                    socket.inet_aton(interface_ip),
+                )
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
             sock.setblocking(False)
             loop = asyncio.get_running_loop()
@@ -101,6 +113,7 @@ class DlnaService:
             self._transport = transport
             self._protocol = protocol
             self.status = "running"
+            self._advertised = {item.id: item for item in self.active_receivers()}
             self.detail = f"DLNA · {len(self.active_receivers())} 个播放入口"
             await self.announce("ssdp:alive")
             self._announce_task = asyncio.create_task(self._announce_loop())
@@ -112,7 +125,7 @@ class DlnaService:
 
     async def stop(self) -> None:
         if self._transport:
-            await self.announce("ssdp:byebye")
+            await self.announce("ssdp:byebye", self._advertised.values())
         if self._announce_task:
             self._announce_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -122,6 +135,7 @@ class DlnaService:
             self._transport.close()
         self._transport = None
         self._protocol = None
+        self._advertised.clear()
         self.status = "stopped"
         self.detail = "DLNA 已关闭"
 
@@ -132,8 +146,13 @@ class DlnaService:
         if not self._transport:
             await self.start()
             return
-        valid = {item.id for item in self.active_receivers()}
+        active = {item.id: item for item in self.active_receivers()}
+        removed = [item for key, item in self._advertised.items() if key not in active]
+        if removed:
+            await self.announce("ssdp:byebye", removed)
+        valid = set(active)
         self.states = {key: value for key, value in self.states.items() if key in valid}
+        self._advertised = active
         self.detail = f"DLNA · {len(valid)} 个播放入口"
         await self.announce("ssdp:alive")
 
@@ -165,6 +184,7 @@ class DlnaService:
     async def respond(self, addr, requested: str) -> None:
         if not self._transport:
             return
+        self._refresh_boot_id()
         for receiver in self.active_receivers():
             for target, usn in self.search_targets(receiver):
                 if requested not in ("ssdp:all", target):
@@ -179,7 +199,7 @@ class DlnaService:
                         f"SERVER: {SERVER_HEADER}",
                         f"ST: {target}",
                         f"USN: {usn}",
-                        "BOOTID.UPNP.ORG: 1",
+                        f"BOOTID.UPNP.ORG: {self._boot_id}",
                         "CONFIGID.UPNP.ORG: 1",
                         "",
                         "",
@@ -187,11 +207,12 @@ class DlnaService:
                 ).encode()
                 self._transport.sendto(packet, addr)
 
-    async def announce(self, subtype: str) -> None:
+    async def announce(self, subtype: str, receivers=None) -> None:
         if not self._transport:
             return
+        self._refresh_boot_id()
         destination = (SSDP_ADDRESS, SSDP_PORT)
-        for receiver in self.active_receivers():
+        for receiver in receivers if receivers is not None else self.active_receivers():
             for target, usn in self.search_targets(receiver):
                 lines = [
                     "NOTIFY * HTTP/1.1",
@@ -206,12 +227,19 @@ class DlnaService:
                             "CACHE-CONTROL: max-age=120",
                             f"LOCATION: {self.location_for(receiver.id)}",
                             f"SERVER: {SERVER_HEADER}",
-                            "BOOTID.UPNP.ORG: 1",
+                            f"BOOTID.UPNP.ORG: {self._boot_id}",
                             "CONFIGID.UPNP.ORG: 1",
                         ]
                     )
                 packet = ("\r\n".join(lines) + "\r\n\r\n").encode()
                 self._transport.sendto(packet, destination)
+
+    def _refresh_boot_id(self) -> None:
+        host = settings.effective_stream_host
+        if self._location_host and host != self._location_host:
+            self._boot_id += 1
+            logger.info("DLNA publish address changed: %s -> %s", self._location_host, host)
+        self._location_host = host
 
     def state_for(self, receiver_id: str) -> DlnaTransportState:
         return self.states.setdefault(receiver_id, DlnaTransportState())
@@ -228,6 +256,13 @@ class DlnaService:
         state.state = "STOPPED"
         state.volume_mode = settings.sender_volume_mode
         state.session_id = uuid.uuid4().hex
+        logger.info("DLNA %s received media URI: %s", receiver_id, uri)
+
+    async def set_next_uri(self, receiver_id: str, uri: str, metadata: str = "") -> None:
+        state = self.state_for(receiver_id)
+        state.next_uri = uri
+        state.next_metadata = metadata
+        logger.info("DLNA %s queued next media URI: %s", receiver_id, uri)
 
     def media_volume(self, receiver_id: str, session_id: str) -> int:
         state = self.states.get(receiver_id)
@@ -263,15 +298,30 @@ class DlnaService:
         # DLNA casting has no per-speaker delay path — the speakers fetch the
         # media URI (or the /dlna-media proxy) directly, outside the stream
         # server's sink buffer — so every target plays the live edge together.
-        await asyncio.gather(
+        if not targets:
+            raise ValueError("Playback target has no speakers")
+        results = await asyncio.gather(
             *(
                 self.device_manager.play_stream(
                     did, url, owner=self._owner(receiver_id), force=True
                 )
                 for did in targets
-            )
+            ),
+            return_exceptions=True,
         )
+        accepted = sum(result is True for result in results)
+        if not accepted:
+            failures = [str(result) for result in results if isinstance(result, Exception)]
+            if failures:
+                logger.warning("DLNA %s speaker commands failed: %s", receiver_id, failures)
+            raise ValueError("No speaker accepted the playback command")
         state.state = "PLAYING"
+        if accepted < len(targets):
+            logger.warning(
+                "DLNA %s started on %s/%s speakers", receiver_id, accepted, len(targets)
+            )
+        else:
+            logger.info("DLNA %s playing on %s speaker(s)", receiver_id, accepted)
         if state.volume_mode == "linked" and (state.volume_received or state.muted):
             for did in targets:
                 await self.device_manager.set_volume(did, 0 if state.muted else state.volume)
@@ -381,6 +431,16 @@ def _headers(message: str) -> dict[str, str]:
             key, value = line.split(":", 1)
             result[key.strip().lower()] = value.strip()
     return result
+
+
+def _multicast_interface_ip() -> str:
+    """IP of the interface the kernel routes LAN multicast through."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect((SSDP_ADDRESS, SSDP_PORT))
+            return probe.getsockname()[0]
+    except OSError:
+        return "0.0.0.0"
 
 
 def xml_value(body: bytes, name: str, default: str = "") -> str:

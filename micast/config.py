@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shutil
 import socket
 import sys
 import uuid
@@ -70,31 +71,87 @@ def resolve_port(preferred: int, env_var: str, attempts: int = 32) -> int:
     raise RuntimeError(f"端口 {preferred}-{preferred + attempts} 全部被占用")
 
 
+def storage_mode() -> str:
+    """Current persistence profile exposed to diagnostics and the UI."""
+    if os.environ.get("MICAST_DATA_DIR", "").strip():
+        return "managed"
+    if getattr(sys, "frozen", False):
+        executable_dir = Path(sys.executable).resolve().parent
+        if os.environ.get("MICAST_PORTABLE", "").strip() == "1" or (
+            executable_dir / "portable.flag"
+        ).exists():
+            return "portable"
+        return "installed"
+    return "development"
+
+
+def _migrate_source_data(target: Path) -> None:
+    """Copy the old repo-local profile once; never remove the source copy."""
+    legacy = Path(__file__).resolve().parent.parent / "config"
+    if target.exists() or not legacy.is_dir():
+        return
+    files = ("micast.json", "access.json", "xiaomi-account.json", "xiaomi-tokens.enc")
+    if not any((legacy / name).is_file() for name in files):
+        return
+    target.mkdir(parents=True, exist_ok=True)
+    for name in files:
+        source = legacy / name
+        if source.is_file():
+            shutil.copy2(source, target / name)
+
+
 def default_data_dir() -> Path:
     """Where micast.json and the encrypted Xiaomi tokens live.
 
     Priority:
     1. MICAST_DATA_DIR env (Docker mounts, portable installs)
-    2. The repo's own config/ directory when running from a source checkout
-       (keeps existing dev/docker-volume behaviour unchanged)
-    3. The per-OS user data dir — the case that matters for packaged builds:
+    2. A portable build's adjacent data/ directory
+    3. Per-user directories, isolated between development and installed builds
        %APPDATA%/MiCast, ~/Library/Application Support/MiCast,
        $XDG_DATA_HOME/micast.
     """
     override = os.environ.get("MICAST_DATA_DIR", "").strip()
     if override:
         return Path(override).expanduser()
-    if not getattr(sys, "frozen", False):
-        legacy = Path(__file__).resolve().parent.parent / "config"
-        if legacy.exists():
-            return legacy
+    mode = storage_mode()
+    if mode == "portable":
+        return Path(sys.executable).resolve().parent / "data"
     if sys.platform == "win32":
         base = os.environ.get("APPDATA")
-        return Path(base) / "MiCast" if base else Path.home() / "AppData" / "Roaming" / "MiCast"
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "MiCast"
-    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
-    return (Path(xdg) if xdg else Path.home() / ".local" / "share") / "micast"
+        name = "MiCast-Dev" if mode == "development" else "MiCast"
+        target = Path(base) / name if base else Path.home() / "AppData" / "Roaming" / name
+    elif sys.platform == "darwin":
+        target = Path.home() / "Library" / "Application Support" / "MiCast"
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+        target = (Path(xdg) if xdg else Path.home() / ".local" / "share") / "micast"
+    if mode == "development":
+        _migrate_source_data(target)
+    return target
+
+
+def default_log_dir() -> Path:
+    """Logs are removable local state for installed builds."""
+    mode = storage_mode()
+    if mode == "managed":
+        return default_data_dir()
+    if mode == "installed" and sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "MiCast" / "logs"
+    return default_data_dir() / "logs"
+
+
+def default_runtime_dir() -> Path:
+    """Locks and other disposable process state."""
+    mode = storage_mode()
+    if mode == "managed":
+        return default_data_dir()
+    if mode == "installed" and sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "MiCast" / "runtime"
+    return default_data_dir() / "runtime"
 
 
 class AudioConfig(BaseSettings):

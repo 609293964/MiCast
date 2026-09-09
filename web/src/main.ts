@@ -689,10 +689,13 @@ async function init() {
     }
   }, 30000);
 
+  let debugRefreshInFlight = false;
   setInterval(async () => {
     if (store.get().ui.activeSection !== "debug") return;
+    if (debugRefreshInFlight) return;
     const log = document.querySelector<HTMLElement>("[data-runtime-log]");
     if (!log || log.dataset.paused === "true") return;
+    debugRefreshInFlight = true;
     try {
       const debug = await api.getDebugState();
       const needsInitialRender = store.get().debug === null;
@@ -711,6 +714,8 @@ async function init() {
       }
     } catch {
       // Keep the latest diagnostics visible during a temporary API failure.
+    } finally {
+      debugRefreshInFlight = false;
     }
   }, 1500);
 }

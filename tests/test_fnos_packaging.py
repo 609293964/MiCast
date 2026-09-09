@@ -42,6 +42,10 @@ def test_fnos_package_has_every_required_lifecycle_file():
     assert required <= {path.name for path in (FNOS / "cmd").iterdir()}
     assert json.loads((FNOS / "config" / "privilege").read_text(encoding="utf-8"))
     assert json.loads((FNOS / "config" / "resource").read_text(encoding="utf-8")) == {}
+    uninstall_wizard = json.loads((FNOS / "wizard" / "uninstall").read_text(encoding="utf-8"))
+    policy = uninstall_wizard[0]["items"][0]
+    assert policy["field"] == "wizard_data_policy"
+    assert policy["initValue"] == "keep_config"
 
 
 def test_fnos_runtime_uses_installed_target_layout():
@@ -70,7 +74,7 @@ def test_fnos_keeps_classic_airplay_and_starts_single_airplay2_on_demand():
     assert 'service_type = "airplay2"' in receiver
 
 
-def test_fnos_lifecycle_handles_health_upgrade_and_full_uninstall():
+def test_fnos_lifecycle_handles_health_upgrade_and_uninstall_policies():
     main = (FNOS / "cmd" / "main").read_text(encoding="utf-8")
     upgrade = (FNOS / "cmd" / "upgrade_init").read_text(encoding="utf-8")
     uninstall = (FNOS / "cmd" / "uninstall_callback").read_text(encoding="utf-8")
@@ -80,3 +84,6 @@ def test_fnos_lifecycle_handles_health_upgrade_and_full_uninstall():
     assert "upgrade-backup.tgz" in upgrade
     assert 'find "$TRIM_PKGVAR" -mindepth 1 -maxdepth 1' in uninstall
     assert '[ "$TRIM_PKGVAR" != "/" ]' in uninstall
+    assert "keep_all)" in uninstall
+    assert "remove_all)" in uninstall
+    assert "! -name micast.json" in uninstall

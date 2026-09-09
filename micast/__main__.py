@@ -56,9 +56,9 @@ if __name__ == "__main__":
         if getattr(sys, "frozen", False):
             import traceback
 
-            from micast.config import default_data_dir
+            from micast.config import default_log_dir
 
-            crash = default_data_dir() / "crash.log"
+            crash = default_log_dir() / "crash.log"
             crash.parent.mkdir(parents=True, exist_ok=True)
             crash.write_text(traceback.format_exc(), encoding="utf-8")
         raise

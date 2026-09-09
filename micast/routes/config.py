@@ -3,7 +3,7 @@
 from fastapi import APIRouter, HTTPException
 
 from micast.audio_bridge import AudioBridge
-from micast.config import settings
+from micast.config import default_data_dir, default_log_dir, settings, storage_mode
 from micast.deployment import airplay2_available, airplay2_mode
 from micast.dlna import DlnaService
 
@@ -46,6 +46,11 @@ def install(bridge: AudioBridge, dlna: DlnaService | None = None) -> APIRouter:
             "airplay2_available": airplay2_available(),
             "airplay2_mode": airplay2_mode(),
             "airplay2_can_add_instances": airplay2_mode() == "multi",
+            "storage": {
+                "mode": storage_mode(),
+                "data_dir": str(default_data_dir()),
+                "log_dir": str(default_log_dir()),
+            },
             "dlna_status": {
                 "status": dlna.status if dlna else "unavailable",
                 "detail": dlna.detail if dlna else "DLNA 服务不可用",

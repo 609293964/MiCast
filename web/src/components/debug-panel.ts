@@ -486,7 +486,7 @@ export function renderRuntimeLogRows(debug: DebugState | null, filter: string): 
     if (filter === "all") return true;
     return item.logger.startsWith("micast") || ["WARNING", "ERROR", "CRITICAL"].includes(item.level);
   }).reverse();
-  if (!records.length) return `<div class="empty-log">等待 AirPlay 连接事件…</div>`;
+  if (!records.length) return `<div class="empty-log">等待 AirPlay、DLNA 或音箱连接事件…</div>`;
   return records.map((item) => `<article class="runtime-log-row ${item.level.toLowerCase()}">
     <div class="runtime-log-meta"><time>${escapeHtml(item.time)}</time><span>${escapeHtml(item.level)}</span><code>${escapeHtml(shortLogger(item.logger))}</code></div>
     <p>${escapeHtml(item.message)}</p>

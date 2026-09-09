@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from html import escape
 
 from fastapi import APIRouter, HTTPException, Request
@@ -17,6 +18,7 @@ from micast.dlna import (
 )
 
 router = APIRouter(prefix="/dlna", tags=["dlna"])
+logger = logging.getLogger(__name__)
 
 
 def install(service: DlnaService) -> APIRouter:
@@ -57,10 +59,20 @@ def install(service: DlnaService) -> APIRouter:
         _receiver(service, receiver_id)
         body = await request.body()
         soap_action = request.headers.get("soapaction", "").strip('"').rsplit("#", 1)[-1]
+        logger.info("DLNA %s: %s#%s", receiver_id, service_name, soap_action)
         try:
             values = await _dispatch(service, receiver_id, service_name, soap_action, body)
         except ValueError as exc:
+            logger.warning("DLNA %s action failed: %s", receiver_id, exc)
             return _soap_fault(701, str(exc))
+        except Exception:
+            logger.exception(
+                "DLNA %s action crashed: %s#%s",
+                receiver_id,
+                service_name,
+                soap_action,
+            )
+            return _soap_fault(501, "Playback command failed")
         return _soap_response(_service_type(service_name), soap_action, values)
 
     @router.api_route(
@@ -91,6 +103,13 @@ async def _dispatch(
                 receiver_id,
                 xml_value(body, "CurrentURI"),
                 xml_value(body, "CurrentURIMetaData"),
+            )
+            return {}
+        if action == "SetNextAVTransportURI":
+            await service.set_next_uri(
+                receiver_id,
+                xml_value(body, "NextURI"),
+                xml_value(body, "NextURIMetaData"),
             )
             return {}
         if action == "Play":
@@ -131,8 +150,8 @@ async def _dispatch(
                 "MediaDuration": "00:00:00",
                 "CurrentURI": state.uri,
                 "CurrentURIMetaData": state.metadata,
-                "NextURI": "",
-                "NextURIMetaData": "",
+                "NextURI": state.next_uri,
+                "NextURIMetaData": state.next_metadata,
                 "PlayMedium": "NETWORK",
                 "RecordMedium": "NOT_IMPLEMENTED",
                 "WriteStatus": "NOT_IMPLEMENTED",
@@ -210,6 +229,7 @@ def _scpd(service_name: str) -> str:
     actions = {
         "AVTransport": [
             "SetAVTransportURI",
+            "SetNextAVTransportURI",
             "Play",
             "Pause",
             "Stop",

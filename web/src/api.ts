@@ -58,6 +58,11 @@ export interface FullConfig {
   airplay2_available: boolean;
   airplay2_mode: "disabled" | "single" | "multi";
   airplay2_can_add_instances: boolean;
+  storage: {
+    mode: "managed" | "portable" | "installed" | "development";
+    data_dir: string;
+    log_dir: string;
+  };
   dlna_status: { status: string; detail: string };
   selected_device_id: string | null;
   receivers: ReceiverDefinition[];

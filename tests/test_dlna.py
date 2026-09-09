@@ -71,6 +71,23 @@ async def test_dlna_routes_group_media_to_every_speaker(monkeypatch):
     assert service.state_for("whole").state == "PLAYING"
 
 
+async def test_dlna_does_not_report_playing_when_every_speaker_rejects(monkeypatch):
+    configure(monkeypatch)
+    manager = FakeDeviceManager()
+
+    async def reject(*args, **kwargs):
+        return False
+
+    manager.play_stream = reject
+    service = DlnaService(manager)
+    await service.set_uri("living", "http://media.local/song.mp3")
+
+    import pytest
+    with pytest.raises(ValueError, match="No speaker accepted"):
+        await service.play("living")
+    assert service.state_for("living").state == "STOPPED"
+
+
 async def test_dlna_soap_transport_and_volume(monkeypatch):
     configure(monkeypatch)
     manager = FakeDeviceManager()
@@ -91,6 +108,16 @@ async def test_dlna_soap_transport_and_volume(monkeypatch):
     assert info["CurrentTransportState"] == "PLAYING"
     assert ("volume", "a", 63) in manager.calls
     assert service.state_for("living").volume == 63
+
+
+async def test_dlna_accepts_next_track_uri(monkeypatch):
+    configure(monkeypatch)
+    service = DlnaService(FakeDeviceManager())
+    body = b"<Envelope><NextURI>http://media.local/next.mp3</NextURI></Envelope>"
+
+    await _dispatch(service, "living", "AVTransport", "SetNextAVTransportURI", body)
+
+    assert service.state_for("living").next_uri == "http://media.local/next.mp3"
 
 
 def test_dlna_uses_stable_unique_device_ids(monkeypatch):

@@ -3,7 +3,7 @@
 
 from micast.airplay_discovery import classify_device
 from micast.config import Settings, SpeakerGroupConfig
-from micast.dlna_client import _soap_action
+from micast.dlna_client import DlnaDiscovery, _soap_action
 
 DESCRIPTION = """<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
@@ -37,6 +37,16 @@ def test_soap_action_envelope():
     )
     assert action == '"urn:schemas-upnp-org:service:AVTransport:1#Play"'
     assert "<u:Play" in body and "<InstanceID>0</InstanceID>" in body
+
+
+def test_discovery_ignores_own_description_before_fetch(monkeypatch):
+    from micast.config import ReceiverConfig, settings
+
+    monkeypatch.setattr(settings, "receivers", [ReceiverConfig(id="living", name="客厅")])
+    discovery = DlnaDiscovery()
+    discovery.note_location("http://192.168.0.12:3000/dlna/living/description.xml")
+
+    assert discovery._pending_locations == set()
 
 
 def test_update_group_sanitizes_dlna_targets(monkeypatch):

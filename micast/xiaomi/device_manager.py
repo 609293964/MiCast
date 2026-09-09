@@ -80,8 +80,12 @@ class DeviceManager:
 
     async def refresh_service(self) -> bool:
         """Ensure MiNAService is available."""
-        if self._service is None:
-            self._service = await self.auth.ensure_service()
+        # XiaomiAuth replaces its cached service after silent token renewal.
+        # Always take its current instance so a long-running DeviceManager
+        # never keeps issuing commands with the retired serviceToken.
+        service = await self.auth.ensure_service()
+        if self._service is not service:
+            self._service = service
         return self._service is not None
 
     async def list_devices(self) -> list[dict]:

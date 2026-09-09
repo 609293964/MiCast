@@ -21,7 +21,7 @@ from pathlib import Path
 
 import uvicorn
 
-from micast.config import default_data_dir, settings
+from micast.config import default_log_dir, default_runtime_dir, settings
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ _LOCK_NAME = "micast.lock"
 
 
 def _lock_path():
-    return default_data_dir() / _LOCK_NAME
+    return default_runtime_dir() / _LOCK_NAME
 
 
 def _running_instance_port() -> int | None:
@@ -52,6 +52,7 @@ def _running_instance_port() -> int | None:
 
 def _claim_instance(port: int) -> None:
     with contextlib.suppress(OSError):
+        _lock_path().parent.mkdir(parents=True, exist_ok=True)
         _lock_path().write_text(
             json.dumps({"pid": os.getpid(), "port": port}), encoding="utf-8"
         )
@@ -83,7 +84,7 @@ def _acquire_singleton_mutex():
 
 def _install_file_logging() -> None:
     """Windowed builds have no console — logs go to <data dir>/micast.log."""
-    log_path = default_data_dir() / "micast.log"
+    log_path = default_log_dir() / "micast.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     handler = logging.FileHandler(log_path, encoding="utf-8")
     handler.setFormatter(

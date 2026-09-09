@@ -166,6 +166,23 @@ export function renderSettingsView(props: SettingsProps): string {
       ` : ""}
     </div>
 
+    <div class="group-header">数据与版本</div>
+    <div class="group">
+      <div class="cell">
+        <div class="cell-icon">${icon("folder")}</div>
+        <div class="cell-content">
+          <span class="cell-title">${storageModeLabel(config?.storage?.mode)}</span>
+          <span class="cell-subtitle" title="${escapeHtml(config?.storage?.data_dir ?? "")}">${escapeHtml(config?.storage?.data_dir ?? "正在读取数据目录…")}</span>
+        </div>
+      </div>
+      <div class="cell">
+        <div class="cell-content">
+          <span class="cell-title">日志目录</span>
+          <span class="cell-subtitle" title="${escapeHtml(config?.storage?.log_dir ?? "")}">${escapeHtml(config?.storage?.log_dir ?? "正在读取日志目录…")}</span>
+        </div>
+      </div>
+    </div>
+
     <div class="group-header">播放方式</div>
     <div class="group">
       <div class="cell">
@@ -273,6 +290,15 @@ function renderCell(title: string, subtitle: string, control: string): string {
       ${control}
     </div>
   `;
+}
+
+function storageModeLabel(mode?: FullConfig["storage"]["mode"]): string {
+  return ({
+    managed: "系统托管数据",
+    portable: "Windows 便携版",
+    installed: "Windows 安装版",
+    development: "本地开发版",
+  } as const)[mode ?? "managed"];
 }
 
 function renderSegments(

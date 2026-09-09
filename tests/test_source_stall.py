@@ -1,9 +1,11 @@
 """PCM source stall detection: a wedged source during a live session restarts."""
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
+from micast.audio_bridge import AudioBridge
 from micast.pcm_source import PCMSource
 from micast.speaker_pipeline import (
     SOURCE_STALL_CHECK_SECONDS,
@@ -30,6 +32,27 @@ class StarvingSource(PCMSource):
         self.stops += 1
 
 
+@pytest.mark.asyncio
+async def test_bridge_coalesces_stalled_source_recovery():
+    bridge = AudioBridge()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def restart():
+        entered.set()
+        await release.wait()
+
+    bridge.restart = AsyncMock(side_effect=restart)
+
+    first = asyncio.create_task(bridge._recover_stalled_source("r1"))
+    await entered.wait()
+    await bridge._recover_stalled_source("r1-q1")
+    release.set()
+    await first
+
+    assert bridge.restart.await_count == 1
+
+
 def _pipeline(source: PCMSource, session_active) -> SpeakerPipeline:
     return SpeakerPipeline(
         device_id="airplay2",
@@ -38,6 +61,34 @@ def _pipeline(source: PCMSource, session_active) -> SpeakerPipeline:
         stream_server=StreamServer(),
         session_active=session_active,
     )
+
+
+@pytest.mark.asyncio
+async def test_stalled_reader_delegates_upstream_recovery(monkeypatch):
+    monkeypatch.setattr(
+        "micast.speaker_pipeline.SOURCE_STALL_TIMEOUT_SECONDS", 0.2
+    )
+    recovered = []
+
+    async def recover(stream_id):
+        recovered.append(stream_id)
+
+    source = StarvingSource()
+    pipeline = SpeakerPipeline(
+        device_id="classic",
+        alias="test",
+        pcm_source=source,
+        stream_server=StreamServer(),
+        session_active=lambda: True,
+        on_source_stall=recover,
+    )
+    await pipeline.start()
+    try:
+        await asyncio.sleep(SOURCE_STALL_CHECK_SECONDS + 0.5)
+        assert recovered == ["classic"]
+        assert source.starts == 1
+    finally:
+        await pipeline.stop()
 
 
 @pytest.mark.asyncio

@@ -28,20 +28,21 @@ def install(service: DlnaService) -> APIRouter:
         device_uuid = service.uuid_for(receiver_id)
         base = f"/dlna/{receiver_id}"
         xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<root xmlns="urn:schemas-upnp-org:device-1-0">
+<root xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0">
   <specVersion><major>1</major><minor>0</minor></specVersion>
-  <URLBase>http://{escape(service.location_for(receiver_id).split('/')[2])}/</URLBase>
+  <URLBase>http://{escape(service.location_for(receiver_id).split("/")[2])}/</URLBase>
   <device>
     <deviceType>{MEDIA_RENDERER}</deviceType>
     <friendlyName>{escape(receiver.name)}</friendlyName>
     <manufacturer>MiCast</manufacturer><manufacturerURL>https://github.com/</manufacturerURL>
     <modelDescription>MiCast local audio bridge</modelDescription>
     <modelName>MiCast DLNA Renderer</modelName><modelNumber>0.1</modelNumber>
+    <dlna:X_DLNADOC>DMR-1.50</dlna:X_DLNADOC>
     <UDN>uuid:{device_uuid}</UDN>
     <serviceList>
-      {_service_xml(AV_TRANSPORT, 'AVTransport', base)}
-      {_service_xml(RENDERING_CONTROL, 'RenderingControl', base)}
-      {_service_xml(CONNECTION_MANAGER, 'ConnectionManager', base)}
+      {_service_xml(AV_TRANSPORT, "AVTransport", base)}
+      {_service_xml(RENDERING_CONTROL, "RenderingControl", base)}
+      {_service_xml(CONNECTION_MANAGER, "ConnectionManager", base)}
     </serviceList>
   </device>
 </root>"""
@@ -75,9 +76,7 @@ def install(service: DlnaService) -> APIRouter:
             return _soap_fault(501, "Playback command failed")
         return _soap_response(_service_type(service_name), soap_action, values)
 
-    @router.api_route(
-        "/{receiver_id}/{service_name}/event", methods=["SUBSCRIBE", "UNSUBSCRIBE"]
-    )
+    @router.api_route("/{receiver_id}/{service_name}/event", methods=["SUBSCRIBE", "UNSUBSCRIBE"])
     async def event_subscription(receiver_id: str, service_name: str, request: Request):
         _receiver(service, receiver_id)
         sid = request.headers.get("sid") or f"uuid:{service.uuid_for(receiver_id)}-{service_name}"
@@ -226,29 +225,196 @@ def _service_xml(service_type: str, service_name: str, base: str) -> str:
 
 
 def _scpd(service_name: str) -> str:
-    actions = {
-        "AVTransport": [
-            "SetAVTransportURI",
-            "SetNextAVTransportURI",
-            "Play",
-            "Pause",
-            "Stop",
-            "Seek",
-            "GetTransportInfo",
-            "GetPositionInfo",
-            "GetMediaInfo",
-        ],
-        "RenderingControl": ["SetVolume", "GetVolume", "SetMute", "GetMute"],
-        "ConnectionManager": [
-            "GetProtocolInfo",
-            "GetCurrentConnectionIDs",
-            "GetCurrentConnectionInfo",
-        ],
-    }[service_name]
-    action_xml = "".join(f"<action><name>{name}</name></action>" for name in actions)
+    action_specs, state_variables = _scpd_spec(service_name)
+    action_xml = "".join(_action_xml(name, arguments) for name, arguments in action_specs)
+    state_xml = "".join(state_variables)
     return f"""<?xml version="1.0"?><scpd xmlns="urn:schemas-upnp-org:service-1-0">
 <specVersion><major>1</major><minor>0</minor></specVersion>
-<actionList>{action_xml}</actionList><serviceStateTable/></scpd>"""
+<actionList>{action_xml}</actionList><serviceStateTable>{state_xml}</serviceStateTable></scpd>"""
+
+
+def _action_xml(name: str, arguments: list[tuple[str, str, str]]) -> str:
+    argument_xml = "".join(
+        f"<argument><name>{arg_name}</name><direction>{direction}</direction>"
+        f"<relatedStateVariable>{variable}</relatedStateVariable></argument>"
+        for arg_name, direction, variable in arguments
+    )
+    return f"<action><name>{name}</name><argumentList>{argument_xml}</argumentList></action>"
+
+
+def _state_variable(name: str, data_type: str, allowed: tuple[str, ...] = ()) -> str:
+    allowed_xml = ""
+    if allowed:
+        allowed_xml = (
+            "<allowedValueList>"
+            + "".join(f"<allowedValue>{value}</allowedValue>" for value in allowed)
+            + "</allowedValueList>"
+        )
+    return (
+        f'<stateVariable sendEvents="no"><name>{name}</name>'
+        f"<dataType>{data_type}</dataType>{allowed_xml}</stateVariable>"
+    )
+
+
+def _scpd_spec(
+    service_name: str,
+) -> tuple[list[tuple[str, list[tuple[str, str, str]]]], list[str]]:
+    instance = ("InstanceID", "in", "A_ARG_TYPE_InstanceID")
+    channel = ("Channel", "in", "A_ARG_TYPE_Channel")
+    if service_name == "AVTransport":
+        actions = [
+            (
+                "SetAVTransportURI",
+                [
+                    instance,
+                    ("CurrentURI", "in", "AVTransportURI"),
+                    ("CurrentURIMetaData", "in", "AVTransportURIMetaData"),
+                ],
+            ),
+            (
+                "SetNextAVTransportURI",
+                [
+                    instance,
+                    ("NextURI", "in", "NextAVTransportURI"),
+                    ("NextURIMetaData", "in", "NextAVTransportURIMetaData"),
+                ],
+            ),
+            ("Play", [instance, ("Speed", "in", "TransportPlaySpeed")]),
+            ("Pause", [instance]),
+            ("Stop", [instance]),
+            (
+                "Seek",
+                [
+                    instance,
+                    ("Unit", "in", "A_ARG_TYPE_SeekMode"),
+                    ("Target", "in", "A_ARG_TYPE_SeekTarget"),
+                ],
+            ),
+            (
+                "GetTransportInfo",
+                [
+                    instance,
+                    ("CurrentTransportState", "out", "TransportState"),
+                    ("CurrentTransportStatus", "out", "TransportStatus"),
+                    ("CurrentSpeed", "out", "TransportPlaySpeed"),
+                ],
+            ),
+            (
+                "GetPositionInfo",
+                [
+                    instance,
+                    ("Track", "out", "CurrentTrack"),
+                    ("TrackDuration", "out", "CurrentTrackDuration"),
+                    ("TrackMetaData", "out", "CurrentTrackMetaData"),
+                    ("TrackURI", "out", "AVTransportURI"),
+                    ("RelTime", "out", "RelativeTimePosition"),
+                    ("AbsTime", "out", "AbsoluteTimePosition"),
+                    ("RelCount", "out", "RelativeCounterPosition"),
+                    ("AbsCount", "out", "AbsoluteCounterPosition"),
+                ],
+            ),
+            (
+                "GetMediaInfo",
+                [
+                    instance,
+                    ("NrTracks", "out", "NumberOfTracks"),
+                    ("MediaDuration", "out", "CurrentMediaDuration"),
+                    ("CurrentURI", "out", "AVTransportURI"),
+                    ("CurrentURIMetaData", "out", "AVTransportURIMetaData"),
+                    ("NextURI", "out", "NextAVTransportURI"),
+                    ("NextURIMetaData", "out", "NextAVTransportURIMetaData"),
+                    ("PlayMedium", "out", "PlaybackStorageMedium"),
+                    ("RecordMedium", "out", "RecordStorageMedium"),
+                    ("WriteStatus", "out", "RecordMediumWriteStatus"),
+                ],
+            ),
+        ]
+        variables = [
+            _state_variable("A_ARG_TYPE_InstanceID", "ui4"),
+            _state_variable("AVTransportURI", "uri"),
+            _state_variable("AVTransportURIMetaData", "string"),
+            _state_variable("NextAVTransportURI", "uri"),
+            _state_variable("NextAVTransportURIMetaData", "string"),
+            _state_variable("TransportPlaySpeed", "string", ("1",)),
+            _state_variable(
+                "TransportState",
+                "string",
+                ("STOPPED", "PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING", "NO_MEDIA_PRESENT"),
+            ),
+            _state_variable("TransportStatus", "string", ("OK", "ERROR_OCCURRED")),
+            _state_variable("A_ARG_TYPE_SeekMode", "string", ("REL_TIME",)),
+            _state_variable("A_ARG_TYPE_SeekTarget", "string"),
+            _state_variable("CurrentTrack", "ui4"),
+            _state_variable("CurrentTrackDuration", "string"),
+            _state_variable("CurrentTrackMetaData", "string"),
+            _state_variable("RelativeTimePosition", "string"),
+            _state_variable("AbsoluteTimePosition", "string"),
+            _state_variable("RelativeCounterPosition", "i4"),
+            _state_variable("AbsoluteCounterPosition", "i4"),
+            _state_variable("NumberOfTracks", "ui4"),
+            _state_variable("CurrentMediaDuration", "string"),
+            _state_variable("PlaybackStorageMedium", "string", ("NETWORK", "NOT_IMPLEMENTED")),
+            _state_variable("RecordStorageMedium", "string", ("NOT_IMPLEMENTED",)),
+            _state_variable("RecordMediumWriteStatus", "string", ("NOT_IMPLEMENTED",)),
+        ]
+        return actions, variables
+    if service_name == "RenderingControl":
+        actions = [
+            ("SetVolume", [instance, channel, ("DesiredVolume", "in", "Volume")]),
+            ("GetVolume", [instance, channel, ("CurrentVolume", "out", "Volume")]),
+            ("SetMute", [instance, channel, ("DesiredMute", "in", "Mute")]),
+            ("GetMute", [instance, channel, ("CurrentMute", "out", "Mute")]),
+        ]
+        return actions, [
+            _state_variable("A_ARG_TYPE_InstanceID", "ui4"),
+            _state_variable("A_ARG_TYPE_Channel", "string", ("Master",)),
+            _state_variable("Volume", "ui2"),
+            _state_variable("Mute", "boolean"),
+        ]
+    if service_name == "ConnectionManager":
+        actions = [
+            (
+                "GetProtocolInfo",
+                [("Source", "out", "SourceProtocolInfo"), ("Sink", "out", "SinkProtocolInfo")],
+            ),
+            ("GetCurrentConnectionIDs", [("ConnectionIDs", "out", "CurrentConnectionIDs")]),
+            (
+                "GetCurrentConnectionInfo",
+                [
+                    ("ConnectionID", "in", "A_ARG_TYPE_ConnectionID"),
+                    ("RcsID", "out", "A_ARG_TYPE_RcsID"),
+                    ("AVTransportID", "out", "A_ARG_TYPE_AVTransportID"),
+                    ("ProtocolInfo", "out", "A_ARG_TYPE_ProtocolInfo"),
+                    ("PeerConnectionManager", "out", "A_ARG_TYPE_ConnectionManager"),
+                    ("PeerConnectionID", "out", "A_ARG_TYPE_ConnectionID"),
+                    ("Direction", "out", "A_ARG_TYPE_Direction"),
+                    ("Status", "out", "A_ARG_TYPE_ConnectionStatus"),
+                ],
+            ),
+        ]
+        return actions, [
+            _state_variable("SourceProtocolInfo", "string"),
+            _state_variable("SinkProtocolInfo", "string"),
+            _state_variable("CurrentConnectionIDs", "string"),
+            _state_variable("A_ARG_TYPE_ConnectionID", "i4"),
+            _state_variable("A_ARG_TYPE_RcsID", "i4"),
+            _state_variable("A_ARG_TYPE_AVTransportID", "i4"),
+            _state_variable("A_ARG_TYPE_ProtocolInfo", "string"),
+            _state_variable("A_ARG_TYPE_ConnectionManager", "string"),
+            _state_variable("A_ARG_TYPE_Direction", "string", ("Input", "Output")),
+            _state_variable(
+                "A_ARG_TYPE_ConnectionStatus",
+                "string",
+                (
+                    "OK",
+                    "ContentFormatMismatch",
+                    "InsufficientBandwidth",
+                    "UnreliableChannel",
+                    "Unknown",
+                ),
+            ),
+        ]
+    raise ValueError(f"Unknown DLNA service: {service_name}")
 
 
 def _soap_response(service_type: str, action: str, values: dict[str, str | int]) -> Response:

@@ -2,7 +2,7 @@
 # 不启动编排器，不开放动态新增实例。
 services:
   micast:
-    image: ${MICAST_IMAGE:-micast:0.2.1}
+    image: ${MICAST_IMAGE:-micast:0.2.2}
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -36,7 +36,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.receiver
-    image: ${MICAST_RECEIVER_IMAGE:-micast-receiver:0.2.1}
+    image: ${MICAST_RECEIVER_IMAGE:-micast-receiver:0.2.2}
     container_name: micast-airplay2
     restart: unless-stopped
     environment:

@@ -1,6 +1,6 @@
 from micast.config import ReceiverConfig, SpeakerGroupConfig, settings
 from micast.dlna import DlnaService
-from micast.routes.dlna import _dispatch
+from micast.routes.dlna import _dispatch, _scpd
 
 
 class FakeDeviceManager:
@@ -26,8 +26,7 @@ class FakeDeviceManager:
 
     def owned_targets(self, receiver_id, owner):
         return [
-            did for did in settings.receiver_targets(receiver_id)
-            if self._owners.get(did) == owner
+            did for did in settings.receiver_targets(receiver_id) if self._owners.get(did) == owner
         ]
 
 
@@ -54,6 +53,27 @@ def test_dlna_hides_groups_without_deleting_them(monkeypatch):
     monkeypatch.setattr(settings, "sync_groups_enabled", False)
     assert [item.name for item in service.active_receivers()] == ["客厅"]
     assert settings.groups[0].name == "全屋"
+
+
+def test_dlna_service_descriptions_declare_action_arguments_and_state_variables():
+    from xml.etree import ElementTree as ET
+
+    namespace = {"upnp": "urn:schemas-upnp-org:service-1-0"}
+    transport = ET.fromstring(_scpd("AVTransport"))
+    actions = {
+        item.findtext("upnp:name", namespaces=namespace): item
+        for item in transport.findall("upnp:actionList/upnp:action", namespace)
+    }
+
+    set_uri = actions["SetAVTransportURI"]
+    arguments = set_uri.findall("upnp:argumentList/upnp:argument", namespace)
+    assert [item.findtext("upnp:name", namespaces=namespace) for item in arguments] == [
+        "InstanceID",
+        "CurrentURI",
+        "CurrentURIMetaData",
+    ]
+    assert all(item.find("upnp:relatedStateVariable", namespace) is not None for item in arguments)
+    assert transport.findall("upnp:serviceStateTable/upnp:stateVariable", namespace)
 
 
 async def test_dlna_routes_group_media_to_every_speaker(monkeypatch):
@@ -83,6 +103,7 @@ async def test_dlna_does_not_report_playing_when_every_speaker_rejects(monkeypat
     await service.set_uri("living", "http://media.local/song.mp3")
 
     import pytest
+
     with pytest.raises(ValueError, match="No speaker accepted"):
         await service.play("living")
     assert service.state_for("living").state == "STOPPED"

@@ -66,9 +66,9 @@ class SpeakerPipeline:
         self._stall_task: asyncio.Task | None = None
         self._source_restart_lock = asyncio.Lock()
         self._last_feed_at = 0.0
-        # Disarmed after a stall restart until bytes flow again: a paused
-        # sender is indistinguishable from a dead source at this layer, so
-        # restarting on every check would churn the pipeline for a whole pause.
+        # Armed only while a newly-started sender session has not produced its
+        # first bytes. Once audio has flowed, later silence may be a pause or a
+        # track transition and must not restart the receiver underneath it.
         self._stall_armed = True
         self._encoder: AudioEncoder | None = None
         self._tasks: list[asyncio.Task] = []
@@ -98,11 +98,7 @@ class SpeakerPipeline:
                 if abs(gain) >= 0.05:
                     parts.append(f"equalizer=f={hz}:t=q:w=1.0:g={gain:g}")
         group = next((g for g in settings.groups if g.id == self._group_id), None)
-        stereo = (
-            group is not None
-            and group.mode == "stereo"
-            and self._channel in ("left", "right")
-        )
+        stereo = group is not None and group.mode == "stereo" and self._channel in ("left", "right")
         if not stereo:
             return ",".join(parts) or None
         # Keep the stream stereo (duplicate the picked channel to both sides):
@@ -120,15 +116,9 @@ class SpeakerPipeline:
     def _channel_holder(self) -> str | None:
         """The speaker currently assigned to this pipeline's stereo channel."""
         group = next((g for g in settings.groups if g.id == self._group_id), None)
-        if (
-            group is None
-            or group.mode != "stereo"
-            or self._channel not in ("left", "right")
-        ):
+        if group is None or group.mode != "stereo" or self._channel not in ("left", "right"):
             return None
-        return next(
-            (did for did, ch in group.channels.items() if ch == self._channel), None
-        )
+        return next((did for did, ch in group.channels.items() if ch == self._channel), None)
 
     def _audio_config(self):
         """Encoding config: filtered streams always go through the encoder, so
@@ -145,6 +135,7 @@ class SpeakerPipeline:
     def _apply_input_gain(self, chunk: bytes) -> bytes:
         """Apply the sender volume to signed 16-bit little-endian PCM."""
         from micast.volume import apply_pcm_gain
+
         return apply_pcm_gain(chunk, self._input_volume)
 
     @property
@@ -255,6 +246,11 @@ class SpeakerPipeline:
 
     async def session_start(self) -> None:
         logger.info("AirPlay session started on receiver %s", self.device_id)
+        # Pipelines are long-lived. Without resetting this timestamp, a fresh
+        # connection inherits all idle time since startup and can be declared
+        # stalled before its first packet arrives.
+        self._last_feed_at = time.monotonic()
+        self._stall_armed = True
         if self._on_session_start:
             try:
                 await self._on_session_start(self.device_id)
@@ -264,7 +260,7 @@ class SpeakerPipeline:
     def _note_source_bytes(self, chunk: bytes) -> None:
         if chunk:
             self._last_feed_at = time.monotonic()
-            self._stall_armed = True
+            self._stall_armed = False
 
     async def _watch_source_stall(self) -> None:
         """Restart the PCM source when it stops producing during a live session.
@@ -278,7 +274,7 @@ class SpeakerPipeline:
             while self._running:
                 await asyncio.sleep(SOURCE_STALL_CHECK_SECONDS)
                 if not self._session_active or not self._session_active():
-                    self._stall_armed = True
+                    self._stall_armed = False
                     continue
                 if self._source_restart_lock.locked():
                     continue
@@ -325,14 +321,10 @@ class SpeakerPipeline:
                 source_reader = await self._pcm_source.start()
                 await self._start_encoder(source_reader)
             except Exception:
-                logger.exception(
-                    "Failed to restart stalled source for %s", self._stream_id
-                )
+                logger.exception("Failed to restart stalled source for %s", self._stream_id)
                 self._status = "error"
 
-    async def _pump_source_to_encoder(
-        self, reader: asyncio.StreamReader, writer
-    ) -> None:
+    async def _pump_source_to_encoder(self, reader: asyncio.StreamReader, writer) -> None:
         try:
             rate = self._input_sample_rate or 44100
             byte_rate = rate * 4  # s16 stereo
@@ -384,17 +376,13 @@ class SpeakerPipeline:
             if self._running:
                 # Raw PCM bypass: prepend a streaming WAV header so the stream
                 # is a valid container (and gets cached as the join prefix).
-                await self._stream_server.broadcast(
-                    self._stream_id, wav_header(rate)
-                )
+                await self._stream_server.broadcast(self._stream_id, wav_header(rate))
             while self._running:
                 chunk = await reader.read(32768)
                 if not chunk:
                     break
                 self._note_source_bytes(chunk)
-                await self._stream_server.broadcast(
-                    self._stream_id, self._apply_input_gain(chunk)
-                )
+                await self._stream_server.broadcast(self._stream_id, self._apply_input_gain(chunk))
                 fed_bytes += len(chunk)
                 ahead = fed_bytes / byte_rate - (loop.time() - started_at)
                 if self._pace_source and ahead > 0:

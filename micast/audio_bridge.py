@@ -46,6 +46,10 @@ class AudioBridge:
         self._restart_requested = False
         self._audio_restart_requested = False
         self._stall_recovery_requested = False
+        # Session-stop callbacks emitted while MiCast replaces a receiver are
+        # maintenance events, not sender intent. Suppress their delayed speaker
+        # stop so recovery never pauses the user's device.
+        self._maintenance_sessions: set[str] = set()
         self._sweeper_task: asyncio.Task | None = None
         # Receivers with a live sender session right now. Gates the pipelines'
         # PCM-stall watchdog (no session → no bytes is normal, not a stall).
@@ -311,9 +315,7 @@ class AudioBridge:
                     try:
                         await pipeline.restart_encoder()
                     except Exception:
-                        logger.exception(
-                            "Failed to restart pipeline %s", pipeline.device_id
-                        )
+                        logger.exception("Failed to restart pipeline %s", pipeline.device_id)
                         self._error_count += 1
                 audio_hook = True
 
@@ -690,9 +692,15 @@ class AudioBridge:
                 logger.exception("Single AirPlay 2 PCM source failed")
                 return
             await self._start_airplay2_variant_pipelines(
-                instance, group, stereo, variants, reader,
-                input_sample_rate=None, pace_source=True,
-                input_volume=None, runtime=runtime,
+                instance,
+                group,
+                stereo,
+                variants,
+                reader,
+                input_sample_rate=None,
+                pace_source=True,
+                input_volume=None,
+                runtime=runtime,
             )
             if runtime["status"] == "starting":
                 runtime.update(status="running", detail="运行正常")
@@ -750,9 +758,15 @@ class AudioBridge:
                 else known_volume or 0
             )
             await self._start_airplay2_variant_pipelines(
-                instance, group, stereo, variants, source_reader,
-                input_sample_rate=48000, pace_source=False,
-                input_volume=input_volume, runtime=runtime,
+                instance,
+                group,
+                stereo,
+                variants,
+                source_reader,
+                input_sample_rate=48000,
+                pace_source=False,
+                input_volume=input_volume,
+                runtime=runtime,
             )
 
     def _airplay2_variant_plan(self, instance) -> tuple:
@@ -985,10 +999,13 @@ class AudioBridge:
 
     async def _rebuild_entry_for_tap(self, entry_id: str) -> None:
         """Rebuild one entry's pipelines so its external-target PCM tap exists."""
-        is_airplay2 = any(
-            key == entry_id or key.startswith(f"{entry_id}-")
-            for key in self._airplay2_pipelines
-        ) or entry_id in self._airplay2_runtime
+        is_airplay2 = (
+            any(
+                key == entry_id or key.startswith(f"{entry_id}-")
+                for key in self._airplay2_pipelines
+            )
+            or entry_id in self._airplay2_runtime
+        )
         if is_airplay2:
             await self._rebuild_airplay2_instances({entry_id})
         elif settings.airplay_engine == "local":
@@ -1021,8 +1038,7 @@ class AudioBridge:
         if dlna_ids and self._dlna_targets:
             # DLNA renderers pull the HTTP stream — no PCM tap needed.
             cast_url = (
-                f"http://{settings.effective_stream_host}:{settings.stream_port}"
-                f"/stream/{entry_id}"
+                f"http://{settings.effective_stream_host}:{settings.stream_port}/stream/{entry_id}"
             )
             await self._dlna_targets.play_targets(
                 entry_id, dlna_ids, cast_url, settings.receiver_network_channels(entry_id)
@@ -1052,7 +1068,17 @@ class AudioBridge:
         self._stall_recovery_requested = True
         logger.warning("Rebuilding AirPlay receiver after PCM stall on %s", stream_id)
         try:
-            await self.restart()
+            airplay2_ids = [item.id for item in settings.airplay2_instances if item.enabled]
+            instance_id = _stream_owner(stream_id, airplay2_ids)
+            if instance_id is None:
+                await self.restart()
+                return
+            self._maintenance_sessions.add(instance_id)
+            self._active_sessions.discard(instance_id)
+            try:
+                await self._rebuild_airplay2_instances({instance_id})
+            finally:
+                self._maintenance_sessions.discard(instance_id)
         finally:
             self._stall_recovery_requested = False
 
@@ -1225,6 +1251,9 @@ class AudioBridge:
             else:
                 return
         self._active_sessions.discard(device_id)
+        if device_id in self._maintenance_sessions:
+            logger.info("Ignoring maintenance session stop for %s", device_id)
+            return
         if self.on_session_stop:
             try:
                 await self.on_session_stop(device_id)

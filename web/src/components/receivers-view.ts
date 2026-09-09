@@ -409,8 +409,10 @@ export function renderReceiversView(state: State): string {
                 <div class="receiver-heading">
                   <div>
                     <div class="device-name">${escapeHtml(r.name)}</div>
-                    <span class="protocol-badge">经典 AirPlay</span>
-                    ${dlnaEnabled ? `<span class="protocol-badge">DLNA</span>` : ""}
+                    <div class="receiver-protocols">
+                      <span class="protocol-badge protocol-airplay">经典 AirPlay</span>
+                      ${dlnaEnabled ? `<span class="protocol-badge protocol-dlna">DLNA</span>` : ""}
+                    </div>
                     ${detail ? `<span class="caption">${escapeHtml(detail)}</span>` : ""}
                   </div>
                 <span class="status-pill ${available ? "running" : r.status === "error" ? "error" : ""}">
@@ -456,7 +458,7 @@ function renderAirPlay2Entries(state: State): string {
         <div class="receiver-heading">
           <div class="receiver-entry-summary">
             <div class="receiver-entry-identity"><span class="device-name">${escapeHtml(item.name)}</span>
-            <span class="protocol-badge">AirPlay 2</span>
+            <span class="protocol-badge protocol-airplay2">AirPlay 2</span>
             </div><span class="caption">播放到 ${escapeHtml(item.target_name)}</span>
           </div>
           <span class="status-pill ${available ? "running" : item.status === "error" ? "error" : ""}">${available ? "可连接" : item.status === "error" ? "不可用" : "准备中"}</span>

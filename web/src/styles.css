@@ -1493,8 +1493,7 @@ html.is-embedded {
 .main-content[data-active-section="topology"] {
   display: flex;
   flex-direction: column;
-  /* Same content measure as every other section — the map is a page, not
-     a fullscreen monitor takeover. */
+  min-height: 0;
   max-width: 56rem;
 }
 .setup-steps { padding: 4.5rem var(--space-xl); background: color-mix(in srgb, var(--accent) 3%, var(--bg)); }
@@ -2531,16 +2530,62 @@ html.is-embedded {
   .has-playback .main-content {
     padding-bottom: 0;
   }
-  /* The desktop player occupies the header strip. In an embedded fnOS window
-     that strip is hidden, so move the topology HUD below the player instead
-     of allowing two independent overlays to share the same coordinates. */
-  .is-embedded.has-playback .topology-hud-left,
-  .is-embedded.has-playback .topology-legend {
-    top: 3.75rem;
+  /* fnOS owns the native title bar, so its embedded page has no MiCast header
+     for the horizontal player. Use the quiet space below the navigation as a
+     compact sidebar controller instead. */
+  .is-embedded .now-playing {
+    top: calc(var(--space-lg) + 20.75rem + var(--space-md));
+    left: max(
+      var(--space-2xl),
+      calc((100vw - 1180px) / 2 + var(--space-2xl))
+    );
+    right: auto;
+    bottom: auto;
+    width: var(--sidebar-width);
+    max-height: calc(100dvh - 24rem);
+    padding: var(--space-sm);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    box-shadow: 0 0.5px 0 var(--separator), var(--shadow-sm);
+    overflow-y: auto;
   }
-  .is-embedded.has-playback .topology-detail {
-    top: 6rem;
-    max-height: calc(100% - 7rem);
+  .is-embedded .now-playing-main {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) repeat(3, auto);
+    gap: var(--space-2xs);
+  }
+  .is-embedded .now-playing-copy {
+    min-width: 0;
+  }
+  .is-embedded .now-playing-master {
+    grid-column: 1 / 5;
+    grid-row: 2;
+    min-width: 0;
+    margin-top: var(--space-xs);
+  }
+  .is-embedded .now-playing-main > [data-mute] {
+    grid-column: 5;
+    grid-row: 2;
+    margin-top: var(--space-xs);
+  }
+  .is-embedded .now-playing-expand {
+    grid-column: 5;
+    grid-row: 1;
+  }
+  .is-embedded .now-playing-device {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .is-embedded .now-playing-device-name {
+    grid-column: 1;
+    width: auto;
+  }
+  .is-embedded .now-playing-device input[type="range"] {
+    grid-column: 1;
+    min-width: 0;
+  }
+  .is-embedded .now-playing-device output {
+    grid-column: 2;
   }
 }
 
@@ -3069,16 +3114,29 @@ html.is-embedded {
 /* ---- Topology link map (dark monitor view, theme-independent) ---- */
 .topology-stage {
   position: relative;
-  flex: none;
-  /* Bounded card: tall enough to read the map, never the whole window. */
-  height: clamp(24rem, 62dvh, 42rem);
+  flex: 1 0 24rem;
+  min-height: 24rem;
   border-radius: var(--radius-lg, 1rem);
   overflow: hidden;
   background: radial-gradient(ellipse at 30% 20%, #0a1622 0%, #060d14 60%, #04080d 100%);
   border: 1px solid rgba(56, 189, 248, 0.12);
 }
-.topology-stage:has(.topology-empty:not([hidden])) {
-  height: clamp(18rem, 36dvh, 22rem);
+
+.receiver-protocols {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3xs);
+}
+
+.protocol-badge.protocol-dlna {
+  background: color-mix(in srgb, #8b5cf6 15%, transparent);
+  color: light-dark(#6d28d9, #c4b5fd);
+}
+
+.protocol-badge.protocol-airplay2 {
+  background: color-mix(in srgb, #06b6d4 15%, transparent);
+  color: light-dark(#0e7490, #67e8f9);
 }
 .topology-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 .topology-hud {
@@ -3310,14 +3368,12 @@ html.is-embedded {
   .calibration-hint { margin-top: 0.75rem; }
 
   /* Link map: the empty state must not compete with inactive nodes and the legend. */
+  .main-content[data-active-section="topology"] {
+    min-height: calc(100dvh - var(--header-height));
+  }
   .topology-stage {
-    height: auto;
     min-height: 20rem;
     border-radius: 0.875rem;
-  }
-  .topology-stage:has(.topology-empty:not([hidden])) {
-    height: auto;
-    min-height: 17rem;
   }
   .topology-legend {
     left: auto;

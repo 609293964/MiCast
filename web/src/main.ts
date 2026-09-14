@@ -10,6 +10,7 @@ import {
 } from "./components/app-shell";
 import { bindDebugPanel, bindStreamKicks, renderConnectionChecks, renderDebugPanel, renderStreamRows, updateRuntimeLog, type DebugState } from "./components/debug-panel";
 import { bindDevicesView, renderDevicesView } from "./components/devices-view";
+import { bindTuningView, renderTuningView } from "./components/tuning-view";
 import { renderQRSheet, bindQRSheet } from "./components/qr-sheet";
 import { bindReceiversView, renderReceiversView } from "./components/receivers-view";
 import { bindSettingsView, renderSettingsView } from "./components/settings-view";
@@ -33,6 +34,7 @@ let shellMounted = false;
 let topologyCleanup: (() => void) | null = null;
 // Content scrolls inside .app-body; switching sections starts at the top.
 let lastRenderedSection: Section | null = null;
+let lastRenderedTuningDid: string | null = null;
 
 function render(state: State) {
   const app = document.getElementById("app");
@@ -56,21 +58,65 @@ function render(state: State) {
     bindOnboarding(app, {
       onAccess: async (payload) => {
         try {
-          await api.setupAccess(payload);
-          const access = await api.getAccessStatus();
-          store.set({ access, onboardingStep: "xiaomi" });
+          // 退回第一步重设时，管理访问已经配置过，须走设置接口；首次 setup 会 409。
+          if (store.get().access?.access_configured) await api.updateAccess(payload);
+          else await api.setupAccess(payload);
+          const [access, xiaomi] = await Promise.all([
+            api.getAccessStatus(),
+            api.getXiaomiStatus().catch(() => null),
+          ]);
+          store.set({ access, ...(xiaomi ? { xiaomi } : {}), onboardingStep: "xiaomi" });
           render(store.get());
+          // 已经连着米家（例如重跑引导）时不必再等人点“继续”。
+          if (xiaomi?.logged_in) scheduleXiaomiAutoAdvance();
         } catch (error) {
           store.showToast(`保存失败：${friendlyError(error)}`);
           throw error;
         }
       },
       onXiaomi: startQRLogin,
-      onReview: async () => {
-        const [fullConfig, xiaomi] = await Promise.all([api.getConfig(), api.getXiaomiStatus()]);
-        let devices = store.get().devices;
-        if (xiaomi.logged_in) devices = await api.getDevices().catch(() => devices);
-        store.set({ fullConfig, xiaomi, devices, onboardingStep: fullConfig.airplay2_available ? "airplay2" : "complete", qr: { open: false, qrUrl: null, scanToken: null, state: "idle" } });
+      onReview: advanceFromXiaomi,
+      onBack: (step) => {
+        window.clearTimeout(xiaomiAutoTimer);
+        store.set({
+          onboardingStep: step as State["onboardingStep"],
+          qr: { open: false, qrUrl: null, scanToken: null, state: "idle" },
+        });
+        render(store.get());
+      },
+      onAddReceivers: async () => {
+        const { devices, fullConfig } = store.get();
+        const existing = new Set(
+          (fullConfig?.receivers ?? []).filter((r) => r.target_type === "speaker").map((r) => r.target_id)
+        );
+        const pending = devices.filter((device) => !existing.has(device.did));
+        const results = await Promise.allSettled(
+          pending.map((device) =>
+            api.createReceiver({ name: device.alias || device.name, target_type: "speaker", target_id: device.did })
+          )
+        );
+        const failed = results.filter((r) => r.status === "rejected").length;
+        store.showToast(failed
+          ? `已添加 ${results.length - failed} 台，${failed} 台失败`
+          : `已添加 ${results.length} 台音箱`);
+        const config = await api.getConfig().catch(() => store.get().fullConfig);
+        store.set({
+          fullConfig: config,
+          onboardingStep: config?.airplay2_available ? "airplay2" : "complete",
+        });
+        render(store.get());
+      },
+      onSkipReceivers: () => {
+        store.set({ onboardingStep: store.get().fullConfig?.airplay2_available ? "airplay2" : "complete" });
+        render(store.get());
+      },
+      onRefreshReceivers: async () => {
+        try {
+          const devices = await api.getDevices();
+          store.set({ devices, deviceLoadError: null });
+        } catch (error) {
+          store.set({ deviceLoadError: `获取音箱列表失败：${friendlyError(error)}` });
+        }
         render(store.get());
       },
       onAirPlay2: async (enabled, target) => {
@@ -99,10 +145,15 @@ function render(state: State) {
 
   const appName = state.fullConfig?.app.name ?? "MiCast";
   const activeSection = state.ui.activeSection;
+  const tuningDid = state.ui.tuningDid;
 
   let mainContent = "";
 
-  switch (activeSection) {
+  if (tuningDid) {
+    // Full-screen secondary page: replaces the section content without
+    // taking a sidebar slot.
+    mainContent = renderTuningView(state.devices.find((d) => d.did === tuningDid));
+  } else switch (activeSection) {
     case "receivers":
       mainContent = renderReceiversView(state);
       break;
@@ -170,8 +221,14 @@ function render(state: State) {
     const previousScrollTop = scrollContainer?.scrollTop ?? 0;
     topologyCleanup?.();
     topologyCleanup = null;
-    main.innerHTML = mainContent;
-    bindSectionUI(main);
+    // The tuning canvas owns live drag state; a poll-triggered re-render would
+    // destroy it mid-gesture. While tuning stays open on the same speaker,
+    // leave the DOM untouched (the page updates itself).
+    const tuningUnchanged = tuningDid != null && tuningDid === lastRenderedTuningDid;
+    if (!tuningUnchanged) {
+      main.innerHTML = mainContent;
+      bindSectionUI(main);
+    }
     if (sectionChanged) {
       scrollContainer?.scrollTo(0, 0);
     } else if (scrollContainer) {
@@ -188,6 +245,7 @@ function render(state: State) {
     }
   }
   lastRenderedSection = activeSection;
+  lastRenderedTuningDid = tuningDid;
   app.querySelectorAll<HTMLElement>("[data-section]").forEach((item) => {
     const selected = item.dataset.section === activeSection;
     item.classList.toggle("active", selected);
@@ -269,6 +327,16 @@ document.addEventListener("focusout", () => {
   });
 });
 
+// Views that mutate state as a direct consequence of a finished user action
+// (e.g. the EQ switch on a device card) dispatch this to force a re-render.
+// It bypasses the interaction guard: the action is already complete, and the
+// control that fired it (a switch) often keeps focus, which would otherwise
+// defer the render indefinitely on pages that only update in place on polls.
+window.addEventListener("micast:request-render", () => {
+  renderPending = false;
+  render(store.get());
+});
+
 function bindGlobalUI(container: HTMLElement) {
   bindNavigation(container, (section) => {
     store.setUi({ activeSection: section });
@@ -299,6 +367,13 @@ function bindGlobalUI(container: HTMLElement) {
 
 function bindSectionUI(container: HTMLElement) {
   const activeSection = store.get().ui.activeSection;
+  if (store.get().ui.tuningDid) {
+    bindTuningView(container, () => {
+      store.setUi({ tuningDid: null });
+      render(store.get());
+    });
+    return;
+  }
   if (activeSection === "receivers") {
     bindReceiversView(container, () => render(store.get()));
   } else if (activeSection === "settings") {
@@ -322,10 +397,17 @@ function bindSectionUI(container: HTMLElement) {
       }
     );
   } else if (activeSection === "devices") {
-    bindDevicesView(container, (did) => {
-      store.setUi({ expandedDeviceDid: did });
-      render(store.get());
-    });
+    bindDevicesView(
+      container,
+      (did) => {
+        store.setUi({ expandedDeviceDid: did });
+        render(store.get());
+      },
+      (did) => {
+        store.setUi({ tuningDid: did });
+        render(store.get());
+      }
+    );
   } else if (activeSection === "account") {
     bindAccountView(container, {
       onBack: () => {
@@ -430,6 +512,63 @@ async function refreshLoginState() {
   }
 }
 
+let xiaomiAutoTimer: number | undefined;
+
+// 米家步骤之后统一的前进逻辑：登录了就一定进入「播放入口」步——空列表和
+// 加载失败由视图层的空态/重扫负责，不再在这里静默跳过整步。
+async function advanceFromXiaomi() {
+  const [fullConfig, xiaomi] = await Promise.all([api.getConfig(), api.getXiaomiStatus()]);
+  let devices = store.get().devices;
+  let deviceLoadError: string | null = null;
+  if (xiaomi.logged_in) {
+    try {
+      devices = await api.getDevices();
+    } catch (error) {
+      deviceLoadError = `获取音箱列表失败：${friendlyError(error)}`;
+    }
+  }
+  const nextStep = xiaomi.logged_in
+    ? "receivers"
+    : fullConfig.airplay2_available ? "airplay2" : "complete";
+  store.set({
+    fullConfig,
+    xiaomi,
+    devices,
+    deviceLoadError,
+    onboardingStep: nextStep,
+    qr: { open: false, qrUrl: null, scanToken: null, state: "idle" },
+  });
+  render(store.get());
+}
+
+// 登录成功后短暂展示成功态，然后自动进入下一步；用户点“上一步”会取消。
+function scheduleXiaomiAutoAdvance() {
+  window.clearTimeout(xiaomiAutoTimer);
+  xiaomiAutoTimer = window.setTimeout(() => {
+    const state = store.get();
+    if (state.access?.setup_complete || state.onboardingStep !== "xiaomi" || !state.xiaomi.logged_in) return;
+    void advanceFromXiaomi();
+  }, 1500);
+}
+
+// QR 登录确认后：先刷新持久化的登录身份，再清二维码面板（顺序反过来会把
+// 界面闪回登录卡片），在引导页里随后自动前进。
+async function finishXiaomiLogin() {
+  try {
+    store.set({ xiaomi: await api.getXiaomiStatus() });
+  } catch {
+    // Keep the last known state; the status poll will retry.
+  }
+  store.set({ qr: { open: false, qrUrl: null, scanToken: null, state: "idle" } });
+  const state = store.get();
+  if (!state.access?.setup_complete && state.onboardingStep === "xiaomi" && state.xiaomi.logged_in) {
+    await advanceFromXiaomi();
+    return;
+  }
+  render(store.get());
+  loadDevices();
+}
+
 async function finishOnboarding() {
   try {
     // The first application view is always the live link map. Persist this
@@ -481,13 +620,9 @@ async function pollQR(scanToken: string) {
         store.set({ qr: { ...qr, state: "scanned" } });
       } else if (result.status === "confirmed") {
         store.set({ qr: { ...qr, state: "confirmed" } });
+        render(store.get());
         store.showToast("登录成功");
-        setTimeout(() => {
-          store.set({ qr: { open: false, qrUrl: null, scanToken: null, state: "idle" } });
-          render(store.get());
-          refreshLoginState();
-          loadDevices();
-        }, 1500);
+        setTimeout(() => { void finishXiaomiLogin(); }, 1200);
         return;
       } else if (result.status === "expired") {
         store.set({ qr: { ...qr, state: "expired" } });
@@ -558,6 +693,7 @@ async function loadInitialState() {
       api.getXiaomiStatus(),
       api.getAirPlay2State().catch(() => null),
     ]);
+    document.documentElement.classList.toggle("is-fnos", config.deployment === "fnos");
     store.set({ status, audio, fullConfig: config, xiaomi, receivers: status.receivers, airplay2 });
     render(store.get());
 
@@ -591,7 +727,20 @@ async function init() {
     const access = await api.getAccessStatus();
     store.set({ access, onboardingStep: access.access_configured ? "xiaomi" : "access" });
     render(store.get());
-    if (!access.setup_complete || (access.auth_enabled && !access.authenticated)) return;
+    if (!access.setup_complete || (access.auth_enabled && !access.authenticated)) {
+      // 重进引导且米家仍连着：直接展示成功态并自动进入下一步。
+      if (store.get().onboardingStep === "xiaomi" && !access.setup_complete) {
+        try {
+          const xiaomi = await api.getXiaomiStatus();
+          store.set({ xiaomi });
+          render(store.get());
+          if (xiaomi.logged_in) scheduleXiaomiAutoAdvance();
+        } catch {
+          // Status check failed — the manual 继续/暂时跳过 buttons stay.
+        }
+      }
+      return;
+    }
   } catch (e) {
     store.showToast(`加载访问设置失败：${friendlyError(e)}`);
     return;

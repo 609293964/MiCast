@@ -12,9 +12,30 @@ receiver_id="${MICAST_DEVICE_ID:-main}"
 shairport_pid_file="${MICAST_DATA_DIR:?}/shairport-sync.pid"
 nqptp_pid_file="${MICAST_DATA_DIR:?}/nqptp.pid"
 
+# AirPlay 2 客户端通过 mDNS 记录里的端口连接，不要求固定 7000；
+# 从首选端口（MICAST_AIRPLAY2_PORT，默认 7000）起挑一个空闲端口，
+# 被占用时自动顺延。
+port_base="${MICAST_AIRPLAY2_PORT:-7000}"
+port="$("$PYTHON_BIN" -c '
+import socket, sys
+base = int(sys.argv[1])
+for p in range(base, base + 32):
+    s = socket.socket()
+    try:
+        s.bind(("0.0.0.0", p))
+        s.close()
+        print(p)
+        break
+    except OSError:
+        continue
+else:
+    print(base)
+' "$port_base")"
+
 cat > "$config" <<EOF
 general = {
   name = "$name";
+  port = $port;
   output_backend = "stdout";
   service_type = "airplay2";
   ignore_volume_control = "yes";

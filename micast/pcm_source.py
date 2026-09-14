@@ -111,17 +111,26 @@ class MockPCMSource(PCMSource):
 class LocalPCMSource(PCMSource):
     """Spawn a local process that outputs PCM on stdout."""
 
-    def __init__(self, command: str):
+    def __init__(self, command: str, env: dict[str, str] | None = None):
         self.command = command
+        # Extra environment for the child (e.g. MICAST_AIRPLAY2_PORT for the
+        # bundled shairport launcher); merged over the inherited environment.
+        self.env = env or {}
         self._process: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task | None = None
 
     async def start(self) -> asyncio.StreamReader:
         args = self.command.split()
+        env = None
+        if self.env:
+            import os  # noqa: PLC0415 — only needed on the spawn path
+
+            env = {**os.environ, **self.env}
         self._process = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
             **SUBPROCESS_KWARGS,
         )
         if self._process.stdout is None:
@@ -215,7 +224,7 @@ class ReaderPCMSource(PCMSource):
         pass
 
 
-def create_pcm_source(source_string: str) -> PCMSource:
+def create_pcm_source(source_string: str, env: dict[str, str] | None = None) -> PCMSource:
     """Factory for PCM sources."""
     kind, params = _parse_pcm_source(source_string)
     if kind == "mock":
@@ -223,5 +232,5 @@ def create_pcm_source(source_string: str) -> PCMSource:
     if kind == "tcp":
         return TCPPCMSource(params["host"], int(params["port"]))
     if kind == "local":
-        return LocalPCMSource(params["command"])
+        return LocalPCMSource(params["command"], env=env)
     raise ValueError(f"Unknown PCM source kind: {kind}")

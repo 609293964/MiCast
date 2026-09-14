@@ -19,8 +19,9 @@ from fastapi.responses import FileResponse, Response
 from micast.audio_bridge import AudioBridge
 from micast.audio_encoder import transcode_file_to_wav
 from micast.config import settings
-from micast.runtime_log import runtime_logs
+from micast.diagnostics import build_report, collect_state
 from micast.test_tone import test_tone_wav
+from micast.url_safety import validate_http_url
 from micast.xiaomi.device_manager import DeviceManager
 from micast.xiaomi.mina_api import MinaAPI
 
@@ -192,9 +193,10 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
                 raise HTTPException(status_code=404, detail="请重新上传测试音频")
             url = f"{media_base}/diagnostic/media/{token}"
         elif source == "url":
-            url = str(payload.get("url", "")).strip()
-            if not url.startswith(("http://", "https://")):
-                raise HTTPException(status_code=400, detail="请输入有效的音频地址")
+            try:
+                url = await validate_http_url(str(payload.get("url", "")))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         else:
             raise HTTPException(status_code=400, detail="未知测试音源")
         session_id = secrets.token_urlsafe(12)
@@ -435,30 +437,18 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
 
     @router.get("/state")
     async def debug_state():
-        service = await device_manager.auth.ensure_service()
-        devices = await device_manager.list_devices()
-        return {
-            "logged_in": service is not None,
-            "selected_device_id": device_manager.selected_device_id,
-            "devices": [
-                {
-                    "did": d.get("deviceID"),
-                    "name": d.get("name"),
-                    "hardware": d.get("hardware"),
-                    "presence": d.get("presence"),
-                    "miotDID": d.get("miotDID"),
-                }
-                for d in devices
-            ],
-            "pcm_source": settings.pcm_source,
-            "stream_url": bridge.status["stream_url"],
-            "audio_config": settings.audio.model_dump(),
-            "bridge_status": bridge.status,
-            "stream_clients": bridge._stream_server.total_flowing_clients(),
-            "stream_bytes_sent": bridge._stream_server.total_bytes(),
-            "diagnostics": bridge.diagnostics,
-            "logs": runtime_logs.snapshot(),
-        }
+        return await collect_state(bridge, device_manager)
+
+    @router.get("/report")
+    async def download_report():
+        """Sanitized diagnostic bundle: settings + state + logs, one file."""
+        report = await build_report(bridge, device_manager)
+        filename = f"micast-diagnostic-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        return Response(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @router.post("/tts")
     async def debug_tts(payload: dict):
@@ -539,6 +529,10 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
         method = payload.get("method", "music_url")
         if not url:
             raise HTTPException(status_code=400, detail="url required")
+        try:
+            url = await validate_http_url(str(url))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         service = await device_manager.auth.ensure_service()
         if not service or not device_manager.selected_device_id:
             raise HTTPException(status_code=400, detail="No device selected or not logged in")
@@ -573,6 +567,14 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
         else:
             raise HTTPException(status_code=400, detail="unknown action")
         return {"ok": True, "result": result}
+
+    @router.post("/pipelines/refresh")
+    async def refresh_pipelines():
+        """Full engine teardown + rebuild — the same rebuild an AirPlay 2
+        toggle triggers. Clears stuck sessions, stale pipelines and other
+        half-broken states; playback drops briefly."""
+        await bridge.restart()
+        return {"ok": True, "status": bridge.status.get("status", "unknown")}
 
     @router.post("/stream/{receiver_id}/kick")
     async def kick_stream(receiver_id: str):

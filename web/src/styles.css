@@ -1885,35 +1885,35 @@ html.is-embedded {
   border-top: none;
 }
 
-/* Per-speaker EQ */
+/* Per-speaker EQ entry (device card) */
 .eq-title-row {
   margin-top: var(--space-xs);
 }
 
-.eq-panel {
-  padding: 0 0 var(--space-sm);
-  transition: opacity 150ms ease;
-}
-
-.eq-panel.disabled {
-  opacity: 0.45;
-  pointer-events: none;
+.eq-entry {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
 }
 
 .eq-presets {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-xs);
-  margin: var(--space-xs) 0 var(--space-sm);
 }
 
 .eq-preset-chip {
-  padding: 4px 12px;
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 30px;
+  padding: 0 14px;
   border-radius: 999px;
   border: 0.5px solid var(--separator-strong);
   background: var(--bg);
   color: var(--text-secondary);
-  font-size: 0.78rem;
+  font-size: 0.8125rem;
+  line-height: 1;
   cursor: pointer;
   transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
 }
@@ -1928,46 +1928,282 @@ html.is-embedded {
   color: var(--accent-text);
 }
 
-.eq-bands {
+/* Full-screen tuning page */
+.tuning-heading {
   display: flex;
-  gap: var(--space-md);
-  justify-content: space-between;
-  padding: var(--space-xs) var(--space-sm);
+  align-items: flex-start;
+  gap: var(--space-sm);
+  /* Optically align the back glyph with the canvas/content left edge. */
+  margin-left: -6px;
 }
 
-.eq-band {
-  display: flex;
-  flex-direction: column;
+.tuning-heading .icon-button {
+  margin-top: 2px;
+  font-size: 1.1rem;
+}
+
+/* Tuning-page buttons share the preset chips' compact pill metrics, so the
+   toolbar reads as one control family instead of chips + oversized blocks. */
+.tuning-toolbar .button {
+  box-sizing: border-box;
+  min-height: 0;
+  height: 30px;
+  padding: 0 14px;
+  border-radius: 999px;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  gap: var(--space-xs);
+}
+
+.tuning-hint {
+  color: var(--text-tertiary);
+}
+
+.tuning-divider-v {
+  width: 1px;
+  height: 18px;
+  background: var(--separator);
+}
+
+/* Collapsible advanced section (target curve, calibration, scenes, files). */
+.tuning-advanced {
+  margin-bottom: var(--space-md);
+}
+
+.tuning-advanced-toggle {
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
-  flex: 1;
-}
-
-.eq-band input[type="range"] {
-  writing-mode: vertical-lr;
-  direction: rtl;
-  width: 1.4rem;
-  height: 6.5rem;
-  accent-color: var(--accent);
+  gap: var(--space-xs);
+  padding: 5px 10px;
+  margin-left: -10px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--text);
+  font-size: 0.9rem;
+  font-weight: 600;
   cursor: pointer;
+  transition: background 120ms ease;
 }
 
-.eq-band output {
-  font-size: 0.72rem;
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
-  min-height: 1em;
-}
-
-.eq-freq {
-  font-size: 0.7rem;
+.tuning-advanced-toggle::before {
+  content: "▸";
+  font-size: 0.8em;
   color: var(--text-tertiary);
+  transition: transform 150ms ease;
 }
 
-.eq-hint {
-  display: block;
+.tuning-advanced-toggle.open::before {
+  transform: rotate(90deg);
+}
+
+.tuning-advanced-toggle:hover {
+  background: var(--bg-secondary, var(--bg));
+}
+
+.tuning-advanced-body {
   margin-top: var(--space-xs);
+}
+
+.tuning-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-md);
+}
+
+.tuning-enable {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.tuning-target {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+.tuning-target select {
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 0.5px solid var(--separator-strong);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.85rem;
+}
+
+.tuning-canvas-wrap {
+  position: relative;
+  height: min(46vh, 380px);
+  min-height: 240px;
+  margin-bottom: var(--space-md);
+  border-radius: 12px;
+  border: 0.5px solid var(--separator);
+  background: var(--bg-secondary, var(--bg));
+  overflow: hidden;
+}
+
+.tuning-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+}
+
+.tuning-footer {
+  margin-top: var(--space-sm);
   color: var(--text-tertiary);
+}
+
+.tuning-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background: rgba(255, 149, 0, 0.14);
+  color: var(--warning);
+  font-size: 0.68rem;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+/* A/B blind-comparison modal */
+.ab-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-md);
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.ab-dialog {
+  width: min(26rem, 100%);
+  padding: var(--space-lg);
+  border-radius: 14px;
+  border: 0.5px solid var(--separator);
+  background: var(--bg);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+}
+
+.ab-dialog h3 {
+  margin: 0 0 var(--space-sm);
+  font-size: 1rem;
+}
+
+.ab-pick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+  margin-bottom: var(--space-sm);
+}
+
+.ab-status {
+  margin: 0;
+  min-height: 1.2em;
+}
+
+.ab-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  margin-top: var(--space-md);
+}
+
+.ab-actions .button.active {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+/* Calibration wizard inside the tuning page */
+.wizard {
+  margin-top: var(--space-md);
+  padding: var(--space-lg);
+  border-radius: 12px;
+  border: 0.5px solid var(--separator);
+  background: var(--bg-secondary, var(--bg));
+}
+
+.wizard h3 {
+  margin: 0 0 var(--space-xs);
+  font-size: 1rem;
+}
+
+.wizard p {
+  margin: 0 0 var(--space-md);
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.wizard-warning {
+  color: var(--danger);
+  font-size: 0.85rem;
+}
+
+.wizard-note {
+  color: var(--text-tertiary);
+  font-size: 0.8rem;
+}
+
+.wizard-field {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  margin-bottom: var(--space-md);
+}
+
+.wizard-field select {
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 0.5px solid var(--separator-strong);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.85rem;
+}
+
+.wizard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  margin-top: var(--space-md);
+}
+
+.wizard-progress {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--separator);
+  overflow: hidden;
+}
+
+.wizard-progress-bar {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 200ms ease;
+}
+
+.wizard-chart {
+  height: min(30vh, 240px);
+  min-height: 160px;
+  border-radius: 10px;
+  border: 0.5px solid var(--separator);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.wizard-chart canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 /* External AirPlay targets inside a group editor */
@@ -2294,6 +2530,7 @@ html.is-embedded {
   height: 100%;
   display: grid;
   place-items: center;
+
   color: var(--text-secondary);
 }
 
@@ -2552,26 +2789,30 @@ html.is-embedded {
   .is-embedded .now-playing-main {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr) repeat(3, auto);
-    gap: var(--space-2xs);
+    gap: var(--space-xs);
   }
   .is-embedded .now-playing-copy {
     min-width: 0;
   }
   .is-embedded .now-playing-master {
-    grid-column: 1 / 5;
+    grid-column: 2 / -1;
     grid-row: 2;
     min-width: 0;
-    margin-top: var(--space-xs);
+    margin-top: var(--space-2xs);
   }
   .is-embedded .now-playing-main > [data-mute] {
-    grid-column: 5;
+    grid-column: 1;
     grid-row: 2;
-    margin-top: var(--space-xs);
+    margin-top: var(--space-2xs);
   }
   .is-embedded .now-playing-expand {
     grid-column: 5;
     grid-row: 1;
   }
+  .is-embedded .now-playing-icon { width: 1.875rem; height: 1.875rem; }
+  .is-embedded .now-playing-copy strong { font-size: 0.9375rem; }
+  .is-embedded .now-playing-copy span { font-size: 0.75rem; }
+  .is-embedded .now-playing .icon-button.compact { width: 1.875rem; height: 1.875rem; }
   .is-embedded .now-playing-device {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
@@ -2587,6 +2828,11 @@ html.is-embedded {
   .is-embedded .now-playing-device output {
     grid-column: 2;
   }
+}
+
+@media (max-width: 1023px) {
+  .is-fnos .app-title { display: none; }
+  .is-fnos .app-brand { gap: 0; }
 }
 
 .now-playing-icon {
@@ -3401,4 +3647,16 @@ html.is-embedded {
 
 @media (min-width: 1024px) {
   .main-content[data-active-section="topology"] { align-self: stretch; }
+}
+
+/* display rules on .cell/.button would otherwise beat the UA [hidden] style */
+[hidden] { display: none !important; }
+
+.update-actions { display: flex; align-items: center; gap: var(--space-xs); flex-shrink: 0; }
+
+.button.compact {
+  min-height: 1.875rem;
+  padding: 0 var(--space-md);
+  font-size: 0.8125rem;
+  border-radius: var(--radius-sm);
 }

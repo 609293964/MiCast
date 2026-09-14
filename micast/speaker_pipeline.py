@@ -5,8 +5,16 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 
-from micast.audio_encoder import AudioEncoder, raw_pcm_format, wav_header
-from micast.config import EQ_BANDS_HZ, settings
+from micast.audio_encoder import AudioEncoder, firequalizer_available, raw_pcm_format, wav_header
+from micast.config import settings
+from micast.curve_fit import (
+    add_curve,
+    equalizer_chain,
+    firequalizer_args,
+    gain_table,
+    loudness_band,
+    loudness_curve,
+)
 from micast.pcm_source import PCMSource
 from micast.stream_server import StreamServer
 
@@ -43,7 +51,8 @@ class SpeakerPipeline:
         stream_id: str | None = None,
         group_id: str | None = None,
         channel: str | None = None,
-        eq_bands: list[float] | None = None,
+        eq_curve: list[tuple[float, float]] | None = None,
+        loudness: bool = False,
         pace_source: bool = True,
         session_active: Callable[[], bool] | None = None,
         on_source_stall: Callable[[str], Awaitable[None]] | None = None,
@@ -57,7 +66,8 @@ class SpeakerPipeline:
         self._stream_id = stream_id or device_id
         self._group_id = group_id
         self._channel = channel
-        self._eq_bands = list(eq_bands) if eq_bands else None
+        self._eq_curve = list(eq_curve) if eq_curve else None
+        self._loudness = loudness
         self._pace_source = pace_source
         # Ground truth for the stall watchdog: True while a sender session is
         # live on this pipeline's receiver. None disables stall detection.
@@ -77,6 +87,12 @@ class SpeakerPipeline:
         # AirPlay sender volume is stream gain, independent from the physical
         # speaker volume controlled by the Web UI.
         self._input_volume = 100
+        # Equal-loudness state: the listening level drives the compensation
+        # curve (in both volume modes it is the sender volume), quantized so a
+        # nudge inside a band never rebuilds the encoder.
+        self._loudness_level = 100
+        self._loudness_band = loudness_band(self._loudness_level)
+        self._loudness_restarting = False
 
     @property
     def status(self) -> str:
@@ -86,32 +102,46 @@ class SpeakerPipeline:
     def stream_url(self) -> str:
         return f"http://{settings.effective_stream_host}:{settings.stream_port}/stream/{self._stream_id}"
 
-    def _build_audio_filter(self) -> str | None:
-        """Audio filter chain: per-speaker EQ first, then stereo-pair shaping.
+    def _build_audio_filter(self) -> list[tuple[str, str]] | None:
+        """Audio filter chain: per-speaker EQ curve first, then stereo shaping.
 
-        Parsed by micast.audio_encoder._build_filter_graph — the same
-        name=args, comma-joined mini-language ffmpeg's -af takes.
+        Returns structured ``(filter_name, args)`` links consumed by
+        micast.audio_encoder._build_filter_graph. The drawn EQ curve renders
+        as one firequalizer gain table, or a multi-band equalizer chain when
+        the bundled libavfilter lacks firequalizer.
         """
-        parts: list[str] = []
-        if self._eq_bands:
-            for hz, gain in zip(EQ_BANDS_HZ, self._eq_bands, strict=True):
-                if abs(gain) >= 0.05:
-                    parts.append(f"equalizer=f={hz}:t=q:w=1.0:g={gain:g}")
+        parts: list[tuple[str, str]] = []
+        # The effective curve is the drawn EQ plus the equal-loudness shelf; a
+        # loudness-only speaker (flat EQ) still gets a non-empty curve so it is
+        # encoded rather than bypassed raw.
+        curve = self._eq_curve
+        if self._loudness:
+            shelf = loudness_curve(self._loudness_level)
+            if shelf:
+                curve = add_curve(curve or [], shelf)
+        if curve:
+            table = gain_table(curve)
+            if firequalizer_available():
+                parts.append(("firequalizer", firequalizer_args(table)))
+            else:
+                for link in equalizer_chain(table):
+                    name, _, args = link.partition("=")
+                    parts.append((name, args))
         group = next((g for g in settings.groups if g.id == self._group_id), None)
         stereo = group is not None and group.mode == "stereo" and self._channel in ("left", "right")
         if not stereo:
-            return ",".join(parts) or None
+            return parts or None
         # Keep the stream stereo (duplicate the picked channel to both sides):
         # byte-rate pacing and speaker decoders all assume two channels.
         side = "FL" if self._channel == "left" else "FR"
-        parts.append(f"pan=stereo|c0={side}|c1={side}")
+        parts.append(("pan", f"stereo|c0={side}|c1={side}"))
         # Trims are configured per speaker; follow whoever holds this channel.
         holder = self._channel_holder()
         if holder:
             gain = float(group.gains_db.get(holder, 0.0))
             if gain:
-                parts.append(f"volume={gain}dB")
-        return ",".join(parts)
+                parts.append(("volume", f"{gain}dB"))
+        return parts
 
     def _channel_holder(self) -> str | None:
         """The speaker currently assigned to this pipeline's stereo channel."""
@@ -131,6 +161,34 @@ class SpeakerPipeline:
 
     def set_input_volume(self, percent: int) -> None:
         self._input_volume = max(0, min(100, int(percent)))
+
+    def set_loudness_level(self, percent: int) -> None:
+        """Update the listening level driving equal-loudness compensation.
+
+        The curve is quantized into bands, so only a band crossing rebuilds the
+        encoder (and even then just the encoder, never the stream/session).
+        """
+        percent = max(0, min(100, int(percent)))
+        self._loudness_level = percent
+        if not self._loudness:
+            return
+        band = loudness_band(percent)
+        if band == self._loudness_band or not self._running:
+            self._loudness_band = band
+            return
+        self._loudness_band = band
+        if not self._loudness_restarting:
+            asyncio.create_task(self._rebuild_loudness())
+
+    async def _rebuild_loudness(self) -> None:
+        """Rebuild only the encoder after a loudness band crossing."""
+        if self._loudness_restarting:
+            return
+        self._loudness_restarting = True
+        try:
+            await self.restart_encoder()
+        finally:
+            self._loudness_restarting = False
 
     def _apply_input_gain(self, chunk: bytes) -> bytes:
         """Apply the sender volume to signed 16-bit little-endian PCM."""

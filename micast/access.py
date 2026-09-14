@@ -46,6 +46,14 @@ class AccessManager:
         tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, self.path)
 
+    def reset(self) -> None:
+        """Wipe credentials and setup flags (清空数据 → 回到引导页)."""
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+        self._data = self._load()  # file is gone → fresh defaults
+
     @property
     def access_configured(self) -> bool:
         return bool(self._data.get("access_configured"))

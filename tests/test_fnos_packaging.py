@@ -72,6 +72,8 @@ def test_fnos_keeps_classic_airplay_and_starts_single_airplay2_on_demand():
     assert 'runtime/bin/nqptp' not in main
     assert 'runtime/bin/nqptp' in receiver
     assert 'service_type = "airplay2"' in receiver
+    # AirPlay 2 首选端口由设置页下发，run-shairport 从该值起扫描空闲端口。
+    assert 'MICAST_AIRPLAY2_PORT' in receiver
 
 
 def test_fnos_lifecycle_handles_health_upgrade_and_uninstall_policies():

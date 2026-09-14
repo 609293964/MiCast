@@ -36,22 +36,35 @@ function eqSplitTag(state: State, receiverId: string, channelTag: "L" | "R" | nu
     dids = [config.selected_device_id];
   }
   const wantBase = channelTag ?? "";
-  const signatures: number[][] = [];
+  // Signatures are the canonical curve points, deduped like the backend's
+  // receiver_stream_variants (rounded to 0.1 Hz / 0.01 dB).
+  const signatureOf = (points: [number, number][]) =>
+    normalizePoints(points).map(([f, g]) => `${f.toFixed(1)}:${g.toFixed(2)}`).join(",");
+  const signatures: string[] = [];
   for (const did of dids) {
     if (baseOf(did) !== wantBase) continue;
     const eq = state.devices.find((d) => d.did === did)?.eq;
-    if (!eq?.enabled || !eq.bands.some((b) => b !== 0)) continue;
-    if (!signatures.some((sig) => sig.every((b, i) => Math.abs(b - (eq.bands[i] ?? 0)) < 0.01))) {
-      signatures.push([...eq.bands]);
-    }
+    if (!eq?.enabled || !eq.points.some(([, g]) => Math.abs(g) >= 0.05)) continue;
+    const sig = signatureOf(eq.points);
+    if (!signatures.includes(sig)) signatures.push(sig);
   }
-  const bands = signatures[q - 1];
-  if (!bands) return fallback;
+  const wanted = signatures[q - 1];
+  if (!wanted) return fallback;
   const owner = dids
     .map((did) => state.devices.find((d) => d.did === did))
-    .find((d) => d?.eq?.enabled && d.eq.bands.every((b, i) => Math.abs(b - (bands[i] ?? 0)) < 0.01));
+    .find((d) => d?.eq?.enabled && signatureOf(d.eq.points) === wanted);
   const preset = owner?.eq?.preset;
   return (preset && EQ_PRESET_LABELS[preset]) || "自定义音效";
+}
+
+/** Sort/clamp/dedupe control points, mirroring curve_fit.normalize_points. */
+function normalizePoints(points: [number, number][]): [number, number][] {
+  const byFreq = new Map<number, number>();
+  for (const [f, g] of points) {
+    const freq = Math.min(20000, Math.max(20, f));
+    byFreq.set(freq, Math.min(12, Math.max(-12, g)));
+  }
+  return [...byFreq.entries()].sort((a, b) => a[0] - b[0]).slice(0, 24);
 }
 
 let debugTargetKey = "";
@@ -149,6 +162,17 @@ export function renderDebugPanel(state: State, debug: DebugState | null): string
       ${renderStreamRows(debug, state)}
     </div>
 
+    <div class="group-header">维护</div>
+    <div class="group">
+      <div class="cell">
+        <div class="cell-content">
+          <span class="cell-title">刷新管道</span>
+          <span class="cell-subtitle">重建全部播放管道与连接（同开关 AirPlay 2 的重建），可清除卡住的会话和异常状态；播放会短暂中断</span>
+        </div>
+        <button class="button compact secondary" type="button" data-refresh-pipelines ${debug ? "" : "disabled"}>刷新管道</button>
+      </div>
+    </div>
+
     <details class="diagnostic-details" open>
       <summary><span><strong>技术计数</strong><small>传输、时钟与编码数据</small></span></summary>
       <div class="technical-metrics">
@@ -213,6 +237,7 @@ export function renderDebugPanel(state: State, debug: DebugState | null): string
         </select>
         <button class="button plain log-action" type="button" data-log-pause>暂停</button>
         <button class="button plain log-action" type="button" data-log-copy>复制</button>
+        <button class="button plain log-action" type="button" data-log-report title="下载脱敏后的诊断报告（设置、状态与近期日志），反馈问题时请附上">下载报告</button>
       </div>
       <div class="runtime-log" role="log" aria-label="最新连接日志" data-runtime-log data-filter="micast">
         ${renderRuntimeLogRows(debug, "micast")}
@@ -338,6 +363,19 @@ export function bindDebugPanel(container: HTMLElement, showToast: (msg: string) 
     });
   };
   bindStreamKicks(container, showToast);
+  const refreshBtn = container.querySelector<HTMLButtonElement>("[data-refresh-pipelines]");
+  refreshBtn?.addEventListener("click", async () => {
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = "正在重建…";
+    try {
+      await api.refreshPipelines();
+      showToast("管道已重建");
+    } catch (e) {
+      showToast(`刷新失败: ${e instanceof Error ? e.message : "未知错误"}`);
+    } finally {
+      rerender?.();
+    }
+  });
   container.querySelector<HTMLSelectElement>("[data-debug-target]")?.addEventListener("change", (event) => {
     debugTargetKey = (event.currentTarget as HTMLSelectElement).value;
     rerenderTestPanel();
@@ -419,6 +457,14 @@ export function bindDebugPanel(container: HTMLElement, showToast: (msg: string) 
     if (!text) return showToast("暂无日志可复制");
     try { await navigator.clipboard.writeText(text); showToast("日志已复制"); }
     catch { showToast("复制失败，请手动选择日志"); }
+  });
+  container.querySelector("[data-log-report]")?.addEventListener("click", async () => {
+    try {
+      await api.downloadDebugReport();
+      showToast("诊断报告已下载（已自动脱敏）");
+    } catch (e) {
+      showToast(`下载失败: ${e instanceof Error ? e.message : "未知错误"}`);
+    }
   });
   const ttsBtn = container.querySelector("#btn-debug-tts");
   ttsBtn?.addEventListener("click", async () => {

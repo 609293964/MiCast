@@ -64,7 +64,8 @@ def entry_fingerprint(s: Settings, entry_id: str) -> EntryFingerprint | None:
                     {
                         "did": did,
                         "channel": s.receiver_channel(entry_id, did),
-                        "eq": s.speaker_eq_bands(did),
+                        "eq": s.speaker_eq_curve(did),
+                        "loudness": s.speaker_loudness(did),
                         "gain_db": group.gains_db.get(did, 0.0),
                     }
                     for did in sorted(group.speaker_ids)
@@ -76,7 +77,7 @@ def entry_fingerprint(s: Settings, entry_id: str) -> EntryFingerprint | None:
         # Order-normalized: membership reordering must not diff.
         "variants": sorted(
             s.receiver_stream_variants(entry_id),
-            key=lambda v: (v["suffix"], v["base"], v["channel"] or "", str(v["eq"])),
+            key=lambda v: (v["suffix"], v["base"], v["channel"] or "", str(v["eq"]), v["loudness"]),
         ),
         "audio": s.audio.model_dump(),
         "external_airplay": dict(sorted(s.receiver_airplay_delays(entry_id).items())),

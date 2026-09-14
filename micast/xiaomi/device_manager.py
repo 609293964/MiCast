@@ -74,6 +74,27 @@ class DeviceManager:
     def selected_device_id(self) -> str | None:
         return settings.selected_device_id
 
+    def reset(self) -> None:
+        """Drop every cached device/playback state (清空数据 → 回到引导页)."""
+        for task in self._watchdog_tasks.values():
+            task.cancel()
+        self._watchdog_tasks.clear()
+        self._devices = []
+        self._service = None
+        self._playing.clear()
+        self._paused.clear()
+        self._stream_urls.clear()
+        self._volumes.clear()
+        self._muted.clear()
+        self._pre_mute_volumes.clear()
+        self._owners.clear()
+        self._last_restore.clear()
+        self._play_errors.clear()
+        self._anchor_paused.clear()
+        if self._error_retry_task:
+            self._error_retry_task.cancel()
+            self._error_retry_task = None
+
     @selected_device_id.setter
     def selected_device_id(self, value: str | None) -> None:
         settings.select_device(value)

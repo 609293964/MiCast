@@ -74,7 +74,11 @@ class XiaomiAuth:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            # Bounded waits: a NAS with restricted egress must surface a login
+            # failure instead of hanging the QR sheet forever.
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=20, connect=10)
+            )
         return self._session
 
     async def _build_account(self, tokens: dict) -> MiAccount:
@@ -260,10 +264,16 @@ class XiaomiAuth:
 
         qr_url = result.get("qr")
         lp_url = result.get("lp")
-        if not qr_url or not lp_url:
+        login_url = result.get("loginUrl")
+        if not lp_url or not (login_url or qr_url):
             raise XiaomiAuthError(f"Failed to get QR: {result}")
 
-        return {"qr_url": qr_url, "scan_token": lp_url, "device_id": device_id}
+        return {
+            "qr_url": qr_url,
+            "login_url": login_url,
+            "scan_token": lp_url,
+            "device_id": device_id,
+        }
 
     async def poll_qr_login(self, lp_url: str) -> dict:
         """Poll QR login status. Returns status and tokens on confirmed."""

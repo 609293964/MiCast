@@ -22,7 +22,7 @@ def main() -> None:
     # A normal user's machine may already have something on 3000 — slide to a
     # free port instead of failing. Explicit MICAST_PORT stays strict.
     if not unix_socket:
-        settings.port = resolve_port(settings.port, "MICAST_PORT")
+        settings.apply_resolved_port("port", resolve_port(settings.port, "MICAST_PORT"))
 
     frozen = getattr(sys, "frozen", False)
     if frozen and sys.platform == "win32" and os.environ.get("MICAST_NO_DESKTOP") != "1":

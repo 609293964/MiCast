@@ -1,6 +1,29 @@
 """Deployment feature gates shared by API, runtime and UI state."""
 
 import os
+import sys
+
+
+def deployment_mode() -> str:
+    """Return the normalized package/runtime family exposed to the UI."""
+    explicit = os.environ.get("MICAST_DEPLOYMENT", "").strip().lower()
+    if explicit:
+        return explicit
+    # A frozen Windows build without an explicit tag is the desktop exe.
+    if is_windows_exe():
+        return "windows"
+    return "development"
+
+
+def is_windows_exe() -> bool:
+    """True when running as the PyInstaller-packaged Windows desktop app."""
+    return bool(getattr(sys, "frozen", False)) and sys.platform == "win32"
+
+
+def update_download_supported() -> bool:
+    """Only the Windows exe may download updates; fnOS/Docker builds update
+    through their own package channels, so they only get the notice."""
+    return is_windows_exe()
 
 
 def integrated_airplay2_available() -> bool:
@@ -13,7 +36,7 @@ def airplay2_mode() -> str:
     explicit = os.environ.get("MICAST_AIRPLAY2_MODE", "").strip().lower()
     if explicit in {"disabled", "single", "multi"}:
         return explicit
-    deployment = os.environ.get("MICAST_DEPLOYMENT", "").strip().lower()
+    deployment = deployment_mode()
     if deployment == "fnos":
         return "single"
     if deployment == "integrated":

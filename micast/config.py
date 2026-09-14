@@ -14,6 +14,25 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from micast.curve_fit import (
+    CURVE_FREQ_RANGE,
+    CURVE_GAIN_RANGE,
+    NIGHT_ATTENUATION,
+    TARGET_CURVES,
+    add_curve,
+    curve_signature,
+    legacy_bands_to_points,
+    normalize_points,
+)
+
+# EQ gain clamp kept under its historical name.
+EQ_GAIN_RANGE = CURVE_GAIN_RANGE
+
+# Named per-speaker scenes a user can save their current curve into. Switching
+# a scene copies its saved curve into the active EQ; drawing a custom curve
+# clears the active-scene label (content_profile back to "").
+CONTENT_PROFILES: tuple[str, ...] = ("music", "movie", "voice")
+
 # Snapshot the real environment before .env loading: a port set in .env is a
 # config default, not a deliberate pin — only true env vars make a busy port
 # fatal instead of sliding to a free one.
@@ -69,6 +88,22 @@ def resolve_port(preferred: int, env_var: str, attempts: int = 32) -> int:
         if not port_in_use(candidate):
             return candidate
     raise RuntimeError(f"端口 {preferred}-{preferred + attempts} 全部被占用")
+
+
+def env_pinned(env_var: str) -> bool:
+    """True when a real environment variable (not .env) pins this setting."""
+    return env_var in _ENV_PINNED
+
+
+# UI-editable ports: field name -> (env var, default preferred value).
+# A None default means "unset -> the service's built-in default applies".
+EDITABLE_PORTS: dict[str, tuple[str, int | None]] = {
+    "port": ("MICAST_PORT", 3000),
+    "stream_port": ("MICAST_STREAM_PORT", 8080),
+    "airplay_rtsp_port": ("MICAST_AIRPLAY_RTSP_PORT", None),
+    "airplay_udp_base": ("MICAST_AIRPLAY_UDP_BASE", None),
+    "airplay2_port": ("MICAST_AIRPLAY2_PORT", None),
+}
 
 
 def storage_mode() -> str:
@@ -172,12 +207,15 @@ class AudioConfig(BaseSettings):
         return v
 
 
-# Per-speaker equalizer: ten fixed ISO bands (Hz), gains in dB. A speaker with
-# all-zero gains (or EQ disabled) shares the receiver's base stream; distinct
-# non-flat signatures each get their own split stream (…-q1, …-q2).
+# Per-speaker equalizer: a user-drawn response curve persisted as sparse
+# control points (freq Hz, gain dB). A speaker with a flat curve (or EQ
+# disabled) shares the receiver's base stream; distinct non-flat signatures
+# each get their own split stream (…-q1, …-q2).
+#
+# EQ_BANDS_HZ / EQ_PRESETS are the legacy 10-band layout, kept only to
+# migrate old configs into control points.
 EQ_BANDS_HZ: tuple[int, ...] = (31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000)
 EQ_BAND_COUNT = len(EQ_BANDS_HZ)
-EQ_GAIN_RANGE = (-12.0, 12.0)
 
 # Built-in presets, key -> band gains in dB (31/62/125/250/500/1k/2k/4k/8k/16k).
 EQ_PRESETS: dict[str, list[float]] = {
@@ -187,6 +225,23 @@ EQ_PRESETS: dict[str, list[float]] = {
     "night": [-4.0, -4.0, -3.0, -2.0, -1.0, 0.0, 0.0, -1.0, -2.0, -3.0],
     "live": [2.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 3.0, 3.0],
 }
+
+# Presets expressed as control points (what new configs and the curve editor
+# actually consume).
+EQ_PRESET_POINTS: dict[str, list[tuple[float, float]]] = {
+    key: [(float(hz), g) for hz, g in zip(EQ_BANDS_HZ, bands, strict=True)]
+    for key, bands in EQ_PRESETS.items()
+}
+# The Harman target doubles as a preset so it is one tap away, not only a
+# reference overlay. It is a real curve, not a 10-band migration artifact.
+EQ_PRESET_POINTS["harman"] = list(TARGET_CURVES["harman"])
+
+
+class EqPoint(BaseModel):
+    """One EQ curve control point."""
+
+    freq: float = Field(ge=CURVE_FREQ_RANGE[0], le=CURVE_FREQ_RANGE[1])
+    gain_db: float = Field(ge=CURVE_GAIN_RANGE[0], le=CURVE_GAIN_RANGE[1])
 
 
 class AppConfig(BaseModel):
@@ -206,25 +261,49 @@ class SpeakerConfig(BaseModel):
     # speaker and atomically rewrite every reference to its current deviceID.
     miot_did: str = ""
     hardware: str = ""
-    # Per-speaker EQ: gains in dB for EQ_BANDS_HZ. EQ is a property of the
-    # physical speaker (its room/placement), so it lives here and follows the
-    # speaker into any group.
+    # Per-speaker EQ: a drawn response curve as control points. EQ is a
+    # property of the physical speaker (its room/placement), so it lives here
+    # and follows the speaker into any group.
     eq_enabled: bool = False
-    eq_bands: list[float] = Field(default_factory=lambda: [0.0] * EQ_BAND_COUNT)
+    eq_points: list[EqPoint] = Field(default_factory=list)
     eq_preset: str = ""
+    # Named target response the calibration wizard aims for ("" = flat).
+    eq_target: str = ""
+    # Night mode: a fixed bass-attenuation shelf layered onto the active curve.
+    # Independent of eq_enabled so it also works on a flat curve.
+    night_mode: bool = False
+    # Equal-loudness compensation: a low/high shelf that follows the listening
+    # volume (see curve_fit.loudness_curve). It is a stream-splitting dimension
+    # (its level is runtime, not persisted — only the on/off flag is).
+    loudness_comp_enabled: bool = False
+    # Active scene ("" = custom/manual). Saved per-speaker curves live in
+    # eq_profiles; switching a scene copies it into eq_points.
+    content_profile: str = ""
+    eq_profiles: dict[str, list[EqPoint]] = Field(default_factory=dict)
 
-    @field_validator("eq_bands", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def _clamp_eq_bands(cls, v):
-        if not isinstance(v, list):
-            return [0.0] * EQ_BAND_COUNT
-        lo, hi = EQ_GAIN_RANGE
-        # Migration: 5-band configs (60/250/1k/4k/12k) land on their nearest
-        # ISO band of the 10-band layout, not on the first five positions.
-        if len(v) == 5 and EQ_BAND_COUNT == 10:
-            v = [0.0, v[0], 0.0, v[1], 0.0, v[2], 0.0, v[3], 0.0, v[4]]
-        bands = [max(lo, min(hi, float(b))) for b in v[:EQ_BAND_COUNT]]
-        return bands + [0.0] * (EQ_BAND_COUNT - len(bands))
+    def _migrate_legacy_eq_bands(cls, data):
+        """Old configs persist 10-band (or legacy 5-band) slider gains; fold
+        them into control points on first load."""
+        if not isinstance(data, dict) or "eq_bands" not in data:
+            return data
+        bands = data.pop("eq_bands")
+        if data.get("eq_points"):
+            return data
+        if isinstance(bands, list):
+            # 5-band configs (60/250/1k/4k/12k) land on their nearest ISO band
+            # of the 10-band layout, not on the first five positions.
+            if len(bands) == 5:
+                bands = [0.0, bands[0], 0.0, bands[1], 0.0, bands[2], 0.0, bands[3], 0.0, bands[4]]
+            lo, hi = EQ_GAIN_RANGE
+            gains = [max(lo, min(hi, float(b))) for b in bands[:EQ_BAND_COUNT]]
+            gains += [0.0] * (EQ_BAND_COUNT - len(gains))
+            data["eq_points"] = [
+                {"freq": float(hz), "gain_db": g}
+                for hz, g in zip(EQ_BANDS_HZ, gains, strict=True)
+            ]
+        return data
 
 
 class ReceiverConfig(BaseModel):
@@ -383,6 +462,12 @@ class Settings(BaseSettings):
     port: int = 3000
     stream_host: str = ""
     stream_port: int = 8080
+    # Preferred ports for the AirPlay services; None = use the built-in
+    # default. A busy preferred port slides upward (see resolve_port and
+    # raop.server), so these are starting points, not strict pins.
+    airplay_rtsp_port: int | None = None
+    airplay_udp_base: int | None = None
+    airplay2_port: int | None = None
     pcm_source: str = "mock"
     airplay2_pcm_source: str = "mock"
     pcm_sample_rate: int = Field(default=48000, ge=8000, le=384000)
@@ -401,6 +486,10 @@ class Settings(BaseSettings):
     sync_groups_enabled: bool = True
     large_delay_enabled: bool = False
     airplay2_enabled: bool = False
+    # Experimental LAN discovery of external playback targets: AirPlay mDNS
+    # browse + DLNA SSDP M-SEARCH. Off by default so an idle MiCast never
+    # scans the network.
+    network_discovery_enabled: bool = False
     # Touch-screen speakers show real cover art + scrolling lyrics: DAAP track
     # metadata from the phone is matched against Xiaomi's music library and
     # the play command is re-issued with the song's audioID.
@@ -418,6 +507,26 @@ class Settings(BaseSettings):
     receivers: list[ReceiverConfig] = Field(default_factory=list)
     groups: list[SpeakerGroupConfig] = Field(default_factory=list)
     airplay2_instances: list[AirPlay2InstanceConfig] = Field(default_factory=list)
+    # Global curve library: user-named EQ curves, appliable to any speaker.
+    saved_curves: dict[str, list[EqPoint]] = Field(default_factory=dict)
+
+    # Preferred values captured before resolve_port slides a busy port to a
+    # free one — self.port/self.stream_port then hold the *actual* bound port
+    # (many call sites build URLs from it), while persistence keeps the
+    # preferred one so a one-off conflict doesn't permanently move the port.
+    _preferred_port: int | None = PrivateAttr(default=None)
+    _preferred_stream_port: int | None = PrivateAttr(default=None)
+
+    def apply_resolved_port(self, field: str, resolved: int) -> None:
+        """Adopt the resolved port while remembering the preferred value."""
+        if getattr(self, f"_preferred_{field}") is None:
+            setattr(self, f"_preferred_{field}", getattr(self, field))
+        setattr(self, field, resolved)
+
+    def preferred_port(self, field: str) -> int:
+        """The port we'd like to bind (UI-editable), not the one we got."""
+        preferred = getattr(self, f"_preferred_{field}")
+        return preferred if preferred is not None else getattr(self, field)
 
     @property
     def effective_stream_host(self) -> str:
@@ -479,11 +588,25 @@ class Settings(BaseSettings):
             }
         self._migrate_receivers()
 
+    def reset_runtime(self) -> None:
+        """Restore defaults in-memory after the data files were wiped (清空数据).
+
+        Re-reads environment-backed fields through a fresh instance so env
+        overrides (Docker / fnOS) survive the reset, then adopts its state.
+        """
+        fresh = Settings()
+        self.__dict__.update(fresh.__dict__)
+
     def save_to_file(self) -> None:
         """Persist current runtime settings to config file."""
         data = {
             "audio": self.audio.model_dump(),
             "app": self.app.model_dump(),
+            "port": self.preferred_port("port"),
+            "stream_port": self.preferred_port("stream_port"),
+            "airplay_rtsp_port": self.airplay_rtsp_port,
+            "airplay_udp_base": self.airplay_udp_base,
+            "airplay2_port": self.airplay2_port,
             "receiver_mode": self.receiver_mode,
             "airplay_protocol": self.airplay_protocol,
             "airplay_engine": self.airplay_engine,
@@ -491,6 +614,7 @@ class Settings(BaseSettings):
             "sync_groups_enabled": self.sync_groups_enabled,
             "large_delay_enabled": self.large_delay_enabled,
             "airplay2_enabled": self.airplay2_enabled,
+            "network_discovery_enabled": self.network_discovery_enabled,
             "touchscreen_lyrics": self.touchscreen_lyrics,
             "default_volume": self.default_volume,
             "default_volume_enabled": self.default_volume_enabled,
@@ -544,6 +668,28 @@ class Settings(BaseSettings):
         self.dlna_enabled = enabled
         self.save_to_file()
 
+    def set_ports(self, changes: dict[str, int | None]) -> None:
+        """Update preferred ports and persist.
+
+        None restores the default. env-pinned fields are rejected by the
+        caller; here we simply refuse unknown keys and out-of-range values.
+        Only the preferred value changes — already-bound listeners keep their
+        actual port until their service restarts.
+        """
+        for key, value in changes.items():
+            if key not in EDITABLE_PORTS:
+                raise ValueError(f"未知端口项: {key}")
+            if value is not None and not 1024 <= int(value) <= 65535:
+                raise ValueError(f"端口需在 1024-65535 之间: {key}={value}")
+        for key, value in changes.items():
+            default = EDITABLE_PORTS[key][1]
+            resolved_value = value if value is not None else default
+            if key in ("port", "stream_port"):
+                setattr(self, f"_preferred_{key}", resolved_value)
+            else:
+                setattr(self, key, resolved_value)
+        self.save_to_file()
+
     def set_sync_groups_enabled(self, enabled: bool) -> None:
         self.sync_groups_enabled = enabled
         self.save_to_file()
@@ -572,6 +718,10 @@ class Settings(BaseSettings):
 
     def set_airplay2_enabled(self, enabled: bool) -> None:
         self.airplay2_enabled = enabled
+        self.save_to_file()
+
+    def set_network_discovery_enabled(self, enabled: bool) -> None:
+        self.network_discovery_enabled = enabled
         self.save_to_file()
 
     def configure_airplay2_deployment(self, mode: str) -> None:
@@ -781,59 +931,170 @@ class Settings(BaseSettings):
         channel = self.receiver_channel(receiver_id, did)
         return {"left": "-L", "right": "-R"}.get(channel, "")
 
-    def speaker_eq_bands(self, did: str) -> list[float] | None:
-        """Effective EQ gains for a speaker; None when flat or disabled."""
+    def speaker_eq_curve(self, did: str) -> tuple[tuple[float, float], ...] | None:
+        """Canonical EQ curve signature for a speaker; None when flat and no
+        night mode. Night mode layers its bass shelf onto the active curve, so
+        it also works with EQ disabled (a flat base curve)."""
         speaker = self.get_speaker(did)
-        if not speaker or not speaker.eq_enabled:
+        if not speaker:
             return None
-        bands = list(speaker.eq_bands)
-        if all(abs(b) < 0.05 for b in bands):
-            return None
-        return bands
+        points = [(p.freq, p.gain_db) for p in speaker.eq_points] if speaker.eq_enabled else []
+        if speaker.night_mode:
+            points = add_curve(points, NIGHT_ATTENUATION)
+        return curve_signature(points)
+
+    def set_speaker_eq_curve(
+        self,
+        did: str,
+        *,
+        enabled: bool,
+        points: list[tuple[float, float]],
+        preset: str = "",
+        target: str | None = None,
+    ) -> SpeakerConfig:
+        speaker = self._get_or_create_speaker(did)
+        speaker.eq_enabled = enabled
+        speaker.eq_points = [
+            EqPoint(freq=f, gain_db=g) for f, g in normalize_points(points)
+        ]
+        speaker.eq_preset = preset if preset in EQ_PRESETS else ""
+        # A manual curve edit (or calibration/import) is a custom curve, not a
+        # scene — clear the active-scene label so it stops claiming a saved one.
+        speaker.content_profile = ""
+        if target is not None:
+            speaker.eq_target = target if target in TARGET_CURVES else ""
+        self.save_to_file()
+        return speaker
+
+    # ---- Global curve library ----
+
+    def list_saved_curves(self) -> dict[str, list[tuple[float, float]]]:
+        return {
+            name: [(p.freq, p.gain_db) for p in points]
+            for name, points in sorted(self.saved_curves.items())
+        }
+
+    @staticmethod
+    def _validate_curve_name(name: str) -> str:
+        name = name.strip()
+        if not name or len(name) > 32:
+            raise ValueError("曲线名称需为 1-32 个字符")
+        return name
+
+    def save_curve(self, name: str, points: list[tuple[float, float]]) -> None:
+        """Store the current curve under a user-chosen name."""
+        name = self._validate_curve_name(name)
+        if name in self.saved_curves:
+            raise ValueError("已存在同名曲线")
+        self.saved_curves[name] = [
+            EqPoint(freq=f, gain_db=g) for f, g in normalize_points(points)
+        ]
+        self.save_to_file()
+
+    def delete_saved_curve(self, name: str) -> None:
+        if self.saved_curves.pop(name, None) is not None:
+            self.save_to_file()
+
+    def rename_saved_curve(self, old: str, new: str) -> None:
+        if old not in self.saved_curves:
+            raise ValueError("曲线不存在")
+        new = self._validate_curve_name(new)
+        if new != old and new in self.saved_curves:
+            raise ValueError("已存在同名曲线")
+        self.saved_curves[new] = self.saved_curves.pop(old)
+        self.save_to_file()
+
+    def set_speaker_night_mode(self, did: str, enabled: bool) -> SpeakerConfig:
+        speaker = self._get_or_create_speaker(did)
+        speaker.night_mode = bool(enabled)
+        self.save_to_file()
+        return speaker
+
+    def set_speaker_loudness(self, did: str, enabled: bool) -> SpeakerConfig:
+        speaker = self._get_or_create_speaker(did)
+        speaker.loudness_comp_enabled = bool(enabled)
+        self.save_to_file()
+        return speaker
+
+    def speaker_loudness(self, did: str) -> bool:
+        """True when a speaker has equal-loudness compensation enabled."""
+        speaker = self.get_speaker(did)
+        return bool(speaker and speaker.loudness_comp_enabled)
+
+    def save_speaker_profile(self, did: str, profile: str) -> SpeakerConfig:
+        """Save the speaker's current curve into a named scene slot."""
+        speaker = self._get_or_create_speaker(did)
+        if profile not in CONTENT_PROFILES:
+            raise ValueError(f"unknown content profile: {profile}")
+        speaker.eq_profiles[profile] = [
+            EqPoint(freq=p.freq, gain_db=p.gain_db) for p in speaker.eq_points
+        ]
+        self.save_to_file()
+        return speaker
+
+    def set_speaker_content_profile(self, did: str, profile: str) -> SpeakerConfig:
+        """Activate a saved scene, copying its curve into the active EQ."""
+        speaker = self._get_or_create_speaker(did)
+        if profile not in CONTENT_PROFILES:
+            raise ValueError(f"unknown content profile: {profile}")
+        points = speaker.eq_profiles.get(profile)
+        if not points:
+            raise ValueError(f"content profile not saved: {profile}")
+        speaker.eq_points = [EqPoint(freq=p.freq, gain_db=p.gain_db) for p in points]
+        speaker.eq_enabled = True
+        speaker.eq_preset = ""
+        speaker.content_profile = profile
+        self.save_to_file()
+        return speaker
+
+    def delete_speaker_profile(self, did: str, profile: str) -> SpeakerConfig:
+        speaker = self._get_or_create_speaker(did)
+        speaker.eq_profiles.pop(profile, None)
+        if speaker.content_profile == profile:
+            speaker.content_profile = ""
+        self.save_to_file()
+        return speaker
 
     def set_speaker_eq(
         self, did: str, *, enabled: bool, bands: list[float], preset: str = ""
     ) -> SpeakerConfig:
-        speaker = self._get_or_create_speaker(did)
-        speaker.eq_enabled = enabled
-        lo, hi = EQ_GAIN_RANGE
+        """Deprecated 10-band slider API: converts band gains to control points."""
         bands = list(bands)
         # Same 5→10 migration as the config validator: a stale client posting
         # the old 60/250/1k/4k/12k layout lands on the nearest ISO bands.
         if len(bands) == 5 and EQ_BAND_COUNT == 10:
             bands = [0.0, bands[0], 0.0, bands[1], 0.0, bands[2], 0.0, bands[3], 0.0, bands[4]]
-        clean = [max(lo, min(hi, float(b))) for b in bands[:EQ_BAND_COUNT]]
-        speaker.eq_bands = clean + [0.0] * (EQ_BAND_COUNT - len(clean))
-        speaker.eq_preset = preset if preset in EQ_PRESETS else ""
-        self.save_to_file()
-        return speaker
+        points = legacy_bands_to_points(EQ_BANDS_HZ, bands)
+        return self.set_speaker_eq_curve(did, enabled=enabled, points=points, preset=preset)
 
     def receiver_stream_variants(self, receiver_id: str) -> list[dict]:
-        """Streams a receiver must publish: one per (channel, EQ signature).
+        """Streams a receiver must publish: one per (channel, EQ, loudness).
 
-        Returns entries of {suffix, base, channel, eq}; the EQ-less entry of
-        each channel keeps the plain suffix (-L/-R/"") so speakers without EQ
-        share one stream exactly as before. Distinct non-flat signatures get
-        ``-q{n}`` (or ``-Lq{n}``) in order of first appearance.
+        Returns entries of {suffix, base, channel, eq, loudness}; the plain
+        entry of each channel keeps the base suffix (-L/-R/"") so speakers
+        without EQ or loudness share one stream exactly as before. Distinct
+        non-flat signatures (or loudness on/off) get ``-q{n}`` (or ``-Lq{n}``)
+        in order of first appearance.
         """
         variants: list[dict] = []
-        seen: set[tuple[str, tuple[float, ...] | None]] = set()
+        seen: set[tuple[str, tuple[tuple[float, float], ...] | None, bool]] = set()
         eq_counts: dict[str, int] = {}
         for did in self.receiver_targets(receiver_id):
             channel = self.receiver_channel(receiver_id, did)
             base = {"left": "-L", "right": "-R"}.get(channel, "")
-            bands = self.speaker_eq_bands(did)
-            key = (base, tuple(bands) if bands else None)
+            curve = self.speaker_eq_curve(did)
+            loudness = self.speaker_loudness(did)
+            key = (base, curve, loudness)
             if key in seen:
                 continue
             seen.add(key)
-            if bands is None:
+            if curve is None and not loudness:
                 suffix = base
             else:
                 eq_counts[base] = eq_counts.get(base, 0) + 1
                 suffix = f"{base}-q{eq_counts[base]}"
             variants.append(
-                {"suffix": suffix, "base": base, "channel": channel, "eq": bands}
+                {"suffix": suffix, "base": base, "channel": channel, "eq": curve, "loudness": loudness}
             )
         # Network devices with a channel assignment need that channel's
         # stream too (DLNA renderers pull it directly) — even when the group
@@ -842,26 +1103,29 @@ class Settings(BaseSettings):
         if group and group.mode == "stereo":
             assigned_sides = set(group.network_channels.values())
             for side, base in (("left", "-L"), ("right", "-R")):
-                if side in assigned_sides and (base, None) not in seen:
-                    seen.add((base, None))
-                    variants.append({"suffix": base, "base": base, "channel": side, "eq": None})
+                if side in assigned_sides and (base, None, False) not in seen:
+                    seen.add((base, None, False))
+                    variants.append(
+                        {"suffix": base, "base": base, "channel": side, "eq": None, "loudness": False}
+                    )
         # The plain base stream always exists: it is a cheap raw-PCM bypass
         # (no encoder) and serves mirror speakers, DLNA renderers without a
         # channel assignment, and anything else that just wants the mix.
-        if ("", None) not in seen:
-            variants.append({"suffix": "", "base": "", "channel": None, "eq": None})
+        if ("", None, False) not in seen:
+            variants.append(
+                {"suffix": "", "base": "", "channel": None, "eq": None, "loudness": False}
+            )
         return variants
 
     def stream_suffix(self, receiver_id: str, did: str) -> str:
-        """Full stream URL suffix (channel + EQ split) for one speaker."""
+        """Full stream URL suffix (channel + EQ + loudness split) for one speaker."""
         base = self.channel_suffix(receiver_id, did)
-        bands = self.speaker_eq_bands(did)
-        if bands is None:
+        curve = self.speaker_eq_curve(did)
+        loudness = self.speaker_loudness(did)
+        if curve is None and not loudness:
             return base
-        key = (base, tuple(bands))
         for variant in self.receiver_stream_variants(receiver_id):
-            other = variant["eq"]
-            if (variant["base"], tuple(other) if other else None) == key:
+            if (variant["base"], variant["eq"], variant["loudness"]) == (base, curve, loudness):
                 return variant["suffix"]
         return base
 

@@ -44,7 +44,7 @@ def test_common_gain_preserves_identity_and_mutes():
 async def test_airplay2_pipeline_and_network_share_policy(monkeypatch):
     bridge = object.__new__(AudioBridge)
     bridge._pipelines = {}
-    pipeline = SimpleNamespace(set_input_volume=Mock())
+    pipeline = SimpleNamespace(set_input_volume=Mock(), set_loudness_level=Mock())
     bridge._airplay2_pipelines = {"receiver": pipeline}
     bridge._volume_modes = {}
     bridge._sender_volumes = {}

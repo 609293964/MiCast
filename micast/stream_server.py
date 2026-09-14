@@ -140,8 +140,14 @@ class StreamServer:
                 )
 
             if not session.get("group_id"):
+                pcm = session.get("pcm")
+                data = (
+                    test_tone_wav()
+                    if pcm is None
+                    else wav_header(44100, data_bytes=len(pcm)) + pcm
+                )
                 return Response(
-                    test_tone_wav(),
+                    data,
                     media_type="audio/wav",
                     headers={"Cache-Control": "no-store"},
                 )

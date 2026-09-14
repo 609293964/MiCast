@@ -3,12 +3,9 @@
 import logging
 from io import BytesIO
 
-import aiohttp
 import qrcode
-import zxingcpp
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from PIL import Image
 
 from micast.xiaomi.auth import XiaomiAuth
 
@@ -27,44 +24,31 @@ def install(auth: XiaomiAuth) -> APIRouter:
             result = await auth.start_qr_login()
             _qr_state["lp_url"] = result["scan_token"]
             _qr_state["device_id"] = result["device_id"]
-            return {"qr_url": result["qr_url"], "scan_token": result["scan_token"]}
+            # Prefer the login URL itself: Xiaomi's outer QR image just encodes
+            # it, and rendering locally avoids a second network round-trip (and
+            # the image decode step) that used to leave the sheet blank whenever
+            # fetching the outer QR stalled or failed.
+            return {
+                "qr_url": result["login_url"] or result["qr_url"],
+                "scan_token": result["scan_token"],
+            }
         except Exception as e:
             logger.exception("QR start failed")
             raise HTTPException(status_code=500, detail=str(e)) from e
 
     @router.get("/login/qr/image")
     async def qr_image(url: str = Query(...)):
-        """Download Xiaomi's outer QR and return a login QR for its inner URL."""
+        """Render a login QR for the given Xiaomi login URL, generated locally."""
         try:
-            async with (
-                aiohttp.ClientSession() as session,
-                session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp,
-            ):
-                if resp.status != 200:
-                    raise HTTPException(status_code=502, detail="Failed to fetch QR from Xiaomi")
-                outer_bytes = await resp.read()
-
-            # Decode outer QR (zxing-cpp: pure wheel, no system zbar needed)
-            outer_img = Image.open(BytesIO(outer_bytes))
-            decoded = zxingcpp.read_barcodes(outer_img)
-            if not decoded:
-                raise HTTPException(status_code=502, detail="Could not decode outer QR")
-
-            inner_url = decoded[0].text
-            logger.info("Decoded inner QR URL: %s", inner_url)
-
-            # Generate inner QR image
             qr = qrcode.QRCode(version=None, box_size=10, border=2)
-            qr.add_data(inner_url)
+            qr.add_data(url)
             qr.make(fit=True)
-            inner_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+            img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
             buf = BytesIO()
-            inner_img.save(buf, format="PNG")
+            img.save(buf, format="PNG")
             buf.seek(0)
             return StreamingResponse(buf, media_type="image/png")
-        except HTTPException:
-            raise
         except Exception as e:
             logger.exception("QR image generation failed")
             raise HTTPException(status_code=500, detail=str(e)) from e

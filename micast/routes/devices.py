@@ -5,7 +5,8 @@ import asyncio
 from fastapi import APIRouter, HTTPException
 
 from micast.audio_bridge import AudioBridge
-from micast.config import EQ_BAND_COUNT, EQ_BANDS_HZ, EQ_PRESETS, settings
+from micast.config import EQ_PRESET_POINTS, settings
+from micast.curve_fit import CURVE_FREQ_RANGE, CURVE_GAIN_RANGE, TARGET_CURVES
 from micast.xiaomi.auth import XiaomiAuthError
 from micast.xiaomi.device_manager import DeviceManager
 
@@ -78,8 +79,21 @@ def install(device_manager: DeviceManager, bridge: AudioBridge | None = None) ->
                         "volume": volume,
                         "eq": {
                             "enabled": speaker.eq_enabled if speaker else False,
-                            "bands": list(speaker.eq_bands) if speaker else [0.0] * EQ_BAND_COUNT,
+                            "points": (
+                                [[p.freq, p.gain_db] for p in speaker.eq_points]
+                                if speaker
+                                else []
+                            ),
                             "preset": speaker.eq_preset if speaker else "",
+                            "target": speaker.eq_target if speaker else "",
+                            "night_mode": speaker.night_mode if speaker else False,
+                            "loudness_comp_enabled": speaker.loudness_comp_enabled if speaker else False,
+                            "content_profile": speaker.content_profile if speaker else "",
+                            "profiles": (
+                                {k: [[p.freq, p.gain_db] for p in v] for k, v in speaker.eq_profiles.items()}
+                                if speaker
+                                else {}
+                            ),
                         },
                     }
                 )
@@ -91,10 +105,17 @@ def install(device_manager: DeviceManager, bridge: AudioBridge | None = None) ->
 
     @router.get("/eq/presets")
     async def get_eq_presets():
-        return {"bands_hz": list(EQ_BANDS_HZ), "presets": EQ_PRESETS}
+        return {
+            "presets": {k: [[f, g] for f, g in v] for k, v in EQ_PRESET_POINTS.items()},
+            "targets": {k: [[f, g] for f, g in v] for k, v in TARGET_CURVES.items()},
+            "saved": settings.list_saved_curves(),
+            "freq_range": list(CURVE_FREQ_RANGE),
+            "gain_range": list(CURVE_GAIN_RANGE),
+        }
 
     @router.post("/eq")
     async def set_eq(payload: dict):
+        """Deprecated 10-band API kept for old clients; bands become points."""
         did = payload.get("did")
         enabled = payload.get("enabled")
         bands = payload.get("bands")
@@ -115,8 +136,15 @@ def install(device_manager: DeviceManager, bridge: AudioBridge | None = None) ->
             "did": did,
             "eq": {
                 "enabled": speaker.eq_enabled,
-                "bands": list(speaker.eq_bands),
+                "points": [[p.freq, p.gain_db] for p in speaker.eq_points],
                 "preset": speaker.eq_preset,
+                "target": speaker.eq_target,
+                "night_mode": speaker.night_mode,
+                "loudness_comp_enabled": speaker.loudness_comp_enabled,
+                "content_profile": speaker.content_profile,
+                "profiles": {
+                    k: [[p.freq, p.gain_db] for p in v] for k, v in speaker.eq_profiles.items()
+                },
             },
         }
 

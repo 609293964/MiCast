@@ -1,4 +1,4 @@
-import type { AccessStatus, AirPlayProtocol, AudioConfig, FullConfig } from "../api";
+import type { AccessStatus, AirPlayProtocol, AudioConfig, FullConfig, PortStatus } from "../api";
 import { api } from "../api";
 import { store, type Theme } from "../state";
 import { icon } from "../icons";
@@ -134,6 +134,13 @@ export function renderSettingsView(props: SettingsProps): string {
       </button>
     </div>
 
+    ${config?.ports?.length ? `
+    <div class="group-header">服务端口</div>
+    <div class="group">
+      ${config.ports.map(renderPortRow).join("")}
+    </div>
+    ` : ""}
+
     <div class="group-header">管理访问</div>
     <div class="group">
       <button class="cell settings-link" type="button" data-access-settings-toggle>
@@ -180,6 +187,25 @@ export function renderSettingsView(props: SettingsProps): string {
           <span class="cell-title">日志目录</span>
           <span class="cell-subtitle" title="${escapeHtml(config?.storage?.log_dir ?? "")}">${escapeHtml(config?.storage?.log_dir ?? "正在读取日志目录…")}</span>
         </div>
+      </div>
+      <div class="cell">
+        <div class="cell-icon blue">${icon("download")}</div>
+        <div class="cell-content">
+          <span class="cell-title">软件更新</span>
+          <span class="cell-subtitle" data-update-status>当前版本读取中…</span>
+        </div>
+        <div class="update-actions">
+          <button class="button compact primary" type="button" data-update-download hidden>下载更新</button>
+          <button class="button compact primary" type="button" data-update-apply hidden>安装并重启</button>
+          <button class="button compact secondary" type="button" data-update-check>检查更新</button>
+        </div>
+      </div>
+      <div class="cell">
+        <div class="cell-content">
+          <span class="cell-title danger-text">清空数据</span>
+          <span class="cell-subtitle">删除全部配置、米家登录与管理账号，回到初始引导页</span>
+        </div>
+        <button class="button compact secondary danger-text" type="button" data-reset-all>清空数据</button>
       </div>
     </div>
 
@@ -266,6 +292,13 @@ export function renderSettingsView(props: SettingsProps): string {
         </div>
         <input type="checkbox" class="switch" id="airplay2-enabled" ${airplay2Enabled ? "checked" : ""} ${airplay2Available ? "" : "disabled"} aria-label="开启 AirPlay 2">
       </div>
+      <div class="cell">
+        <div class="cell-content">
+          <span class="cell-title">网络发现 <span class="feature-badge">实验性</span></span>
+          <span class="cell-subtitle">扫描局域网中的 AirPlay / DLNA 播放设备；关闭后停止一切网络探测，也无法再投放到外部设备</span>
+        </div>
+        <input type="checkbox" class="switch" id="network-discovery-enabled" ${config?.network_discovery_enabled ? "checked" : ""} aria-label="开启网络发现">
+      </div>
       ${airplay2Available && airplay2Enabled ? `<button class="cell settings-link" type="button" data-open-airplay2>
         <div class="cell-icon blue">${icon("airplay")}</div>
         <div class="cell-content">
@@ -277,6 +310,51 @@ export function renderSettingsView(props: SettingsProps): string {
     </div>
 
     <p class="footnote" style="margin: var(--space-md) var(--space-lg);">修改会自动保存，并在当前音频输出中重新应用。</p>
+  `;
+}
+
+const portModeLabels: Record<PortStatus["mode"], string> = {
+  auto: "自动",
+  custom: "自定义",
+  env: "环境固定",
+  fixed: "协议固定",
+};
+
+function portActualText(p: PortStatus): string {
+  if (p.actual == null) return p.status === "listening" ? "" : "未监听";
+  return Array.isArray(p.actual) ? p.actual.join("、") : String(p.actual);
+}
+
+function renderPortRow(p: PortStatus): string {
+  const actual = portActualText(p);
+  const stateClass = p.status === "error" ? "error" : p.status === "listening" ? "success" : "";
+  const stateText = p.status === "error" ? "异常" : p.status === "listening" ? `监听中${actual ? ` · ${actual}` : ""}` : p.status === "hosted" ? "已托管" : "未启用";
+  if (!p.editable) {
+    return `
+      <div class="cell">
+        <div class="cell-content">
+          <span class="cell-title">${escapeHtml(p.name)} <span class="feature-badge">${portModeLabels[p.mode]}</span></span>
+          <span class="cell-subtitle">${escapeHtml(p.detail)}</span>
+        </div>
+        <span class="plain-state ${stateClass}">${stateText}</span>
+      </div>
+    `;
+  }
+  return `
+    <div class="cell">
+      <div class="cell-content">
+        <span class="cell-title">${escapeHtml(p.name)} <span class="feature-badge">${portModeLabels[p.mode]}</span></span>
+        <span class="cell-subtitle">${escapeHtml(p.detail)}</span>
+      </div>
+      <div class="settings-inline-control">
+        <span class="plain-state ${stateClass}" data-port-status="${p.id}" aria-live="polite">${stateText}</span>
+        <input type="number" class="input settings-number" data-port-input="${p.id}" min="1024" max="65535"
+          placeholder="${p.preferred ?? ""}" value="${p.mode === "custom" ? p.preferred ?? "" : ""}"
+          aria-label="${escapeHtml(p.name)}首选端口">
+        ${p.mode === "custom" ? `<button class="button compact secondary" type="button" data-port-reset="${p.id}">恢复</button>` : ""}
+        <button class="button compact secondary" type="button" data-port-save="${p.id}">保存</button>
+      </div>
+    </div>
   `;
 }
 
@@ -466,6 +544,13 @@ export function bindSettingsView(
   );
   bindFeatureSwitch(
     container,
+    "#network-discovery-enabled",
+    "network_discovery_enabled",
+    api.setNetworkDiscoveryEnabled,
+    onStateChange
+  );
+  bindFeatureSwitch(
+    container,
     "#touchscreen-lyrics",
     "touchscreen_lyrics",
     api.setTouchscreenLyrics,
@@ -534,6 +619,35 @@ export function bindSettingsView(
     });
   }
 
+  const applyPortChange = async (id: string, value: number | null) => {
+    const statusEl = container.querySelector<HTMLElement>(`[data-port-status="${id}"]`);
+    try {
+      const result = await api.setPort(id, value);
+      const config = store.get().fullConfig;
+      if (config) store.set({ fullConfig: { ...config, ports: result.ports } });
+      onStateChange();
+      store.showToast(result.restart_required ? "已保存，重启应用后生效" : "已保存并重新应用");
+    } catch (e) {
+      if (statusEl) statusEl.textContent = "保存失败";
+      store.showToast(`保存失败: ${e instanceof Error ? e.message : "未知错误"}`);
+    }
+  };
+  container.querySelectorAll<HTMLElement>("[data-port-save]").forEach((el) => {
+    el.addEventListener("click", () => {
+      const id = el.dataset.portSave ?? "";
+      const input = container.querySelector<HTMLInputElement>(`[data-port-input="${id}"]`);
+      const raw = input?.value.trim() ?? "";
+      if (raw && !/^\d+$/.test(raw)) {
+        store.showToast("端口必须是 1024-65535 的数字");
+        return;
+      }
+      void applyPortChange(id, raw ? Number(raw) : null);
+    });
+  });
+  container.querySelectorAll<HTMLElement>("[data-port-reset]").forEach((el) => {
+    el.addEventListener("click", () => void applyPortChange(el.dataset.portReset ?? "", null));
+  });
+
   container.querySelectorAll("[data-theme]").forEach((el) => {
     el.addEventListener("click", () => {
       const theme = (el as HTMLElement).dataset.theme as Theme;
@@ -587,6 +701,135 @@ export function bindSettingsView(
       }, 600);
     });
   }
+
+  bindUpdateSection(container);
+  bindResetAll(container);
+}
+
+function bindResetAll(container: HTMLElement) {
+  const button = container.querySelector<HTMLButtonElement>("[data-reset-all]");
+  if (!button) return;
+  let confirmTimer: ReturnType<typeof setTimeout> | null = null;
+  button.addEventListener("click", async () => {
+    // 两段确认：第一次点击变成红色确认态，3 秒内再点才真正执行。
+    if (!confirmTimer) {
+      button.textContent = "确认清空？再点一次";
+      confirmTimer = setTimeout(() => {
+        confirmTimer = null;
+        button.textContent = "清空数据";
+      }, 3000);
+      return;
+    }
+    clearTimeout(confirmTimer);
+    confirmTimer = null;
+    button.disabled = true;
+    button.textContent = "正在清空…";
+    try {
+      await api.resetAll();
+      store.showToast("数据已清空，即将回到引导页");
+      setTimeout(() => window.location.reload(), 800);
+    } catch (e) {
+      button.disabled = false;
+      button.textContent = "清空数据";
+      store.showToast(`清空失败: ${e instanceof Error ? e.message : "未知错误"}`);
+    }
+  });
+}
+
+let updatePollTimer: ReturnType<typeof setInterval> | null = null;
+
+function bindUpdateSection(container: HTMLElement) {
+  const statusEl = container.querySelector<HTMLElement>("[data-update-status]");
+  const checkBtn = container.querySelector<HTMLButtonElement>("[data-update-check]");
+  const downloadBtn = container.querySelector<HTMLButtonElement>("[data-update-download]");
+  const applyBtn = container.querySelector<HTMLButtonElement>("[data-update-apply]");
+  if (!statusEl || !checkBtn) return;
+
+  const stopPolling = () => {
+    if (updatePollTimer) { clearInterval(updatePollTimer); updatePollTimer = null; }
+  };
+
+  const showDownloadResult = async () => {
+    const dl = await api.getUpdateDownloadStatus();
+    if (dl.state === "downloading") {
+      statusEl.textContent = dl.total > 0
+        ? `正在下载更新… ${Math.min(100, Math.round((dl.progress / dl.total) * 100))}%（${formatBytes(dl.progress)} / ${formatBytes(dl.total)}）`
+        : `正在下载更新… ${formatBytes(dl.progress)}`;
+      return;
+    }
+    stopPolling();
+    if (dl.state === "done") {
+      statusEl.textContent = "下载完成，可以安装了";
+      if (downloadBtn) downloadBtn.hidden = true;
+      if (applyBtn) applyBtn.hidden = false;
+    } else if (dl.state === "error") {
+      statusEl.textContent = `下载失败：${dl.error ?? "未知错误"}`;
+      if (downloadBtn) { downloadBtn.hidden = false; downloadBtn.disabled = false; downloadBtn.textContent = "重新下载"; }
+    }
+  };
+
+  const runCheck = async (force: boolean) => {
+    checkBtn.disabled = true;
+    checkBtn.textContent = "检查中…";
+    try {
+      const info = await api.checkUpdate(force);
+      if (info.update_available) {
+        // exe 版提供应用内下载；飞牛/Docker 版只提示，不显示任何跳转或下载按钮。
+        statusEl.textContent = info.can_download
+          ? `发现新版本 v${info.latest_version}（当前 v${info.current_version}）`
+          : `发现新版本 v${info.latest_version}（当前 v${info.current_version}），请前往 GitHub 发布页更新`;
+        if (info.can_download && info.asset && downloadBtn) {
+          downloadBtn.hidden = false;
+          downloadBtn.textContent = `下载更新（${formatBytes(info.asset.size)}）`;
+        }
+      } else {
+        statusEl.textContent = `当前已是最新版本 v${info.current_version}`;
+      }
+    } catch (e) {
+      statusEl.textContent = e instanceof Error ? e.message : "检查更新失败";
+    } finally {
+      checkBtn.disabled = false;
+      checkBtn.textContent = "检查更新";
+    }
+  };
+
+  checkBtn.addEventListener("click", () => runCheck(true));
+  runCheck(false); // 打开设置页时先用缓存静默检查一次
+
+  downloadBtn?.addEventListener("click", async () => {
+    downloadBtn.disabled = true;
+    downloadBtn.textContent = "正在下载…";
+    try {
+      await api.startUpdateDownload();
+      stopPolling();
+      updatePollTimer = setInterval(() => {
+        showDownloadResult().catch(() => stopPolling());
+      }, 800);
+    } catch (e) {
+      downloadBtn.disabled = false;
+      downloadBtn.textContent = "下载更新";
+      store.showToast(e instanceof Error ? e.message : "下载失败");
+    }
+  });
+
+  applyBtn?.addEventListener("click", async () => {
+    applyBtn.disabled = true;
+    applyBtn.textContent = "正在启动安装…";
+    try {
+      await api.applyUpdate();
+      statusEl.textContent = "安装程序已启动，MiCast 即将退出并完成更新";
+    } catch (e) {
+      applyBtn.disabled = false;
+      applyBtn.textContent = "安装并重启";
+      store.showToast(e instanceof Error ? e.message : "启动安装失败");
+    }
+  });
+}
+
+function formatBytes(bytes: number): string {
+  if (!bytes) return "0 MB";
+  if (bytes >= 1 << 20) return `${(bytes / (1 << 20)).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 function escapeHtml(text: string): string {
@@ -601,7 +844,7 @@ function escapeHtml(text: string): string {
 function bindFeatureSwitch(
   container: HTMLElement,
   selector: string,
-  key: "dlna_enabled" | "sync_groups_enabled" | "large_delay_enabled" | "airplay2_enabled" | "touchscreen_lyrics",
+  key: "dlna_enabled" | "sync_groups_enabled" | "large_delay_enabled" | "airplay2_enabled" | "touchscreen_lyrics" | "network_discovery_enabled",
   save: (enabled: boolean) => Promise<unknown>,
   rerender: () => void
 ) {
@@ -617,7 +860,7 @@ function bindFeatureSwitch(
       const [fullConfig, status] = await Promise.all([api.getConfig(), api.getStatus()]);
       store.set({ fullConfig, status, receivers: status.receivers, saving: false });
       rerender();
-      const label = key === "dlna_enabled" ? "DLNA" : key === "sync_groups_enabled" ? "音箱组合" : key === "large_delay_enabled" ? "大延迟" : key === "touchscreen_lyrics" ? "触屏歌词与封面" : "AirPlay 2";
+      const label = key === "dlna_enabled" ? "DLNA" : key === "sync_groups_enabled" ? "音箱组合" : key === "large_delay_enabled" ? "大延迟" : key === "touchscreen_lyrics" ? "触屏歌词与封面" : key === "network_discovery_enabled" ? "网络发现" : "AirPlay 2";
       store.showToast(`${label}已${enabled ? "开启" : "关闭"}`);
     } catch (error) {
       store.set({ fullConfig: previous, saving: false });

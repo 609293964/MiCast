@@ -1,5 +1,5 @@
 import {
-  Airplay, AudioWaveform, Cast, Check, ChevronRight, Link2, Moon, Projector, RadioTower,
+  Airplay, AudioWaveform, Cast, Check, ChevronRight, Download, Link2, Moon, Projector, RadioTower,
   Clock3, FolderOpen, LockKeyhole, Minimize2, Monitor, Pause, Play, Settings, Share2, Speaker, SquareTerminal, Sun, Tv, User, Volume2, VolumeX, X,
 } from "lucide";
 import { siXiaomi } from "simple-icons";
@@ -7,7 +7,8 @@ import { siXiaomi } from "simple-icons";
 export type IconName = "airplay" | "antenna" | "speaker" | "settings" |
   "person" | "terminal" | "sun" | "moon" | "appearance" | "wave" | "check" |
   "play" | "pause" | "close" | "cast" | "link" | "clock" | "topology" |
-  "tv" | "loudspeaker" | "projector" | "chevron" | "minimize" | "mute" | "lock" | "folder";
+  "tv" | "loudspeaker" | "projector" | "chevron" | "minimize" | "mute" | "lock" | "folder" |
+  "download";
 
 const lucideIcons: Record<IconName, unknown> = {
   airplay: Airplay, antenna: RadioTower, speaker: Volume2,
@@ -20,6 +21,7 @@ const lucideIcons: Record<IconName, unknown> = {
   mute: VolumeX,
   lock: LockKeyhole,
   folder: FolderOpen,
+  download: Download,
 };
 
 export function icon(name: IconName, className = "symbol"): string {

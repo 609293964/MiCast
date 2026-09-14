@@ -41,6 +41,7 @@ export type AirPlayProtocol = "auto" | "classic" | "airplay2";
 export type AirPlayEngine = "local" | "airplay2";
 
 export interface FullConfig {
+  deployment: string;
   audio: AudioConfig;
   app: AppConfig;
   receiver_mode: ReceiverMode;
@@ -55,6 +56,7 @@ export interface FullConfig {
   sender_volume_mode: "independent" | "linked";
   notify_webhook_url: string;
   airplay2_enabled: boolean;
+  network_discovery_enabled: boolean;
   airplay2_available: boolean;
   airplay2_mode: "disabled" | "single" | "multi";
   airplay2_can_add_instances: boolean;
@@ -65,9 +67,42 @@ export interface FullConfig {
   };
   dlna_status: { status: string; detail: string };
   selected_device_id: string | null;
+  ports?: PortStatus[];
   receivers: ReceiverDefinition[];
   groups: SpeakerGroup[];
   speaker_names: Record<string, string>;
+}
+
+export interface PortStatus {
+  id: string;
+  name: string;
+  protocol: "tcp" | "udp";
+  mode: "auto" | "custom" | "env" | "fixed";
+  preferred: number | null;
+  actual: number | number[] | null;
+  status: "listening" | "hosted" | "off" | "error";
+  detail: string;
+  editable: boolean;
+}
+
+export interface UpdateInfo {
+  current_version: string;
+  latest_version: string;
+  update_available: boolean;
+  release_url: string;
+  release_notes: string;
+  published_at: string | null;
+  can_download: boolean;
+  asset: { name: string; size: number; download_url: string } | null;
+  checked_at: number;
+}
+
+export interface UpdateDownloadStatus {
+  state: "idle" | "downloading" | "done" | "error";
+  progress: number;
+  total: number;
+  path: string | null;
+  error: string | null;
 }
 
 export interface AirPlay2Instance {
@@ -173,8 +208,24 @@ export interface XiaomiStatus {
 
 export interface SpeakerEq {
   enabled: boolean;
-  bands: number[];
+  /** Curve control points as [freqHz, gainDb] pairs, sorted by freq. */
+  points: [number, number][];
   preset: string;
+  target?: string;
+  night_mode?: boolean;
+  loudness_comp_enabled?: boolean;
+  content_profile?: string;
+  /** Saved per-speaker scene curves keyed by profile name. */
+  profiles?: Record<string, [number, number][]>;
+}
+
+export interface EqPresetsResponse {
+  presets: Record<string, [number, number][]>;
+  targets: Record<string, [number, number][]>;
+  /** Global user-named curve library. */
+  saved?: Record<string, [number, number][]>;
+  freq_range: [number, number];
+  gain_range: [number, number];
 }
 
 export interface Device {
@@ -372,6 +423,13 @@ export const api = {
     });
   },
 
+  setPort(id: string, port: number | null): Promise<{ ok: boolean; restart_required: boolean; ports: PortStatus[] }> {
+    return apiFetch("/api/config/ports", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, port }),
+    });
+  },
+
   setSyncGroupsEnabled(enabled: boolean): Promise<{ sync_groups_enabled: boolean }> {
     return apiFetch("/api/config/sync-groups", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -420,6 +478,13 @@ export const api = {
     });
   },
 
+  setNetworkDiscoveryEnabled(enabled: boolean): Promise<{ network_discovery_enabled: boolean }> {
+    return apiFetch("/api/config/network-discovery", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+  },
+
   getAirPlay2State(): Promise<AirPlay2State> {
     return apiFetch("/api/airplay2");
   },
@@ -452,6 +517,22 @@ export const api = {
     return apiFetch("/api/xiaomi/login/qr/start", { method: "POST" });
   },
 
+  checkUpdate(force = false): Promise<UpdateInfo> {
+    return apiFetch(`/api/update/check${force ? "?force=true" : ""}`);
+  },
+
+  startUpdateDownload(): Promise<{ started: boolean; asset: string }> {
+    return apiFetch("/api/update/download", { method: "POST" });
+  },
+
+  getUpdateDownloadStatus(): Promise<UpdateDownloadStatus> {
+    return apiFetch("/api/update/download/status");
+  },
+
+  applyUpdate(): Promise<{ ok: boolean; path: string }> {
+    return apiFetch("/api/update/apply", { method: "POST" });
+  },
+
   pollQRLogin(scanToken: string): Promise<{ status: string; user_id?: string; pass_token?: string }> {
     return apiFetch(`/api/xiaomi/login/qr/poll?scan_token=${encodeURIComponent(scanToken)}`);
   },
@@ -468,15 +549,147 @@ export const api = {
     return apiFetch("/api/devices");
   },
 
-  getEqPresets(): Promise<{ bands_hz: number[]; presets: Record<string, number[]> }> {
+  getEqPresets(): Promise<EqPresetsResponse> {
     return apiFetch("/api/devices/eq/presets");
   },
 
-  setDeviceEq(did: string, eq: SpeakerEq): Promise<{ did: string; eq: SpeakerEq }> {
-    return apiFetch("/api/devices/eq", {
+  /** Save a speaker's EQ curve (control points). Committed on release, not mid-drag. */
+  setDeviceEqCurve(did: string, eq: SpeakerEq): Promise<{ did: string } & SpeakerEq> {
+    return apiFetch("/api/tuning/eq", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ did, ...eq }),
+    });
+  },
+
+  setDeviceNightMode(did: string, enabled: boolean): Promise<{ did: string } & SpeakerEq> {
+    return apiFetch("/api/tuning/night-mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ did, enabled }),
+    });
+  },
+
+  setDeviceLoudness(did: string, enabled: boolean): Promise<{ did: string } & SpeakerEq> {
+    return apiFetch("/api/tuning/loudness", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ did, enabled }),
+    });
+  },
+
+  /** Save the current curve into the global library under `name`. */
+  saveCurve(name: string, points: [number, number][]): Promise<{ curves: Record<string, [number, number][]> }> {
+    return apiFetch("/api/tuning/curves/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, points }),
+    });
+  },
+
+  renameCurve(oldName: string, newName: string): Promise<{ curves: Record<string, [number, number][]> }> {
+    return apiFetch("/api/tuning/curves/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ old: oldName, new: newName }),
+    });
+  },
+
+  deleteCurve(name: string): Promise<{ curves: Record<string, [number, number][]> }> {
+    return apiFetch("/api/tuning/curves/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+  },
+
+  saveDeviceProfile(did: string, profile: string): Promise<{ did: string } & SpeakerEq> {
+    return apiFetch("/api/tuning/profile/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ did, profile }),
+    });
+  },
+
+  switchDeviceProfile(did: string, profile: string): Promise<{ did: string } & SpeakerEq> {
+    return apiFetch("/api/tuning/profile/switch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ did, profile }),
+    });
+  },
+
+  deleteDeviceProfile(did: string, profile: string): Promise<{ did: string } & SpeakerEq> {
+    return apiFetch("/api/tuning/profile/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ did, profile }),
+    });
+  },
+
+  exportGraphicEq(did: string): Promise<{ did: string; graphic_eq: string; points: [number, number][] }> {
+    return apiFetch(`/api/tuning/${encodeURIComponent(did)}/export`);
+  },
+
+  importGraphicEq(did: string, text: string): Promise<{ did: string } & SpeakerEq> {
+    return apiFetch(`/api/tuning/${encodeURIComponent(did)}/import`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+  },
+
+  calibrationStart(did: string): Promise<{ token: string; duration_seconds: number }> {
+    return apiFetch("/api/tuning/calibration/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ did }),
+    });
+  },
+
+  calibrationStop(token: string): Promise<{ ok: boolean }> {
+    return apiFetch("/api/tuning/calibration/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+  },
+
+  calibrationAnalyze(
+    wav: Blob,
+    did: string,
+    target: string
+  ): Promise<{
+    did: string;
+    measured: { freqs: number[]; gains: number[] };
+    points: [number, number][];
+    level_dbfs: number;
+  }> {
+    const form = new FormData();
+    form.append("file", wav, "recording.wav");
+    return apiFetch(
+      `/api/tuning/calibration/analyze?did=${encodeURIComponent(did)}&target=${encodeURIComponent(target)}`,
+      { method: "POST", body: form }
+    );
+  },
+
+  calibrationApply(
+    did: string,
+    points: [number, number][],
+    target: string
+  ): Promise<{ did: string } & SpeakerEq> {
+    return apiFetch("/api/tuning/calibration/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ did, points, target }),
+    });
+  },
+
+  levelMatch(groupId: string, levels: Record<string, number>): Promise<{ gains_db: Record<string, number> }> {
+    return apiFetch("/api/tuning/level-match", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ group_id: groupId, levels }),
     });
   },
 
@@ -593,6 +806,14 @@ export const api = {
     return apiFetch(`/api/debug/stream/${encodeURIComponent(receiverId)}/kick`, { method: "POST" });
   },
 
+  refreshPipelines(): Promise<{ ok: boolean; status: string }> {
+    return apiFetch("/api/debug/pipelines/refresh", { method: "POST" });
+  },
+
+  resetAll(): Promise<{ ok: boolean }> {
+    return apiFetch("/api/config/reset", { method: "POST" });
+  },
+
   getPlaybackState(refresh = false): Promise<PlaybackState> {
     return apiFetch(`/api/playback/state${refresh ? "?refresh=true" : ""}`);
   },
@@ -649,6 +870,22 @@ export const api = {
 
   getDebugState(): Promise<DebugState> {
     return apiFetch("/api/debug/state");
+  },
+
+  async downloadDebugReport(): Promise<void> {
+    const res = await fetch(appUrl("/api/debug/report"));
+    if (!res.ok) {
+      const text = await res.text().catch(() => "Unknown error");
+      throw new Error(`HTTP ${res.status}: ${text}`);
+    }
+    const blob = await res.blob();
+    const disposition = res.headers.get("Content-Disposition") || "";
+    const filename = disposition.match(/filename="?([^";]+)"?/)?.[1] || "micast-diagnostic.json";
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(link.href);
   },
 
   getTopology(): Promise<Topology> {

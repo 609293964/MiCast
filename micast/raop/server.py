@@ -16,6 +16,10 @@ from micast.raop.transport import RaopSession
 
 logger = logging.getLogger(__name__)
 
+# TCP close acknowledgement is best-effort. Some mobile clients disappear
+# without completing it; playback teardown must still release speaker state.
+RAOP_CLOSE_TIMEOUT_SECONDS = 2.0
+
 RAOP_HANDSHAKE_TIMEOUT_SECONDS = 30.0
 
 _reserved_rtsp_ports: set[int] = set()
@@ -144,10 +148,20 @@ class RaopServer:
                 self._close_session(session)
             writer.close()
         if writers:
-            await asyncio.gather(
-                *(writer.wait_closed() for writer in writers),
-                return_exceptions=True,
-            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(writer.wait_closed() for writer in writers),
+                        return_exceptions=True,
+                    ),
+                    timeout=RAOP_CLOSE_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Timed out waiting for %d AirPlay client connection(s) to close; "
+                    "continuing playback cleanup",
+                    len(writers),
+                )
         return len(writers)
 
     def _feed_pcm(self, data: bytes) -> None:
@@ -449,7 +463,8 @@ def _transport_port(value: str, key: str) -> int:
 
 
 async def _start_rtsp_server(handler):
-    for port in range(5000, 5032):
+    last = _rtsp_base + 31
+    for port in range(_rtsp_base, last + 1):
         if port in _reserved_rtsp_ports:
             continue
         try:
@@ -458,7 +473,33 @@ async def _start_rtsp_server(handler):
             continue
         _reserved_rtsp_ports.add(port)
         return server, port
-    raise RuntimeError("没有可用的 AirPlay RTSP 端口（5000-5031）")
+    raise RuntimeError(f"没有可用的 AirPlay RTSP 端口（{_rtsp_base}-{last}）")
+
+
+# Preferred scan starts; configure() overrides them from Settings at startup.
+_rtsp_base = 5000
+_udp_pool_base = 6000
+_UDP_POOL_WIDTH = 196  # bases step by 3, so the top base is base + 195
+
+
+def configure_ports(rtsp_port: int | None, udp_base: int | None) -> None:
+    """Point the RTSP/UDP port scans at user-preferred starting ports.
+
+    None restores the built-in defaults (5000 / 6000).
+    """
+    global _rtsp_base, _udp_pool_base, _next_udp_base
+    _rtsp_base = rtsp_port or 5000
+    _udp_pool_base = udp_base or 6000
+    _next_udp_base = _udp_pool_base
+
+
+def rtsp_base() -> int:
+    return _rtsp_base
+
+
+def udp_pool() -> tuple[int, int]:
+    """(base, top) of the UDP port pool, for diagnostics."""
+    return _udp_pool_base, _udp_pool_base + _UDP_POOL_WIDTH - 1
 
 
 _next_udp_base = 6000
@@ -469,12 +510,13 @@ def _reserve_udp_base() -> int:
     only picked again after a full cycle, giving Windows time to actually
     release the sockets."""
     global _next_udp_base
+    top = _udp_pool_base + _UDP_POOL_WIDTH - 1
     for _ in range(66):
         base = _next_udp_base
         _next_udp_base += 3
-        if _next_udp_base > 6195:
-            _next_udp_base = 6000
+        if _next_udp_base > top - 2:
+            _next_udp_base = _udp_pool_base
         if base not in _reserved_udp_bases:
             _reserved_udp_bases.add(base)
             return base
-    raise RuntimeError("没有可用的 AirPlay UDP 端口（6000-6199）")
+    raise RuntimeError(f"没有可用的 AirPlay UDP 端口（{_udp_pool_base}-{top}）")

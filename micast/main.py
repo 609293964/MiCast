@@ -22,6 +22,7 @@ from micast.dlna import DlnaService
 from micast.lyrics import LyricsSession
 from micast.notify import Notifier, notify_expired_soon
 from micast.paths import APP_BASE_PATH
+from micast.raop import server as raop_server
 from micast.routes import (
     access,
     airplay2,
@@ -35,6 +36,8 @@ from micast.routes import (
     receivers,
     status,
     topology,
+    tuning,
+    update,
     ws,
     xiaomi,
 )
@@ -50,7 +53,10 @@ async def lifespan(app: FastAPI):
     settings.configure_airplay2_deployment(airplay2_mode())
     # Speakers pull audio from stream_port; if it's taken and the user didn't
     # pin it explicitly, slide to a free one rather than failing the session.
-    settings.stream_port = resolve_port(settings.stream_port, "MICAST_STREAM_PORT")
+    settings.apply_resolved_port(
+        "stream_port", resolve_port(settings.stream_port, "MICAST_STREAM_PORT")
+    )
+    raop_server.configure_ports(settings.airplay_rtsp_port, settings.airplay_udp_base)
     app.state.auth.on_login_expired = lambda: notify_expired_soon(app.state.notifier)
     bridge: AudioBridge = app.state.bridge
     device_manager: DeviceManager = app.state.device_manager
@@ -439,7 +445,7 @@ app.state.device_manager.stream_active = _stream_active_for
 # aliases are transitional compatibility for older clients and cached pages.
 api_routers = [
     access.install(app.state.access),
-    config.install(app.state.bridge, app.state.dlna),
+    config.install(app.state.bridge, app.state.dlna, app.state.auth, app.state.access, app.state.device_manager),
     status.install(app.state.bridge),
     receivers.install(
         app.state.bridge,
@@ -454,6 +460,8 @@ api_routers = [
     airplay_devices.install(app.state.bridge),
     dlna_devices.install(app.state.bridge),
     topology.install(app.state.bridge, app.state.device_manager),
+    tuning.install(app.state.bridge, app.state.device_manager),
+    update.install(),
     ws.install(app.state.bridge, app.state.device_manager, app.state.access),
 ]
 for api_router in api_routers:

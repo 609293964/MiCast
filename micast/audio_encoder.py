@@ -129,21 +129,54 @@ def _open_encoder(container, fmt: str, bitrate: str, sample_rate: int):
     return stream
 
 
-def _build_filter_graph(audio_filter: str | None, input_rate: int, output_rate: int) -> Graph:
+@lru_cache(maxsize=1)
+def firequalizer_available() -> bool:
+    """Whether the bundled libavfilter can configure firequalizer with a real
+    gain table. Probed once with a dense, non-flat curve: the filter can add
+    successfully yet fail at configure with a large gain_entry (ENOMEM on the
+    installed Windows build), so a trivial one-entry probe is not enough."""
+    try:
+        graph = Graph()
+        src = graph.add_abuffer(format="s16", layout="stereo", sample_rate=48000)
+        # 120 log-spaced entries matching curve_fit.gain_table, with a non-flat
+        # gain slope (+6 dB → −6 dB) so the probe exercises interpolation too.
+        entries = ";".join(
+            f"entry({20.0 * (20000.0 / 20.0) ** (i / 119):.1f},{6.0 - 12.0 * i / 119:.2f})"
+            for i in range(120)
+        )
+        node = graph.add("firequalizer", f"gain_entry='{entries}'")
+        sink = graph.add("abuffersink")
+        graph.link_nodes(src, node, sink).configure()
+        return True
+    except Exception:
+        logger.info("firequalizer unavailable; EQ curves fall back to equalizer chain")
+        return False
+
+
+def _build_filter_graph(
+    audio_filter: str | list[tuple[str, str]] | None,
+    input_rate: int,
+    output_rate: int,
+) -> Graph:
     """abuffer → [speaker EQ/pan/gain/delay chain] → aresample → s16 stereo out.
 
-    The filter strings are the same mini-language ffmpeg's -af takes; the
-    pipeline only ever generates simple name=args links, so a plain split
-    on ',' is a faithful parse.
+    ``audio_filter`` is normally a structured list of (name, args) links —
+    firequalizer gain tables contain commas and semicolons, so the old
+    comma-joined mini-language string is accepted only for compatibility.
     """
+    if isinstance(audio_filter, str):
+        links = []
+        for link in audio_filter.split(","):
+            name, _, args = link.partition("=")
+            links.append((name.strip(), args.strip()))
+        audio_filter = links
     graph = Graph()
     nodes = [
         graph.add_abuffer(format="s16", layout="stereo", sample_rate=input_rate),
     ]
     if audio_filter:
-        for link in audio_filter.split(","):
-            name, _, args = link.partition("=")
-            nodes.append(graph.add(name.strip(), args.strip()))
+        for name, args in audio_filter:
+            nodes.append(graph.add(name, args))
     if output_rate != input_rate:
         nodes.append(graph.add("aresample", str(output_rate)))
     nodes.append(graph.add("aformat", "sample_fmts=s16:channel_layouts=stereo"))
@@ -170,7 +203,7 @@ class AudioEncoder:
         self,
         config,
         input_sample_rate: int | None = None,
-        audio_filter: str | None = None,
+        audio_filter: str | list[tuple[str, str]] | None = None,
     ):
         self.config = config
         self.input_sample_rate = input_sample_rate or settings.pcm_sample_rate
@@ -202,12 +235,17 @@ class AudioEncoder:
 
     async def start(self) -> "AudioEncoder":
         self._loop = asyncio.get_running_loop()
+        chain = (
+            ",".join(f"{name}={args}" for name, args in self.audio_filter)
+            if isinstance(self.audio_filter, list)
+            else self.audio_filter
+        )
         logger.info(
             "Starting encoder: s16le/%dHz → %s/%dHz%s",
             self.input_sample_rate,
             self.config.format,
             self.config.sample_rate,
-            f" [{self.audio_filter}]" if self.audio_filter else "",
+            f" [{chain}]" if chain else "",
         )
         self._thread = threading.Thread(
             target=self._run, name=f"encoder-{self.config.format}", daemon=True

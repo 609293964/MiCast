@@ -203,10 +203,10 @@ def test_pipeline_builds_channel_filter(monkeypatch):
         gains_db={"didA": -3.0},
     )
     pipeline = _pipeline(monkeypatch, group)
-    assert (
-        pipeline._build_audio_filter()
-        == "pan=stereo|c0=FL|c1=FL,volume=-3.0dB"
-    )
+    assert pipeline._build_audio_filter() == [
+        ("pan", "stereo|c0=FL|c1=FL"),
+        ("volume", "-3.0dB"),
+    ]
     assert pipeline.stream_url.endswith("/stream/r1-L")
 
 
@@ -245,7 +245,7 @@ def test_filter_follows_channel_holder_after_swap(monkeypatch):
         gains_db={"didB": -6.0},
     )
     pipeline = _pipeline(monkeypatch, group)  # the -L pipeline
-    assert (
-        pipeline._build_audio_filter()
-        == "pan=stereo|c0=FL|c1=FL,volume=-6.0dB"
-    )
+    assert pipeline._build_audio_filter() == [
+        ("pan", "stereo|c0=FL|c1=FL"),
+        ("volume", "-6.0dB"),
+    ]

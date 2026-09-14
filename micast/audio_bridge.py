@@ -5,7 +5,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 
-from micast.config import settings
+from micast.config import resolve_port, settings
 from micast.deployment import airplay2_mode
 from micast.local_airplay import LocalAirPlayProvider
 from micast.orchestration import DesiredReceiver, OrchestratorClient
@@ -259,6 +259,18 @@ class AudioBridge:
             while self._restart_requested:
                 self._restart_requested = False
                 await self._restart_engine_locked()
+
+    async def restart_stream_server(self) -> None:
+        """Rebind the stream server after the preferred stream port changed.
+
+        Re-resolves from the preferred port (sliding upward when busy) so a
+        hot change never binds a stale address.
+        """
+        settings.stream_port = resolve_port(
+            settings.preferred_port("stream_port"), "MICAST_STREAM_PORT"
+        )
+        await self._stream_server.stop()
+        await self._stream_server.start()
 
     async def _restart_engine_locked(self) -> None:
         """Full engine teardown+start. Caller must hold ``_restart_lock``."""
@@ -564,6 +576,8 @@ class AudioBridge:
 
     async def _ensure_airplay_discovery(self) -> None:
         """(Re)bind LAN AirPlay discovery to the provider's shared Zeroconf."""
+        if not settings.network_discovery_enabled:
+            return
         from micast.airplay_discovery import AirPlayDiscovery
         from micast.airplay_targets import AirPlayTargetManager
         from micast.dlna_client import DlnaDiscovery, DlnaTargetManager
@@ -584,6 +598,31 @@ class AudioBridge:
             await self._airplay_discovery.start()
         else:
             await self._airplay_discovery.rebind(zeroconf)
+
+    async def set_network_discovery(self, enabled: bool) -> None:
+        """Hot on/off for experimental LAN discovery (AirPlay mDNS + DLNA SSDP).
+
+        Disabling stops active casts to external targets too — without
+        discovery running, those sessions can't survive a network blip anyway.
+        """
+        if enabled:
+            if self._running and settings.airplay_engine == "local":
+                await self._ensure_airplay_discovery()
+            return
+        if self._airplay_targets:
+            await self._airplay_targets.stop_all()
+        if self._dlna_targets:
+            await self._dlna_targets.stop_all()
+        if self._airplay_discovery:
+            await self._airplay_discovery.stop()
+        if self._dlna_discovery:
+            await self._dlna_discovery.stop()
+        # Drop the registries so routes report an empty list instead of stale
+        # devices discovered before the toggle flipped.
+        self._airplay_targets = None
+        self._airplay_discovery = None
+        self._dlna_targets = None
+        self._dlna_discovery = None
 
     @property
     def airplay_discovery(self):
@@ -683,7 +722,12 @@ class AudioBridge:
                 await self._stop_airplay2_pipeline(instance.id)
             runtime = {"id": instance.id, "status": "starting", "detail": "正在启动"}
             self._airplay2_runtime[instance.id] = runtime
-            source = create_pcm_source(settings.airplay2_pcm_source)
+            # A local (shairport) source gets the configured preferred port so
+            # run-shairport scans from it instead of always starting at 7000.
+            source_env: dict[str, str] = {}
+            if settings.airplay2_port:
+                source_env["MICAST_AIRPLAY2_PORT"] = str(settings.airplay2_port)
+            source = create_pcm_source(settings.airplay2_pcm_source, env=source_env)
             self._airplay2_sources[instance.id] = source
             try:
                 reader = await source.start()
@@ -834,7 +878,8 @@ class AudioBridge:
                 stream_id=stream_id,
                 group_id=group.id if stereo else None,
                 channel=variant["channel"] if stereo else None,
-                eq_bands=variant["eq"],
+                eq_curve=variant["eq"],
+                loudness=variant.get("loudness", False),
                 input_sample_rate=input_sample_rate,
                 pace_source=pace_source,
                 session_active=self._session_active_for(instance.id),
@@ -843,6 +888,7 @@ class AudioBridge:
             self._airplay2_pipelines[stream_id] = pipeline
             if input_volume is not None:
                 pipeline.set_input_volume(input_volume)
+            pipeline.set_loudness_level(self._sender_volumes.get(instance.id, 100))
             try:
                 await pipeline.start()
             except Exception as exc:
@@ -902,7 +948,8 @@ class AudioBridge:
                 stream_id=stream_id,
                 group_id=group.id if stereo else None,
                 channel=variant["channel"] if stereo else None,
-                eq_bands=variant["eq"],
+                eq_curve=variant["eq"],
+                loudness=variant.get("loudness", False),
                 session_active=self._session_active_for(item.id),
                 on_source_stall=self._recover_stalled_source,
             )
@@ -912,6 +959,7 @@ class AudioBridge:
                 if self._volume_modes.get(item.id) == "linked"
                 else self._sender_volumes.get(item.id, 100)
             )
+            pipeline.set_loudness_level(self._sender_volumes.get(item.id, 100))
             try:
                 await pipeline.start()
             except Exception as exc:
@@ -1117,6 +1165,7 @@ class AudioBridge:
         for key, pipeline in pipelines.items():
             if key == receiver_id or key.startswith(f"{receiver_id}-"):
                 pipeline.set_input_volume(100 if mode == "linked" else percent)
+                pipeline.set_loudness_level(percent)
         if self._airplay_targets:
             self._airplay_targets.set_input_volume(
                 receiver_id, 100 if mode == "linked" else percent
@@ -1142,6 +1191,10 @@ class AudioBridge:
             await self._dlna_targets.stop_all()
         if self._airplay_discovery:
             await self._airplay_discovery.stop()
+        if self._dlna_discovery:
+            await self._dlna_discovery.stop()
+            self._dlna_discovery = None
+            self._dlna_targets = None
         self._target_taps.clear()
         await self._local_provider.stop()
         await self._stop_airplay2_pipelines()

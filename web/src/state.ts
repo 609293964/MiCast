@@ -12,7 +12,7 @@ export type ReceiverMode = "single" | "multi";
 
 export interface State {
   access: AccessStatus | null;
-  onboardingStep: "access" | "xiaomi" | "airplay2" | "complete";
+  onboardingStep: "access" | "xiaomi" | "receivers" | "airplay2" | "complete";
   recoveryDismissed: boolean;
   status: import("./api").Status | null;
   audio: AudioConfig | null;
@@ -39,6 +39,10 @@ export interface State {
     theme: Theme;
     activeSection: Section;
     expandedDeviceDid: string | null;
+    /** Speaker open in the full-screen tuning page; null = normal sections. */
+    tuningDid: string | null;
+    /** Tuning page: whether the advanced section (target/calibrate/A-B/scenes) is expanded. */
+    tuningAdvanced: boolean;
     confirmingReceiverId: string | null;
     airplay2Tab: AirPlay2Tab;
   };
@@ -68,6 +72,8 @@ function loadUiState(): State["ui"] {
           ? parsed.activeSection
           : "topology",
         expandedDeviceDid: parsed.expandedDeviceDid ?? null,
+        tuningDid: null,
+        tuningAdvanced: Boolean(parsed.tuningAdvanced),
         confirmingReceiverId: null,
     airplay2Tab: ["overview", "instances", "mappings"].includes(parsed.airplay2Tab) ? parsed.airplay2Tab : "overview",
       };
@@ -79,6 +85,8 @@ function loadUiState(): State["ui"] {
     theme: "auto",
     activeSection: "topology",
     expandedDeviceDid: null,
+    tuningDid: null,
+    tuningAdvanced: false,
     confirmingReceiverId: null,
     airplay2Tab: "overview",
   };

@@ -34,7 +34,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["pytest", "ruff", "numpy"],
+    excludes=["pytest", "ruff"],
     noarchive=False,
 )
 

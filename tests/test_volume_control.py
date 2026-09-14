@@ -12,7 +12,9 @@ def test_sender_mode_is_latched_and_linked_does_not_attenuate(monkeypatch):
     async def run():
         bridge = object.__new__(AudioBridge)
         gains = []
-        bridge._pipelines = {"one-L": SimpleNamespace(set_input_volume=gains.append)}
+        bridge._pipelines = {
+            "one-L": SimpleNamespace(set_input_volume=gains.append, set_loudness_level=lambda _p: None)
+        }
         bridge._volume_modes = {}
         bridge._sender_volumes = {}
         bridge._airplay_targets = None

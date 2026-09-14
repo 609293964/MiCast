@@ -2,39 +2,16 @@ import type { Device, PlaybackState, SpeakerEq } from "../api";
 import { api } from "../api";
 import { store } from "../state";
 import { brandIcon, icon } from "../icons";
+import { openTuning } from "./tuning-view";
 
-// 10-band EQ: must match the backend (micast/config.py EQ_BANDS_HZ / EQ_PRESETS).
-// The preset list is refreshed from /api/devices/eq/presets when available.
-const EQ_FREQ_LABELS = ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
 export const EQ_PRESET_LABELS: Record<string, string> = {
   flat: "平直",
   bass: "低音增强",
   vocal: "人声清晰",
-  night: "夜间模式",
+  night: "轻音",
   live: "现场感",
+  harman: "Harman",
 };
-const FALLBACK_EQ_PRESETS: Record<string, number[]> = {
-  flat: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-  bass: [4, 5, 4, 2, 1, 0, 0, -1, 0, 0],
-  vocal: [-2, -1, 0, 0, 1, 3, 2, 2, 1, 0],
-  night: [-4, -4, -3, -2, -1, 0, 0, -1, -2, -3],
-  live: [2, 1, 0, 0, 0, 1, 1, 2, 3, 3],
-};
-let eqPresets: Record<string, number[]> = FALLBACK_EQ_PRESETS;
-let eqPresetsLoaded = false;
-
-function loadEqPresets() {
-  if (eqPresetsLoaded) return;
-  eqPresetsLoaded = true;
-  api
-    .getEqPresets()
-    .then((r) => {
-      eqPresets = r.presets;
-    })
-    .catch(() => {
-      eqPresetsLoaded = false;
-    });
-}
 
 interface DeviceVisual {
   html: string;
@@ -221,122 +198,67 @@ function renderDeviceDetails(device: Device, _playback: PlaybackState | null): s
 }
 
 function renderEqSection(device: Device): string {
-  const eq: SpeakerEq = device.eq ?? { enabled: false, bands: EQ_FREQ_LABELS.map(() => 0), preset: "" };
-  const bands = EQ_FREQ_LABELS.map((_, i) => eq.bands[i] ?? 0);
-  const presetKey = eq.preset && eq.preset in EQ_PRESET_LABELS ? eq.preset : "";
+  const eq: SpeakerEq | undefined = device.eq;
+  const statusLabel = !eq?.enabled
+    ? "已关闭"
+    : eq.preset && eq.preset in EQ_PRESET_LABELS
+      ? EQ_PRESET_LABELS[eq.preset]
+      : eq.points.length
+        ? "自定义曲线"
+        : "平直";
   return `
     <div class="device-detail-row eq-title-row">
       <span class="caption">均衡器 EQ</span>
-      <input type="checkbox" class="switch" data-eq-toggle ${eq.enabled ? "checked" : ""} aria-label="启用均衡器">
-    </div>
-    <div class="eq-panel ${eq.enabled ? "" : "disabled"}" data-eq-panel>
-      <div class="eq-presets" role="group" aria-label="EQ 预设">
-        ${Object.entries(EQ_PRESET_LABELS)
-          .map(
-            ([key, label]) => `
-          <button type="button" class="eq-preset-chip ${presetKey === key ? "active" : ""}" data-eq-preset="${key}">${label}</button>`
-          )
-          .join("")}
+      <div class="eq-entry">
+        <span class="cell-value">${statusLabel}</span>
+        <input type="checkbox" class="switch" data-eq-toggle ${eq?.enabled ? "checked" : ""} aria-label="启用均衡器">
+        ${eq?.enabled ? `<button type="button" class="button secondary" data-tuning-open>调音台</button>` : ""}
       </div>
-      <div class="eq-bands">
-        ${bands
-          .map(
-            (gain, i) => `
-          <label class="eq-band">
-            <output>${formatGain(gain)}</output>
-            <input type="range" min="-12" max="12" step="0.5" value="${gain}" data-eq-band="${i}" aria-label="${EQ_FREQ_LABELS[i]}Hz 增益">
-            <span class="eq-freq">${EQ_FREQ_LABELS[i]}</span>
-          </label>`
-          )
-          .join("")}
-      </div>
-      <span class="caption eq-hint">仅作用于这台音箱；不同 EQ 的音箱会使用独立音频流</span>
     </div>
   `;
 }
 
-function formatGain(gain: number): string {
-  return `${gain > 0 ? "+" : ""}${gain}`;
-}
-
-function bindEqSection(container: HTMLElement) {
-  loadEqPresets();
+function bindEqSection(container: HTMLElement, onOpenTuning: (did: string) => void) {
   container.querySelectorAll<HTMLElement>("[data-did]").forEach((card) => {
     const did = card.dataset.did!;
     const toggle = card.querySelector<HTMLInputElement>("[data-eq-toggle]");
-    const panel = card.querySelector<HTMLElement>("[data-eq-panel]");
-    if (!toggle || !panel) return;
-    const bandInputs = Array.from(card.querySelectorAll<HTMLInputElement>("[data-eq-band]"));
-    const chips = Array.from(card.querySelectorAll<HTMLElement>("[data-eq-preset]"));
-
-    const currentBands = () =>
-      bandInputs
-        .sort((a, b) => Number(a.dataset.eqBand) - Number(b.dataset.eqBand))
-        .map((input) => Number(input.value));
-
-    const matchingPreset = (bands: number[]) =>
-      Object.entries(eqPresets).find(([, gains]) =>
-        EQ_FREQ_LABELS.every((_, i) => Math.abs((gains[i] ?? 0) - bands[i]) < 0.01)
-      )?.[0] ?? "";
-
-    const markChips = (preset: string) => {
-      chips.forEach((chip) =>
-        chip.classList.toggle("active", chip.dataset.eqPreset === preset)
-      );
-    };
-
-    const save = () => {
-      const bands = currentBands();
-      const payload: SpeakerEq = {
-        enabled: toggle.checked,
-        bands,
-        preset: matchingPreset(bands),
-      };
-      // Sliders already show the value; save silently so the panel never
-      // re-renders mid-drag (the classic "slider jumps" bug).
-      api.setDeviceEq(did, payload).catch((e) => {
-        store.showToast(`EQ 保存失败: ${e instanceof Error ? e.message : "未知错误"}`);
-      });
-    };
-
-    toggle.addEventListener("change", () => {
-      panel.classList.toggle("disabled", !toggle.checked);
-      save();
-    });
-
-    chips.forEach((chip) => {
-      chip.addEventListener("click", () => {
-        const key = chip.dataset.eqPreset!;
-        const gains = eqPresets[key];
-        if (!gains) return;
-        bandInputs.forEach((input, i) => {
-          input.value = String(gains[i] ?? 0);
-          const output = input.parentElement?.querySelector("output");
-          if (output) output.value = formatGain(gains[i] ?? 0);
+    toggle?.addEventListener("change", () => {
+      const device = store.get().devices.find((d) => d.did === did);
+      api
+        .setDeviceEqCurve(did, {
+          enabled: toggle.checked,
+          points: device?.eq?.points ?? [],
+          preset: device?.eq?.preset ?? "",
+          target: device?.eq?.target ?? "",
+        })
+        .then((resp) => {
+          // The 调音台 entry only exists while EQ is on — re-render so it
+          // appears/disappears with the switch. The store alone does not
+          // re-render, and the switch still holds focus here, so an explicit
+          // request is required (polls only update this page in place).
+          store.set({
+            devices: store.get().devices.map((d) => (d.did === did ? { ...d, eq: resp } : d)),
+          });
+          window.dispatchEvent(new CustomEvent("micast:request-render"));
+        })
+        .catch((e) => {
+          store.showToast(`EQ 保存失败: ${e instanceof Error ? e.message : "未知错误"}`);
         });
-        markChips(key);
-        save();
-      });
     });
-
-    bandInputs.forEach((input) => {
-      input.addEventListener("input", () => {
-        const output = input.parentElement?.querySelector("output");
-        if (output) output.value = formatGain(Number(input.value));
-        markChips(matchingPreset(currentBands()));
-      });
-      // Commit on release: mid-drag saves make the server value round-trip
-      // back into the control and the thumb lags behind the finger.
-      input.addEventListener("change", save);
+    card.querySelector<HTMLElement>("[data-tuning-open]")?.addEventListener("click", () => {
+      onOpenTuning(did);
     });
   });
 }
 
 export function bindDevicesView(
   container: HTMLElement,
-  onExpandedChange: (did: string | null) => void
+  onExpandedChange: (did: string | null) => void,
+  onOpenTuning: (did: string) => void = (did) => {
+    openTuning(did);
+  }
 ) {
-  bindEqSection(container);
+  bindEqSection(container, onOpenTuning);
   container.querySelectorAll("[data-device-header]").forEach((el) => {
     el.addEventListener("click", (e) => {
       // Don't toggle expand when interacting with a slider, switch or button.

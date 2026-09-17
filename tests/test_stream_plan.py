@@ -9,8 +9,10 @@ import pytest
 
 from micast.config import (
     AirPlay2InstanceConfig,
+    EqPoint,
     ReceiverConfig,
     Settings,
+    SpeakerConfig,
     SpeakerGroupConfig,
 )
 from micast.stream_plan import compute_plan, diff_plans, entry_fingerprint
@@ -73,14 +75,52 @@ def test_airplay2_retarget_and_rename_rebuild_despite_same_suffix_set():
     assert diff.airplay2_rebuild == {"ap2"}
 
 
-def test_audio_format_change_rebuilds_airplay2_and_restarts_classic_encoders():
-    """Defect 2: restart_audio used to skip _airplay2_pipelines entirely."""
+def test_audio_format_change_restarts_encoders_on_both_engines():
+    """A format swap is encoder-level: pipelines, PCM sources (a live AirPlay 2
+    session!) and stream endpoints all stay up."""
     s = _settings()
     old = compute_plan(s)
     s.audio.format = "flac"
     diff = diff_plans(old, compute_plan(s))
-    assert diff.audio_only  # classic: encoder restart, not a rebuild
+    assert diff.audio_only
     assert not diff.classic_rebuild
+    assert not diff.airplay2_rebuild
+    assert diff.encoder_restart == {"r1", "ap2"}
+
+
+def test_eq_curve_change_restarts_encoders_without_rebuilding():
+    """Defect: retuning a curve mid-cast used to rebuild the AirPlay 2
+    instance, killing shairport and the phone's session."""
+    s = _settings()
+    s.speakers = [
+        SpeakerConfig(
+            did="a",
+            alias="A",
+            eq_enabled=True,
+            eq_points=[EqPoint(freq=100.0, gain_db=2.0)],
+        )
+    ]
+    old = compute_plan(s)
+    s.speakers[0].eq_points = [EqPoint(freq=100.0, gain_db=4.0)]
+    diff = diff_plans(old, compute_plan(s))
+    assert not diff.classic_rebuild
+    assert not diff.airplay2_rebuild
+    assert not diff.audio_only
+    assert diff.encoder_restart == {"r1", "ap2"}
+
+    # Flat ↔ EQ'd toggles the -q{n} suffix set: that IS structural.
+    s2 = _settings()
+    old = compute_plan(s2)
+    s2.speakers = [
+        SpeakerConfig(
+            did="a",
+            alias="A",
+            eq_enabled=True,
+            eq_points=[EqPoint(freq=100.0, gain_db=2.0)],
+        )
+    ]
+    diff = diff_plans(old, compute_plan(s2))
+    assert diff.classic_rebuild
     assert diff.airplay2_rebuild == {"ap2"}
 
 

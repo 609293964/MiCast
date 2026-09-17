@@ -5,12 +5,14 @@ serves the curve editor and the calibration wizard (tuning view).
 """
 
 import asyncio
+import contextlib
+import json
 import re
 import secrets
 import time
 from urllib.parse import quote
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
@@ -31,6 +33,11 @@ from micast.room_measure import (
     measure_response,
     recording_level_dbfs,
     sweep_pcm,
+)
+from micast.spectrum import (
+    spectrum_client_connected,
+    spectrum_client_disconnected,
+    spectrum_polled,
 )
 from micast.xiaomi.device_manager import DeviceManager
 
@@ -236,6 +243,49 @@ def install(bridge: AudioBridge | None, device_manager: DeviceManager | None = N
         if bridge:
             await bridge.apply_config_change()
         return _speaker_state(did)
+
+    # ------------------------------------------------------------------
+    # Live spectrum for the tuning page: 64 log bands over the same 20 Hz –
+    # 20 kHz axis as the curve, pushed ~10 fps while the socket is open.
+    # The bands are null whenever the speaker has no audible stream. The GET
+    # twin is the fallback for webviews where the WebSocket handshake dies.
+    # ------------------------------------------------------------------
+
+    def _spectrum_bands(did: str) -> list[float] | None:
+        if bridge is None or device_manager is None:
+            return None
+        owner = device_manager.owner_of(did) or ""
+        # DLNA ingress namespaces its owner "dlna:{rid}"; a manual debug play
+        # has no receiver stream to tap.
+        rid = owner.split(":", 1)[1] if owner.startswith("dlna:") else owner
+        if not rid or rid == "debug":
+            return None
+        pipeline = bridge.pipeline_for_stream(rid + settings.stream_suffix(rid, did))
+        return pipeline.spectrum_bands() if pipeline is not None else None
+
+    @router.get("/{did}/spectrum")
+    async def spectrum_snapshot(did: str):
+        spectrum_polled()  # keep the pump-loop tap alive between polls
+        return {"bands": _spectrum_bands(did)}
+
+    @router.websocket("/{did}/spectrum")
+    async def spectrum_ws(websocket: WebSocket, did: str):
+        await websocket.accept()
+        spectrum_client_connected()
+        try:
+            while True:
+                await websocket.send_text(json.dumps({"bands": _spectrum_bands(did)}))
+                await asyncio.sleep(0.1)
+        except WebSocketDisconnect:
+            pass
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # client vanished mid-send, etc.
+            pass
+        finally:
+            spectrum_client_disconnected()
+            with contextlib.suppress(Exception):
+                await websocket.close()
 
     # ------------------------------------------------------------------
     # Measurement calibration: play a sweep on one speaker, the browser

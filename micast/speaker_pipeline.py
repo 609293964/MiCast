@@ -16,6 +16,7 @@ from micast.curve_fit import (
     loudness_curve,
 )
 from micast.pcm_source import PCMSource
+from micast.spectrum import SpectrumAnalyzer, spectrum_wanted
 from micast.stream_server import StreamServer
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,15 @@ class SpeakerPipeline:
         self._loudness_level = 100
         self._loudness_band = loudness_band(self._loudness_level)
         self._loudness_restarting = False
+        # Live-spectrum tap for the tuning page: raw post-gain PCM in, FFT
+        # only when the UI polls — see micast.spectrum.
+        self._spectrum = SpectrumAnalyzer(self._input_sample_rate or 44100)
+
+    def spectrum_bands(self) -> list[float] | None:
+        """Latest spectrum bands (0..1), or None when the pipeline is idle."""
+        if not self._running:
+            return None
+        return self._spectrum.bands()
 
     @property
     def status(self) -> str:
@@ -394,7 +404,10 @@ class SpeakerPipeline:
                 if not chunk:
                     break
                 self._note_source_bytes(chunk)
-                writer.write(self._apply_input_gain(chunk))
+                gained = self._apply_input_gain(chunk)
+                if spectrum_wanted():
+                    self._spectrum.feed(gained)
+                writer.write(gained)
                 fed_bytes += len(chunk)
                 # Never run ahead of real time: a tee backlog (restart window)
                 # must drain at 1x, not burst into the encoder and overflow
@@ -440,7 +453,10 @@ class SpeakerPipeline:
                 if not chunk:
                     break
                 self._note_source_bytes(chunk)
-                await self._stream_server.broadcast(self._stream_id, self._apply_input_gain(chunk))
+                gained = self._apply_input_gain(chunk)
+                if spectrum_wanted():
+                    self._spectrum.feed(gained)
+                await self._stream_server.broadcast(self._stream_id, gained)
                 fed_bytes += len(chunk)
                 ahead = fed_bytes / byte_rate - (loop.time() - started_at)
                 if self._pace_source and ahead > 0:

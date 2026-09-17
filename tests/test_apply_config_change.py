@@ -53,11 +53,15 @@ def _bare_bridge(monkeypatch, s: Settings) -> AudioBridge:
     bridge._plan_update_requested = False
     bridge._plan = None
     bridge._pipelines = {}
+    bridge._airplay2_pipelines = {}
+    bridge._tees = {}
     bridge._error_count = 0
     bridge.on_group_membership_changed = None
     bridge.on_audio_restarted = None
     bridge._restart_engine_locked = AsyncMock()
     bridge._rebuild_pipelines_locked = AsyncMock()
+    bridge._rebuild_classic_entries_locked = AsyncMock()
+    bridge._reconcile_classic_entries_locked = AsyncMock()
     bridge._start_airplay2_pipelines = AsyncMock()
     bridge._stop_airplay2_pipelines = AsyncMock()
     bridge._rebuild_airplay2_instances_locked = AsyncMock()
@@ -68,19 +72,24 @@ def _bare_bridge(monkeypatch, s: Settings) -> AudioBridge:
 
 
 @pytest.mark.asyncio
-async def test_audio_format_change_restarts_classic_encoders_and_rebuilds_airplay2(monkeypatch):
-    """Defect 2: POST /audio used to leave AirPlay 2 pipelines on the old codec."""
+async def test_audio_format_change_restarts_encoders_on_both_engines(monkeypatch):
+    """Defect 2: POST /audio used to leave AirPlay 2 pipelines on the old codec.
+    A format swap is encoder-level: neither classic pipelines nor the AirPlay 2
+    PCM source (a live session!) is torn down."""
     s = _settings()
     bridge = _bare_bridge(monkeypatch, s)
     classic = AsyncMock()
+    airplay2 = AsyncMock()
     bridge._pipelines = {"r1": classic}
+    bridge._airplay2_pipelines = {"ap2": airplay2}
     bridge._plan = compute_plan(s)
 
     s.audio.format = "flac"
     await bridge.apply_config_change()
 
     classic.restart_encoder.assert_awaited_once()
-    bridge._rebuild_airplay2_instances_locked.assert_awaited_once_with({"ap2"})
+    airplay2.restart_encoder.assert_awaited_once()
+    bridge._rebuild_airplay2_instances_locked.assert_not_called()
     bridge._restart_engine_locked.assert_not_called()
     assert bridge._plan == compute_plan(s)
 
@@ -149,7 +158,7 @@ async def test_membership_change_fires_the_group_hook(monkeypatch):
     await bridge.apply_config_change()
 
     hook.assert_awaited_once_with("g1", ["b"])
-    bridge._rebuild_pipelines_locked.assert_awaited_once()
+    bridge._rebuild_classic_entries_locked.assert_awaited_once_with({"r1"})
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,54 @@
+name: release-fnos
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Install fnpack
+        run: |
+          curl -fSL --connect-timeout 15 \
+            "https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64" \
+            -o "$RUNNER_TEMP/fnpack"
+          chmod +x "$RUNNER_TEMP/fnpack"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Build the fnOS package
+        run: bash scripts/build-fnos.sh
+
+      - name: Checksums
+        working-directory: dist/fnos
+        run: sha256sum *.fpk > SHA256SUMS-fnos.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: MiCast-fnos
+          path: |
+            dist/fnos/*.fpk
+            dist/fnos/SHA256SUMS-fnos.txt
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/fnos/*.fpk
+            dist/fnos/SHA256SUMS-fnos.txt

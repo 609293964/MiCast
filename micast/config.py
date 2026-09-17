@@ -576,6 +576,12 @@ class Settings(BaseSettings):
                 self.airplay2_instances = [
                     AirPlay2InstanceConfig.model_validate(item) for item in value
                 ]
+            elif key == "saved_curves" and isinstance(value, dict):
+                self.saved_curves = {
+                    str(name): [EqPoint.model_validate(p) for p in points]
+                    for name, points in value.items()
+                    if isinstance(points, list)
+                }
             else:
                 env_var = f"MICAST_{key.upper()}"
                 if env_var not in os.environ and hasattr(self, key):
@@ -626,6 +632,10 @@ class Settings(BaseSettings):
             "receivers": [receiver.model_dump() for receiver in self.receivers],
             "groups": [group.model_dump() for group in self.groups],
             "airplay2_instances": [item.model_dump() for item in self.airplay2_instances],
+            "saved_curves": {
+                name: [p.model_dump() for p in points]
+                for name, points in self.saved_curves.items()
+            },
         }
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         self.config_path.write_text(
@@ -962,7 +972,16 @@ class Settings(BaseSettings):
         # scene — clear the active-scene label so it stops claiming a saved one.
         speaker.content_profile = ""
         if target is not None:
-            speaker.eq_target = target if target in TARGET_CURVES else ""
+            # The reference overlay accepts a built-in target name or a curve
+            # from the library ("saved:<name>" / "preset:<key>"); anything else
+            # (e.g. a since-deleted saved curve) collapses to no overlay.
+            speaker.eq_target = (
+                target
+                if target in TARGET_CURVES
+                or (target.startswith("saved:") and target[6:] in self.saved_curves)
+                or (target.startswith("preset:") and target[7:] in EQ_PRESET_POINTS)
+                else ""
+            )
         self.save_to_file()
         return speaker
 

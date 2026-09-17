@@ -43,9 +43,9 @@ def _clean_name(raw: str | None, hardware: str | None) -> str:
 
 def install(device_manager: DeviceManager, bridge: AudioBridge | None = None) -> APIRouter:
     @router.get("")
-    async def get_devices():
+    async def get_devices(refresh: bool = False):
         try:
-            devices = await device_manager.list_devices()
+            devices = await device_manager.list_devices(force=refresh)
             if bridge and device_manager.consume_merge_rewrite():
                 # A device id migrated under us: stream ids and pipeline
                 # targets still reference the old did — rebuild the affected

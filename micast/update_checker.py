@@ -83,6 +83,9 @@ async def check_for_update(force: bool = False) -> dict:
                 "name": a.get("name"),
                 "size": a.get("size"),
                 "download_url": a.get("browser_download_url"),
+                # GitHub API exposes "sha256:<hex>" per asset; used to verify
+                # the downloaded file before applying it.
+                "digest": a.get("digest"),
             }
             for a in data.get("assets", [])
         ]
@@ -100,6 +103,21 @@ async def check_for_update(force: bool = False) -> dict:
         }
         _cache, _cache_at = result, time.time()
         return result
+
+
+def _verify_digest(path: Path, digest: str | None) -> None:
+    """Check the downloaded file against the asset's sha256 digest."""
+    if not digest:
+        logger.warning("Release asset has no digest; skipping integrity check")
+        return
+    algo, _, expected = digest.partition(":")
+    if algo.lower() != "sha256" or not expected:
+        raise RuntimeError(f"无法识别的校验和格式：{digest}")
+    import hashlib
+
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual.lower() != expected.lower():
+        raise RuntimeError("安装包校验失败（SHA256 不匹配），请重新下载")
 
 
 async def download_update(asset: dict) -> None:
@@ -129,6 +147,7 @@ async def download_update(asset: dict) -> None:
                         fh.write(chunk)
                         received += len(chunk)
                         download_state["progress"] = received
+        _verify_digest(target, asset.get("digest"))
         download_state.update({"state": "done", "path": str(target)})
         logger.info("Update downloaded to %s", target)
     except Exception as e:

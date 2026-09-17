@@ -138,7 +138,7 @@ export class CalibrationWizard {
     q<HTMLSelectElement>("[data-wiz-target]")?.addEventListener("change", (e) => {
       this.target = (e.target as HTMLSelectElement).value;
     });
-    q("[data-wiz-start]")?.addEventListener("click", () => void this.measure(this.did, true));
+    q("[data-wiz-start]")?.addEventListener("click", () => void this.runMeasure());
     q("[data-wiz-apply]")?.addEventListener("click", () => void this.apply());
     q("[data-wiz-level-start]")?.addEventListener("click", () => void this.measureLevelNext());
 
@@ -176,6 +176,17 @@ export class CalibrationWizard {
     if (bar) bar.style.width = `${Math.round(fraction * 100)}%`;
     const cd = this.container.querySelector<HTMLElement>("[data-wiz-countdown]");
     if (cd) cd.textContent = label;
+  }
+
+  private async runMeasure(): Promise<void> {
+    this.step = "measuring";
+    this.render();
+    const result = await this.measure(this.did, true);
+    // measure() already switched to the error step on failure.
+    if (result) {
+      this.step = "result";
+      this.render();
+    }
   }
 
   private async measure(did: string, keepResult: boolean): Promise<WizardResult | null> {

@@ -19,7 +19,7 @@ from functools import lru_cache
 
 import numpy as np
 
-from micast.curve_fit import CURVE_GAIN_RANGE, fit_points, pchip_eval, target_table
+from micast.curve_fit import fit_points, pchip_eval, target_table
 
 SWEEP_RATE = 44100
 SWEEP_F0 = 30.0  # below the audible band edge; keeps the 20 Hz grid honest
@@ -31,6 +31,14 @@ SWEEP_PAD_SECONDS = 0.5
 
 # Analysis grid: 1/6-octave-ish log spacing across the audible band.
 ANALYSIS_BANDS = 60
+# Compensation is deliberately conservative: narrow peaks/dips in a phone-mic
+# room measurement are mostly position-specific interference artifacts, and
+# chasing them with EQ only helps at the exact mic spot while sounding worse
+# everywhere else. Smooth the measured shape to ~1/3 octave before inverting,
+# and cap the correction at ±6 dB (deep nulls are phase cancellation — no
+# amount of boost fills them, it just adds distortion).
+SMOOTH_BANDS = 2  # ±2 bands ≈ 1/3 octave on the 1/6-oct analysis grid
+COMP_LIMIT_DB = 6.0
 BOOST_LIMIT_LOW_HZ = 80.0
 BOOST_LIMIT_LOW_DB = 6.0
 
@@ -104,17 +112,26 @@ def _resample_to(samples: np.ndarray, src_rate: int, dst_rate: int = SWEEP_RATE)
 
 
 def _align(recording: np.ndarray, reference: np.ndarray, rate: int) -> np.ndarray:
-    """Trim everything before the sweep via envelope cross-correlation."""
-    env_ref = np.abs(reference)
-    env_rec = np.abs(recording)
-    # Downsample envelopes for a cheap, robust correlation.
-    factor = max(1, rate // 2000)
-    env_ref = env_ref[::factor]
-    env_rec = env_rec[::factor]
-    corr = np.correlate(env_rec, env_ref, mode="valid")
+    """Trim everything before the sweep via FFT cross-correlation.
+
+    The ESS exists for exactly this: its autocorrelation is a sharp pulse, so
+    the correlation peak gives a sample-accurate start lag that absorbs
+    seconds of network/decoder startup delay. (An earlier envelope-based
+    version correlated |x|, but the ESS envelope is flat — the "peak" landed
+    anywhere in the sweep, silently breaking the transfer function below.)
+    """
+    n = len(recording) + len(reference) - 1
+    nfft = 1 << (n - 1).bit_length()
+    corr = np.fft.irfft(
+        np.fft.rfft(recording, nfft) * np.conj(np.fft.rfft(reference, nfft)), nfft
+    )[: len(recording)]
     if corr.size == 0:
         return recording
-    lag = int(np.argmax(corr)) * factor
+    lag = int(np.argmax(corr))
+    peak = float(corr[lag])
+    norm = float(np.sqrt(np.sum(recording**2) * np.sum(reference**2)))
+    if norm <= 0 or peak / norm < 0.05:
+        raise ValueError("录音中未检测到扫频信号，请靠近音箱、保持安静后重试")
     return recording[lag:]
 
 
@@ -170,18 +187,26 @@ def compensation_points(
     target: str = "",
     max_points: int = 16,
 ) -> list[tuple[float, float]]:
-    """Measured response → compensation control points (target − measured)."""
-    glo, ghi = CURVE_GAIN_RANGE
+    """Measured response → compensation control points (target − measured).
+
+    The measured shape is smoothed to ~1/3 octave before inversion so the
+    correction follows broad tonal trends only, never narrow artifacts.
+    """
     tgt = target_table(target) if target else []
+    n = len(measured_gains)
+    smooth = [
+        float(np.mean(measured_gains[max(0, i - SMOOTH_BANDS) : i + SMOOTH_BANDS + 1]))
+        for i in range(n)
+    ]
     comp_freqs: list[float] = []
     comp_gains: list[float] = []
-    for f, g in zip(measured_freqs, measured_gains):
+    for f, g in zip(measured_freqs, smooth):
         desired = pchip_eval(tgt, f) if tgt else 0.0
         comp = desired - g
         if f < BOOST_LIMIT_LOW_HZ:
             # Deep-bass boosting mostly feeds room modes and distortion.
             comp = min(comp, BOOST_LIMIT_LOW_DB)
-        comp = min(ghi, max(glo, comp))
+        comp = min(COMP_LIMIT_DB, max(-COMP_LIMIT_DB, comp))
         comp_freqs.append(f)
         comp_gains.append(comp)
     return fit_points(comp_freqs, comp_gains, max_points=max_points)

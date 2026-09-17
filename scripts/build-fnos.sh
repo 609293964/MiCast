@@ -48,4 +48,11 @@ find "$STAGE_DIR/app/vendor" -type f -name '*.pyi' -delete
 )
 
 find "$STAGE_DIR" -maxdepth 1 -type f -name '*.fpk' -exec cp {} "$OUTPUT_DIR/" \;
+
+# Rename to the versioned artifact name, matching the Windows build script.
+VERSION="$(sed -n 's/^version=//p' "$STAGE_DIR/manifest" | tr -d '\r')"
+PLATFORM="$(sed -n 's/^platform=//p' "$STAGE_DIR/manifest" | tr -d '\r')"
+if [ -f "$OUTPUT_DIR/micast.fpk" ]; then
+  mv "$OUTPUT_DIR/micast.fpk" "$OUTPUT_DIR/micast-$PLATFORM-$VERSION.fpk"
+fi
 echo "fnOS package: $OUTPUT_DIR"

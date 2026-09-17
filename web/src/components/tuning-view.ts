@@ -7,7 +7,7 @@
  */
 
 import { api, type Device, type EqPresetsResponse, type SpeakerEq } from "../api";
-import { appUrl } from "../paths";
+import { appUrl, appWebSocketUrl } from "../paths";
 import { store } from "../state";
 import { CalibrationWizard } from "./calibration-wizard";
 import { EqCurveCanvas, type CurvePoint } from "./eq-curve-canvas";
@@ -22,7 +22,6 @@ const PRESET_LABELS: Record<string, string> = {
 };
 
 const TARGET_LABELS: Record<string, string> = {
-  "": "无",
   harman: "Harman 目标",
   diffuse_field: "扩散场",
 };
@@ -37,7 +36,76 @@ interface TuningState {
 
 let presetsCache: EqPresetsResponse | null = null;
 let editor: EqCurveCanvas | null = null;
+let spectrumSocket: WebSocket | null = null;
+let spectrumTimer: number | null = null; // reconnect delay or poll interval
+let spectrumGen = 0; // guards stale callbacks after a rebind
 let commitTimer: number | null = null;
+
+/** Stop the spectrum feed: socket, pending reconnect, and poll fallback. */
+function closeSpectrumSocket() {
+  spectrumGen += 1;
+  spectrumSocket?.close();
+  spectrumSocket = null;
+  if (spectrumTimer != null) {
+    window.clearTimeout(spectrumTimer);
+    window.clearInterval(spectrumTimer);
+    spectrumTimer = null;
+  }
+}
+
+/** Live spectrum: WebSocket push preferred; some webviews (WeChat) kill the
+ *  WS handshake, so after a couple of failed attempts fall back to polling
+ *  the GET twin. Any close triggers a retry, so a stale page loaded before a
+ *  backend restart recovers by itself. */
+function openSpectrumSocket(did: string) {
+  closeSpectrumSocket();
+  const gen = spectrumGen;
+  let attempts = 0;
+
+  const applyBands = (bands: number[] | null) => {
+    if (gen === spectrumGen) editor?.setSpectrum(bands);
+  };
+
+  const startPolling = () => {
+    const tick = () => {
+      if (document.hidden) return;  // background tab: the server tap idles too
+      api
+        .getSpectrum(did)
+        .then((r) => applyBands(r.bands ?? null))
+        .catch(() => undefined);
+    };
+    tick();
+    spectrumTimer = window.setInterval(tick, 500);
+  };
+
+  const connect = () => {
+    if (gen !== spectrumGen) return;
+    const socket = new WebSocket(appWebSocketUrl(`api/tuning/${encodeURIComponent(did)}/spectrum`));
+    spectrumSocket = socket;
+    socket.onopen = () => {
+      attempts = 0;
+    };
+    socket.onmessage = (ev) => {
+      try {
+        applyBands((JSON.parse(String(ev.data)) as { bands?: number[] | null }).bands ?? null);
+      } catch {
+        // Malformed frame — ignore.
+      }
+    };
+    socket.onclose = () => {
+      if (spectrumSocket === socket) spectrumSocket = null;
+      if (gen !== spectrumGen) return;
+      applyBands(null);
+      attempts += 1;
+      if (attempts <= 3) {
+        spectrumTimer = window.setTimeout(connect, 2000);
+      } else {
+        startPolling();
+      }
+    };
+  };
+  connect();
+}
 
 export function tuningViewActive(): boolean {
   return store.get().ui.tuningDid != null;
@@ -60,11 +128,12 @@ export function renderTuningView(device: Device | undefined): string {
       <button type="button" class="icon-button" data-tuning-back aria-label="返回">${"<"}</button>
       <div>
         <h2 class="page-title">调音台 · ${escapeHtml(name)}</h2>
-        <p>拖动曲线上的圆点调整；点击空白添加控制点，双击删除。松手后生效。</p>
+        <p>拖动圆点调整，点击空白添加控制点；点按圆点选中后可删除（桌面端也可双击删除）。松手后生效。</p>
       </div>
     </div>
     <div class="tuning-canvas-wrap">
       <canvas class="tuning-canvas" data-tuning-canvas aria-label="EQ 曲线编辑器"></canvas>
+      <button type="button" class="point-delete-chip" data-point-delete hidden>删除控制点</button>
     </div>
     <div class="tuning-toolbar">
       <label class="tuning-target">
@@ -97,18 +166,11 @@ export function renderTuningView(device: Device | undefined): string {
       </button>
       <div class="tuning-advanced-body" data-tuning-advanced-body ${advancedOpen ? "" : "hidden"}>
         <div class="tuning-toolbar">
-          <label class="tuning-target" title="标准曲线：不是你的当前曲线，只是叠加在画布上的参考虚线，不改变声音">
-            <span class="caption">目标曲线</span>
-            <select data-tuning-target aria-label="目标曲线">
-              ${Object.entries(TARGET_LABELS)
-                .map(
-                  ([key, label]) =>
-                    `<option value="${key}" ${(eq?.target ?? "") === key ? "selected" : ""}>${label}</option>`
-                )
-                .join("")}
-            </select>
+          <label class="tuning-target" title="叠加在画布背后的参考虚线：不是你的当前曲线，不改变声音">
+            <span class="caption">参考曲线</span>
+            <select data-tuning-target aria-label="参考曲线"></select>
           </label>
-          <span class="caption tuning-hint">标准曲线，仅参考，不改变声音</span>
+          <span class="caption tuning-hint">仅叠加显示作参考，不改变声音</span>
           <button type="button" class="button secondary" data-tuning-calibrate>自动校准<span class="tuning-badge">实验性</span></button>
         </div>
         <div class="tuning-toolbar">
@@ -132,11 +194,11 @@ export function renderTuningView(device: Device | undefined): string {
         </div>
         <p class="caption ab-status" data-ab-status></p>
         <div class="ab-actions">
-          <button type="button" class="button primary" data-ab-start>开始</button>
+          <button type="button" class="button plain" data-ab-close>关闭</button>
           <button type="button" class="button secondary" data-ab-listen-a hidden>听 A</button>
           <button type="button" class="button secondary" data-ab-listen-b hidden>听 B</button>
           <button type="button" class="button secondary" data-ab-reveal hidden>揭示</button>
-          <button type="button" class="button plain" data-ab-close>关闭</button>
+          <button type="button" class="button primary" data-ab-start>开始</button>
         </div>
       </div>
     </div>
@@ -149,6 +211,7 @@ export function renderTuningView(device: Device | undefined): string {
 export function bindTuningView(container: HTMLElement, onClose: () => void) {
   editor?.destroy();
   editor = null;
+  closeSpectrumSocket();
   const did = store.get().ui.tuningDid;
   if (!did) return;
   const device = store.get().devices.find((d) => d.did === did);
@@ -180,6 +243,8 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
   container.querySelector<HTMLElement>("[data-tuning-back]")?.addEventListener("click", () => {
     wizard?.destroy();
     wizard = null;
+    closeSpectrumSocket();
+    editor?.setSpectrum(null);
     onClose();
   });
 
@@ -251,13 +316,58 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
 
   const markCurve = () => refreshCurveSelect();
 
+  /** Reference overlay: built-in targets, or any curve from the library. */
+  const resolveReference = (key: string): CurvePoint[] | null => {
+    if (!key) return null;
+    const toPoints = (gains: [number, number][]) =>
+      gains.map(([freq, gain]) => ({ freq, gain }));
+    if (presetsCache?.targets[key]) return toPoints(presetsCache.targets[key]);
+    if (key.startsWith("saved:")) {
+      const gains = presetsCache?.saved?.[key.slice(6)];
+      return gains ? toPoints(gains) : null;
+    }
+    if (key.startsWith("preset:")) {
+      const gains = presetsCache?.presets[key.slice(7)];
+      return gains ? toPoints(gains) : null;
+    }
+    return null;
+  };
+
   const applyTarget = (key: string) => {
-    const pts = key && presetsCache?.targets[key]
-      ? presetsCache.targets[key].map(([freq, gain]) => ({ freq, gain }))
-      : key === "flat"
-        ? []
-        : undefined;
-    editor?.setTarget(pts && pts.length ? pts : key ? [] : undefined);
+    editor?.setTarget(resolveReference(key) ?? undefined);
+  };
+
+  /** Same library as the curve picker, plus the built-in standard targets. */
+  const refreshTargetSelect = () => {
+    if (!targetSelect) return;
+    const option = (value: string, label: string) =>
+      `<option value="${escapeHtml(value)}" ${value === state.target ? "selected" : ""}>${escapeHtml(label)}</option>`;
+    const group = (label: string, options: string) =>
+      options ? `<optgroup label="${label}">${options}</optgroup>` : "";
+    targetSelect.innerHTML =
+      option("", "无") +
+      group(
+        "标准目标",
+        Object.entries(TARGET_LABELS)
+          .map(([k, label]) => option(k, label))
+          .join("")
+      ) +
+      group(
+        "我的曲线",
+        Object.keys(presetsCache?.saved ?? {})
+          .map((name) => option(`saved:${name}`, name))
+          .join("")
+      ) +
+      group(
+        "系统预设",
+        Object.keys(PRESET_LABELS)
+          // harman 同时是标准目标和预设（同一条曲线）——只在标准目标里出现。
+          .filter((k) => presetsCache?.presets[k] && !(k in TARGET_LABELS))
+          .map((k) => option(`preset:${k}`, PRESET_LABELS[k]))
+          .join("")
+      );
+    // A since-deleted reference collapses to 无.
+    if (targetSelect.value !== state.target) targetSelect.value = "";
   };
 
   // ---- backend sync (never a full re-render, so an open drag survives) ----
@@ -278,6 +388,7 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
     editor?.setPoints(state.points);
     applyTarget(state.target);
     markCurve();
+    refreshTargetSelect();
   };
 
   const postCurve = () =>
@@ -318,16 +429,40 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
   // ---- canvas ----
 
   if (canvas) {
+    const deleteChip = container.querySelector<HTMLButtonElement>("[data-point-delete]");
     editor = new EqCurveCanvas(canvas, {
       points: state.points,
       freqRange: [20, 20000],
       gainRange: [-12, 12],
       onCommit: (points) => {
         state.points = points;
-        markCurve();
+        // A hand edit detaches the curve from whichever preset it started
+        // as — clear the tag BEFORE marking, or the select keeps showing
+        // the preset name over a modified curve.
         state.preset = "";
+        markCurve();
         save();
       },
+      onSelect: (index) => {
+        if (!deleteChip || !editor) return;
+        const pos = index !== null ? editor.pointPosition(index) : null;
+        if (index === null || !pos) {
+          deleteChip.hidden = true;
+          return;
+        }
+        deleteChip.hidden = false;
+        deleteChip.dataset.index = String(index);
+        // Float above the point, clamped into the canvas frame.
+        const w = deleteChip.offsetWidth || 88;
+        const x = Math.max(4, Math.min(pos.x - w / 2, canvas.clientWidth - w - 4));
+        deleteChip.style.left = `${x}px`;
+        deleteChip.style.top = `${Math.max(4, pos.y - 44)}px`;
+      },
+    });
+    deleteChip?.addEventListener("click", () => {
+      const index = Number(deleteChip.dataset.index);
+      if (editor && Number.isInteger(index)) editor.deletePoint(index);
+      deleteChip.hidden = true;
     });
     // Presets/targets/library arrive async; apply once loaded.
     if (!presetsCache) {
@@ -337,13 +472,16 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
           presetsCache = r;
           applyTarget(state.target);
           refreshCurveSelect();
+          refreshTargetSelect();
         })
         .catch(() => undefined);
     } else {
       applyTarget(state.target);
     }
+    openSpectrumSocket(state.did);
   }
   refreshCurveSelect();
+  refreshTargetSelect();
 
   // ---- primary controls ----
 
@@ -380,14 +518,9 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
   });
 
   targetSelect?.addEventListener("change", () => {
-    const key = targetSelect.value;
-    const pts = key && presetsCache?.targets[key]
-      ? presetsCache.targets[key].map(([freq, gain]) => ({ freq, gain }))
-      : key
-        ? []
-        : undefined;
-    editor?.setTarget(key === "" ? undefined : (pts ?? []));
-    save({ target: key });
+    state.target = targetSelect.value;
+    applyTarget(state.target);
+    save();
   });
 
   curveSelect?.addEventListener("change", () => {
@@ -398,6 +531,7 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
   const applyCurveList = (curves: Record<string, [number, number][]>) => {
     presetsCache = { ...(presetsCache ?? { presets: {}, targets: {}, freq_range: [20, 20000], gain_range: [-12, 12] }), saved: curves };
     refreshCurveSelect();
+    refreshTargetSelect();
   };
 
   curveSaveBtn?.addEventListener("click", async () => {

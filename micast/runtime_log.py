@@ -42,6 +42,10 @@ def install_runtime_log() -> None:
     if runtime_logs not in root.handlers:
         root.addHandler(runtime_logs)
     root.setLevel(min(root.level or logging.INFO, logging.INFO))
+    # miservice logs every cloud request at INFO — that is every poll of
+    # device_list and every ubus command, which drowns real events in the
+    # diagnostics view. Warnings and errors still come through.
+    logging.getLogger("miservice").setLevel(logging.WARNING)
 
 
 def install_asyncio_exception_filter(loop) -> None:

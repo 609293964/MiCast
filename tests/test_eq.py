@@ -4,7 +4,7 @@ import pytest
 from test_topology import FakeBridge, FakeDeviceManager, _latency, _raop_diag
 
 from micast import topology
-from micast.config import EQ_BANDS_HZ, ReceiverConfig, Settings, SpeakerConfig, SpeakerGroupConfig
+from micast.config import EQ_BANDS_HZ, EqPoint, ReceiverConfig, Settings, SpeakerConfig, SpeakerGroupConfig
 from micast.curve_fit import (
     CURVE_FREQ_RANGE,
     NIGHT_ATTENUATION,
@@ -344,3 +344,16 @@ def test_curve_library_save_rename_delete(cfg):
     assert list(cfg.list_saved_curves()) == ["客厅"]
     cfg.delete_saved_curve("客厅")
     assert cfg.list_saved_curves() == {}
+
+
+def test_curve_library_survives_save_and_load(tmp_path, monkeypatch):
+    """The library must round-trip through micast.json — a save_to_file that
+    drops saved_curves silently wipes user curves on restart/uninstall."""
+    monkeypatch.setenv("MICAST_DATA_DIR", str(tmp_path))
+    first = Settings()
+    first.save_curve("客厅低音", [(100.0, 4.0), (1000.0, -1.0)])
+
+    second = Settings()
+    second.load_from_file()
+    assert second.list_saved_curves() == {"客厅低音": [(100.0, 4.0), (1000.0, -1.0)]}
+    assert all(isinstance(p, EqPoint) for p in second.saved_curves["客厅低音"])

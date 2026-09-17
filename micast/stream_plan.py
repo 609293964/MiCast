@@ -121,9 +121,20 @@ class PlanDiff:
     """The classified difference between two plan snapshots."""
 
     full_restart_required: bool = False
-    classic_added_removed: bool = False
-    classic_rebuild: bool = False
+    # Classic entries added or removed (a rename is remove+add: the name lives
+    # in the mDNS advertisement). Scoped per entry — the RAOP layer starts and
+    # stops individual receivers, so untouched entries keep their sessions.
+    classic_added: set[str] = field(default_factory=set)
+    classic_removed: set[str] = field(default_factory=set)
+    # Classic entries whose stream topology changed (variants, channels,
+    # membership, target): rebuild only these entries' pipelines.
+    classic_rebuild: set[str] = field(default_factory=set)
     audio_only: bool = False
+    # Entries whose streams keep the same shape but whose sound changed (EQ
+    # curve, loudness, per-speaker gain, global audio format): restart only the
+    # encoder stage. The PCM source (a live AirPlay 2 session!) and the
+    # speakers' stream endpoints stay up, so retuning never drops a cast.
+    encoder_restart: set[str] = field(default_factory=set)
     airplay2_added: set[str] = field(default_factory=set)
     airplay2_removed: set[str] = field(default_factory=set)
     airplay2_rebuild: set[str] = field(default_factory=set)
@@ -134,13 +145,19 @@ class PlanDiff:
     delay_only: bool = False
 
     @property
+    def classic_added_removed(self) -> bool:
+        return bool(self.classic_added or self.classic_removed)
+
+    @property
     def noop(self) -> bool:
         return not any(
             (
                 self.full_restart_required,
-                self.classic_added_removed,
+                self.classic_added,
+                self.classic_removed,
                 self.classic_rebuild,
                 self.audio_only,
+                self.encoder_restart,
                 self.airplay2_added,
                 self.airplay2_removed,
                 self.airplay2_rebuild,
@@ -157,11 +174,45 @@ def _group_structure(group: dict[str, Any] | None) -> dict[str, Any] | None:
 
     Anchor is excluded: re-anchoring shifts the delay reference frame but
     keeps physical timing (update_group re-anchors offsets), and holds are
-    applied live. Mode/membership/channel/EQ/gain all reshape streams.
+    applied live. Mode/membership/channel reshape streams; EQ/loudness/gain
+    only change how the encoder colors the audio and are diffed separately
+    (see ``_group_character``).
     """
     if group is None:
         return None
-    return {"id": group["id"], "mode": group["mode"], "speakers": group["speakers"]}
+    return {
+        "id": group["id"],
+        "mode": group["mode"],
+        "speakers": [
+            {"did": speaker["did"], "channel": speaker["channel"]}
+            for speaker in group["speakers"]
+        ],
+    }
+
+
+def _group_character(group: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Per-speaker sound color (EQ/loudness/gain): encoder-restart territory."""
+    if group is None:
+        return []
+    return [
+        {
+            "did": speaker["did"],
+            "eq": speaker["eq"],
+            "loudness": speaker["loudness"],
+            "gain_db": speaker["gain_db"],
+        }
+        for speaker in group["speakers"]
+    ]
+
+
+def _variants_structure(variants: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
+    """Stream topology: which endpoints exist, on which channel.
+
+    EQ content is stripped: an EQ edit keeps every ``-q{n}`` suffix in place
+    and must not tear down the pipelines. (Flat↔EQ'd transitions DO change
+    the suffix set and correctly stay structural.)
+    """
+    return sorted((v["suffix"], v["base"], v["channel"] or "") for v in variants)
 
 
 def diff_plans(old: PlanSnapshot | None, new: PlanSnapshot) -> PlanDiff:
@@ -177,12 +228,12 @@ def diff_plans(old: PlanSnapshot | None, new: PlanSnapshot) -> PlanDiff:
         if old_entries[entry_id]["kind"] == "airplay2":
             diff.airplay2_removed.add(entry_id)
         else:
-            diff.classic_added_removed = True
+            diff.classic_removed.add(entry_id)
     for entry_id in sorted(new_entries.keys() - old_entries.keys()):
         if new_entries[entry_id]["kind"] == "airplay2":
             diff.airplay2_added.add(entry_id)
         else:
-            diff.classic_added_removed = True
+            diff.classic_added.add(entry_id)
 
     delays_moved = False
     for entry_id in sorted(old_entries.keys() & new_entries.keys()):
@@ -196,25 +247,34 @@ def diff_plans(old: PlanSnapshot | None, new: PlanSnapshot) -> PlanDiff:
 
         hard = (
             o["target"] != n["target"]
-            or o["variants"] != n["variants"]
+            or _variants_structure(o["variants"]) != _variants_structure(n["variants"])
             or _group_structure(og) != _group_structure(ng)
             or (og is None) != (ng is None)
         )
+        character = (
+            o["variants"] != n["variants"]
+            or _group_character(og) != _group_character(ng)
+        )
         audio = o["audio"] != n["audio"]
+        if audio:
+            diff.audio_only = True
         if o["name"] != n["name"]:
             # The name is broadcast by the discovery layer itself (RAOP mDNS /
             # orchestrator), not the pipelines — a rename re-publishes the entry.
             if n["kind"] == "receiver":
-                diff.classic_added_removed = True
+                diff.classic_removed.add(entry_id)
+                diff.classic_added.add(entry_id)
             else:
                 diff.airplay2_rebuild.add(entry_id)
         if n["kind"] == "receiver":
             if hard:
-                diff.classic_rebuild = True
-            elif audio:
-                diff.audio_only = True
-        elif hard or audio:
+                diff.classic_rebuild.add(entry_id)
+            elif character or audio:
+                diff.encoder_restart.add(entry_id)
+        elif hard:
             diff.airplay2_rebuild.add(entry_id)
+        elif character or audio:
+            diff.encoder_restart.add(entry_id)
         if (
             o["external_airplay"] != n["external_airplay"]
             or o["network_channels"] != n["network_channels"]
@@ -234,6 +294,7 @@ def diff_plans(old: PlanSnapshot | None, new: PlanSnapshot) -> PlanDiff:
         and not diff.classic_added_removed
         and not diff.classic_rebuild
         and not diff.audio_only
+        and not diff.encoder_restart
         and not diff.airplay2_added
         and not diff.airplay2_removed
         and not diff.airplay2_rebuild

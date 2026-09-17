@@ -30,6 +30,9 @@ PLAY_ERROR_RETRY_SECONDS = 30.0
 # existing 15-second restore guard.
 STATUS_CHECK_INTERVAL_SECONDS = 5.0
 
+# Cloud device-list cache; see DeviceManager._devices_fetched_at.
+DEVICE_LIST_CACHE_SECONDS = 30.0
+
 
 class DeviceManager:
     """Manages Xiaomi speakers, aliases, enabled targets, and playback."""
@@ -38,6 +41,11 @@ class DeviceManager:
         self.auth = auth
         self._service = None
         self._devices: list[dict] = []
+        # device_list hits Xiaomi's cloud; the 诊断 page alone would otherwise
+        # hammer it every 1.5s and get the account throttled (devices then
+        # "vanish"). Serve the cached list within the TTL; callers needing
+        # ground truth (post-login, explicit refresh) pass force=True.
+        self._devices_fetched_at = 0.0
         self._watchdog_tasks: dict[str, asyncio.Task] = {}
         self._playing: set[str] = set()
         self._paused: set[str] = set()
@@ -109,9 +117,13 @@ class DeviceManager:
             self._service = service
         return self._service is not None
 
-    async def list_devices(self) -> list[dict]:
+    async def list_devices(self, force: bool = False) -> list[dict]:
         _, account_id = self.auth.stored_identity()
         settings.bind_provider_account(account_id)
+        if not force and self._devices and (
+            time.monotonic() - self._devices_fetched_at < DEVICE_LIST_CACHE_SECONDS
+        ):
+            return self._devices
         if not await self.refresh_service():
             return []
         api = MinaAPI(self._service, "")
@@ -125,6 +137,7 @@ class DeviceManager:
                 self._devices = []
                 raise XiaomiAuthError("小米登录已失效，请重新登录") from exc
             raise
+        self._devices_fetched_at = time.monotonic()
         settings.merge_speakers(self._devices)
         return self._devices
 

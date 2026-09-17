@@ -158,6 +158,9 @@ function renderNetworkTargets(group: SpeakerGroup): string {
 
 /** Create-form picker: every discovered device, as checkboxes. */
 function createFormPickerInner(): string {
+  if (!store.get().fullConfig?.network_discovery_enabled) {
+    return "";  // discovery off: no network section, no hint — keep the form quiet
+  }
   if (networkDevices === null) {
     return `<span class="caption">正在搜索网络中的播放设备…</span>`;
   }
@@ -190,6 +193,12 @@ function bindNetworkSections(container: HTMLElement) {
 
   const fresh = networkDevices !== null && Date.now() - networkDevicesFetchedAt < NETWORK_DEVICES_TTL_MS;
   if (fresh) {
+    fill();
+    return;
+  }
+  // Discovery off: render attached devices from config, never hit the network.
+  if (!store.get().fullConfig?.network_discovery_enabled) {
+    networkDevices = { airplay: [], dlna: [] };
     fill();
     return;
   }

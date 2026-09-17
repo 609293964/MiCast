@@ -70,7 +70,6 @@ export function renderTopologyView(): string {
       </div>
       <div class="topology-empty" data-topology-empty hidden>
         <div class="topology-empty-title">等待播放</div>
-        <div class="topology-empty-hint">开始投放后显示实时链路</div>
       </div>
       <div class="topology-detail" data-topology-detail hidden></div>
     </div>

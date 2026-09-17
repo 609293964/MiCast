@@ -58,12 +58,23 @@ jobs:
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           if (-not $ok) { throw "MiCast.exe did not answer /health within 80s" }
 
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $files = @("dist\MiCast-Portable.zip", "dist\installer\MiCast-Setup.exe")
+          $lines = foreach ($f in $files) {
+            $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            "$h  $(Split-Path $f -Leaf)"
+          }
+          $lines | Set-Content -Encoding ascii dist\SHA256SUMS-windows.txt
+
       - uses: actions/upload-artifact@v7
         with:
           name: MiCast-windows
           path: |
             dist/MiCast-Portable.zip
             dist/installer/MiCast-Setup.exe
+            dist/SHA256SUMS-windows.txt
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -72,3 +83,4 @@ jobs:
           files: |
             dist/MiCast-Portable.zip
             dist/installer/MiCast-Setup.exe
+            dist/SHA256SUMS-windows.txt

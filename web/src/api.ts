@@ -545,8 +545,8 @@ export const api = {
     });
   },
 
-  getDevices(): Promise<Device[]> {
-    return apiFetch("/api/devices");
+  getDevices(refresh = false): Promise<Device[]> {
+    return apiFetch(refresh ? "/api/devices?refresh=1" : "/api/devices");
   },
 
   getEqPresets(): Promise<EqPresetsResponse> {
@@ -629,6 +629,10 @@ export const api = {
 
   exportGraphicEq(did: string): Promise<{ did: string; graphic_eq: string; points: [number, number][] }> {
     return apiFetch(`/api/tuning/${encodeURIComponent(did)}/export`);
+  },
+
+  getSpectrum(did: string): Promise<{ bands: number[] | null }> {
+    return apiFetch(`/api/tuning/${encodeURIComponent(did)}/spectrum`);
   },
 
   importGraphicEq(did: string, text: string): Promise<{ did: string } & SpeakerEq> {

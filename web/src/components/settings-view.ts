@@ -292,13 +292,6 @@ export function renderSettingsView(props: SettingsProps): string {
         </div>
         <input type="checkbox" class="switch" id="airplay2-enabled" ${airplay2Enabled ? "checked" : ""} ${airplay2Available ? "" : "disabled"} aria-label="开启 AirPlay 2">
       </div>
-      <div class="cell">
-        <div class="cell-content">
-          <span class="cell-title">网络发现 <span class="feature-badge">实验性</span></span>
-          <span class="cell-subtitle">扫描局域网中的 AirPlay / DLNA 播放设备；关闭后停止一切网络探测，也无法再投放到外部设备</span>
-        </div>
-        <input type="checkbox" class="switch" id="network-discovery-enabled" ${config?.network_discovery_enabled ? "checked" : ""} aria-label="开启网络发现">
-      </div>
       ${airplay2Available && airplay2Enabled ? `<button class="cell settings-link" type="button" data-open-airplay2>
         <div class="cell-icon blue">${icon("airplay")}</div>
         <div class="cell-content">
@@ -307,6 +300,13 @@ export function renderSettingsView(props: SettingsProps): string {
         </div>
         <span class="settings-link-arrow" aria-hidden="true">›</span>
       </button>` : ""}
+      <div class="cell">
+        <div class="cell-content">
+          <span class="cell-title">网络发现 <span class="feature-badge">实验性</span></span>
+          <span class="cell-subtitle">扫描局域网中的 AirPlay / DLNA 播放设备；关闭后停止一切网络探测，也无法再投放到外部设备</span>
+        </div>
+        <input type="checkbox" class="switch" id="network-discovery-enabled" ${config?.network_discovery_enabled ? "checked" : ""} aria-label="开启网络发现">
+      </div>
     </div>
 
     <p class="footnote" style="margin: var(--space-md) var(--space-lg);">修改会自动保存，并在当前音频输出中重新应用。</p>
@@ -329,30 +329,28 @@ function renderPortRow(p: PortStatus): string {
   const actual = portActualText(p);
   const stateClass = p.status === "error" ? "error" : p.status === "listening" ? "success" : "";
   const stateText = p.status === "error" ? "异常" : p.status === "listening" ? `监听中${actual ? ` · ${actual}` : ""}` : p.status === "hosted" ? "已托管" : "未启用";
-  if (!p.editable) {
-    return `
-      <div class="cell">
-        <div class="cell-content">
-          <span class="cell-title">${escapeHtml(p.name)} <span class="feature-badge">${portModeLabels[p.mode]}</span></span>
-          <span class="cell-subtitle">${escapeHtml(p.detail)}</span>
-        </div>
-        <span class="plain-state ${stateClass}">${stateText}</span>
-      </div>
-    `;
-  }
+  // Only render the slots this row actually needs: non-editable rows are a
+  // plain right-aligned status (like the toggle rows above); editable rows
+  // add a wide-enough input; 恢复 appears only for custom ports.
+  const inputSlot = p.editable
+    ? `<input type="number" class="input settings-number" data-port-input="${p.id}" min="1024" max="65535"
+          placeholder="${p.preferred ?? ""}" value="${p.mode === "custom" ? p.preferred ?? "" : ""}"
+          data-committed="${p.mode === "custom" ? p.preferred ?? "" : ""}"
+          aria-label="${escapeHtml(p.name)}首选端口">`
+    : "";
+  const actionSlot = p.editable && p.mode === "custom"
+    ? `<button class="button compact secondary" type="button" data-port-reset="${p.id}">恢复</button>`
+    : "";
   return `
-    <div class="cell">
+    <div class="cell port-row">
       <div class="cell-content">
         <span class="cell-title">${escapeHtml(p.name)} <span class="feature-badge">${portModeLabels[p.mode]}</span></span>
         <span class="cell-subtitle">${escapeHtml(p.detail)}</span>
       </div>
-      <div class="settings-inline-control">
+      <div class="port-control">
         <span class="plain-state ${stateClass}" data-port-status="${p.id}" aria-live="polite">${stateText}</span>
-        <input type="number" class="input settings-number" data-port-input="${p.id}" min="1024" max="65535"
-          placeholder="${p.preferred ?? ""}" value="${p.mode === "custom" ? p.preferred ?? "" : ""}"
-          aria-label="${escapeHtml(p.name)}首选端口">
-        ${p.mode === "custom" ? `<button class="button compact secondary" type="button" data-port-reset="${p.id}">恢复</button>` : ""}
-        <button class="button compact secondary" type="button" data-port-save="${p.id}">保存</button>
+        ${inputSlot}
+        ${actionSlot ? `<span class="port-actions">${actionSlot}</span>` : ""}
       </div>
     </div>
   `;
@@ -632,15 +630,19 @@ export function bindSettingsView(
       store.showToast(`保存失败: ${e instanceof Error ? e.message : "未知错误"}`);
     }
   };
-  container.querySelectorAll<HTMLElement>("[data-port-save]").forEach((el) => {
-    el.addEventListener("click", () => {
-      const id = el.dataset.portSave ?? "";
-      const input = container.querySelector<HTMLInputElement>(`[data-port-input="${id}"]`);
-      const raw = input?.value.trim() ?? "";
+  // Port inputs auto-save on commit (change fires on blur/Enter) — no save
+  // button; an unchanged value or a failed validation never hits the server.
+  container.querySelectorAll<HTMLInputElement>("[data-port-input]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const id = input.dataset.portInput ?? "";
+      const raw = input.value.trim();
       if (raw && !/^\d+$/.test(raw)) {
         store.showToast("端口必须是 1024-65535 的数字");
+        input.value = input.dataset.committed ?? "";
         return;
       }
+      if (raw === (input.dataset.committed ?? "")) return;
+      input.dataset.committed = raw;
       void applyPortChange(id, raw ? Number(raw) : null);
     });
   });

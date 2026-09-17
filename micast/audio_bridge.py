@@ -38,7 +38,7 @@ class AudioBridge:
         self._airplay2_runtime: dict[str, dict] = {}
         self._airplay2_sources: dict[str, PCMSource] = {}
         self._airplay2_tees: dict[str, PCMTee] = {}
-        self._tees: list[PCMTee] = []
+        self._tees: dict[str, PCMTee] = {}
         self._running = False
         self._status = "idle"
         self._error_count = 0
@@ -191,6 +191,10 @@ class AudioBridge:
             for p in self._pipelines.values()
         ]
 
+    def pipeline_for_stream(self, stream_id: str) -> "SpeakerPipeline | None":
+        """The pipeline feeding a stream id (classic or AirPlay 2), if any."""
+        return self._pipelines.get(stream_id) or self._airplay2_pipelines.get(stream_id)
+
     def _orchestration_status(self) -> dict:
         if settings.airplay_engine == "local":
             return {
@@ -312,23 +316,43 @@ class AudioBridge:
 
     async def _apply_plan_diff(self, diff: PlanDiff) -> None:
         """Dispatch a plan diff to the narrowest rebuild path. Lock held."""
-        if diff.full_restart_required or diff.classic_added_removed:
+        if diff.full_restart_required:
+            await self._restart_engine_locked()
+            return
+        if diff.classic_added_removed and settings.airplay_engine != "local":
+            # The orchestrator engine has no per-entry lifecycle — restart it.
             await self._restart_engine_locked()
             return
 
         audio_hook = False
         if settings.airplay_engine == "local":
-            if diff.classic_rebuild:
-                await self._rebuild_pipelines_locked()
+            if diff.classic_added_removed:
+                await self._reconcile_classic_entries_locked(diff)
                 audio_hook = True
-            elif diff.audio_only:
-                logger.info("Restarting audio encoders for config change")
-                for pipeline in self._pipelines.values():
-                    try:
-                        await pipeline.restart_encoder()
-                    except Exception:
-                        logger.exception("Failed to restart pipeline %s", pipeline.device_id)
-                        self._error_count += 1
+            if diff.classic_rebuild:
+                await self._rebuild_classic_entries_locked(diff.classic_rebuild)
+                audio_hook = True
+
+        encoder_restart = set(diff.encoder_restart)
+        # Entries already rebuilt or re-created above got fresh encoders.
+        encoder_restart -= diff.classic_rebuild | diff.classic_added | diff.classic_removed
+        if encoder_restart:
+            logger.info(
+                "Restarting encoders for EQ/audio change: %s", sorted(encoder_restart)
+            )
+            pipelines = {**self._pipelines, **self._airplay2_pipelines}
+            for key, pipeline in pipelines.items():
+                if _stream_owner(key, sorted(encoder_restart)) is None:
+                    continue
+                try:
+                    await pipeline.restart_encoder()
+                except Exception:
+                    logger.exception("Failed to restart encoder %s", key)
+                    self._error_count += 1
+            if diff.audio_only:
+                # Codec/format changed under live connections; speakers must
+                # reconnect to pick up the new stream. EQ-only edits keep the
+                # endpoint (and any live AirPlay 2 session) untouched.
                 audio_hook = True
 
         if diff.airplay2_added or diff.airplay2_removed:
@@ -381,7 +405,7 @@ class AudioBridge:
             }:
                 await self._rebuild_airplay2_instances_locked({entry_id})
             elif settings.airplay_engine == "local":
-                await self._rebuild_pipelines_locked()
+                await self._rebuild_classic_entries_locked({entry_id})
             tap = self._target_taps.get(entry_id)
         if tap is None:
             return
@@ -674,8 +698,8 @@ class AudioBridge:
             tap = self._target_taps.get(receiver.id)
             if tap is None and target_ids:
                 # No PCM tap exists yet (the group had no targets when its
-                # pipelines were built) — rebuild once to create it.
-                await self.rebuild_pipelines()
+                # pipelines were built) — rebuild this entry to create it.
+                await self._rebuild_entry_for_tap(receiver.id)
                 tap = self._target_taps.get(receiver.id)
             if tap is None:
                 continue
@@ -922,7 +946,7 @@ class AudioBridge:
         if len(variants) > 1 or wants_tap:
             tee = PCMTee(item.server.pcm_reader, outputs=len(variants) + (1 if wants_tap else 0))
             tee.start()
-            self._tees.append(tee)
+            self._tees[item.id] = tee
             readers = tee.outputs
         if wants_tap:
             self._target_taps[item.id] = readers[-1]
@@ -1006,10 +1030,7 @@ class AudioBridge:
                 logger.exception("Failed to rebuild pipeline for %s", item.id)
                 self._error_count += 1
         # Drop endpoints that no longer exist (e.g. -L/-R after stereo→mirror).
-        active_stream_ids = set(self._pipelines) | set(self._airplay2_pipelines)
-        for stream_id in self._stream_server.stream_ids():
-            if stream_id not in active_stream_ids:
-                self._stream_server.unregister_stream(stream_id)
+        self._gc_dead_streams()
         self._plan = compute_plan(settings)
 
     async def _local_session_start(self, receiver_id: str, resume: bool = False) -> None:
@@ -1057,7 +1078,8 @@ class AudioBridge:
         if is_airplay2:
             await self._rebuild_airplay2_instances({entry_id})
         elif settings.airplay_engine == "local":
-            await self.rebuild_pipelines()
+            async with self._restart_lock:
+                await self._rebuild_classic_entries_locked({entry_id})
 
     async def _start_entry_targets(self, entry_id: str, *, resume: bool) -> None:
         """Start the external AirPlay/DLNA members of an entry's group.
@@ -1224,9 +1246,92 @@ class AudioBridge:
             except Exception:
                 logger.exception("Error stopping pipeline for %s", pipeline.device_id)
         self._pipelines.clear()
-        for tee in self._tees:
+        for tee in self._tees.values():
             await tee.stop()
         self._tees.clear()
+
+    async def _stop_classic_entry_pipelines(
+        self, entry_id: str, keep_streams: bool = False
+    ) -> None:
+        """Stop one entry's pipelines and PCM tee, leaving every other entry
+        (and its phone sessions) running."""
+        stream_ids = [
+            key
+            for key in self._pipelines
+            if key == entry_id or key.startswith(f"{entry_id}-")
+        ]
+        for stream_id in stream_ids:
+            pipeline = self._pipelines.pop(stream_id, None)
+            if not pipeline:
+                continue
+            try:
+                await pipeline.stop(keep_stream=keep_streams)
+            except Exception:
+                logger.exception("Error stopping pipeline for %s", stream_id)
+        tee = self._tees.pop(entry_id, None)
+        if tee:
+            try:
+                await tee.stop()
+            except Exception:
+                logger.exception("Error stopping PCM tee for %s", entry_id)
+        self._target_taps.pop(entry_id, None)
+
+    def _gc_dead_streams(self) -> None:
+        """Drop registered endpoints no pipeline serves any more."""
+        active_stream_ids = set(self._pipelines) | set(self._airplay2_pipelines)
+        for stream_id in self._stream_server.stream_ids():
+            if stream_id not in active_stream_ids:
+                self._stream_server.unregister_stream(stream_id)
+
+    async def _reconcile_classic_entries_locked(self, diff: PlanDiff) -> None:
+        """Apply classic receiver add/remove/rename without touching the rest.
+
+        The RAOP layer diffs its own receiver set (stopping only removed or
+        renamed servers), so unrelated receivers keep their sessions; only the
+        affected entries' pipelines and stream endpoints are torn down and
+        re-created. Lock held.
+        """
+        logger.info(
+            "Reconciling classic receivers: +%s -%s",
+            sorted(diff.classic_added),
+            sorted(diff.classic_removed),
+        )
+        desired = [(item.id, item.name) for item in settings.active_receivers()]
+        await self._local_provider.start(
+            desired,
+            settings.effective_stream_host,
+            self._local_session_start,
+            self._local_session_stop,
+            self._local_volume,
+        )
+        for entry_id in sorted(diff.classic_removed):
+            await self._stop_classic_entry_pipelines(entry_id)
+        for entry_id in sorted(diff.classic_added):
+            item = self._local_provider.receivers.get(entry_id)
+            if not item or item.status != "running" or not item.server:
+                continue
+            try:
+                await self._create_local_pipelines(item)
+            except Exception:
+                logger.exception("Failed to create pipelines for %s", entry_id)
+                self._error_count += 1
+        self._gc_dead_streams()
+
+    async def _rebuild_classic_entries_locked(self, entry_ids: set[str]) -> None:
+        """Rebuild only the given entries' pipelines, keeping stream endpoints
+        registered so connected speakers do not get disconnected. Lock held."""
+        logger.info("Rebuilding pipelines for entries: %s", sorted(entry_ids))
+        for entry_id in sorted(entry_ids):
+            await self._stop_classic_entry_pipelines(entry_id, keep_streams=True)
+            item = self._local_provider.receivers.get(entry_id)
+            if not item or item.status != "running" or not item.server:
+                continue
+            try:
+                await self._create_local_pipelines(item)
+            except Exception:
+                logger.exception("Failed to rebuild pipeline for %s", entry_id)
+                self._error_count += 1
+        self._gc_dead_streams()
 
     async def _stop_airplay2_pipelines(self) -> None:
         instance_ids = (
@@ -1377,12 +1482,16 @@ def _diff_summary(diff: PlanDiff) -> str:
     parts = []
     if diff.full_restart_required:
         parts.append("full-restart")
-    if diff.classic_added_removed:
-        parts.append("classic-set")
+    if diff.classic_added:
+        parts.append(f"classic+{sorted(diff.classic_added)}")
+    if diff.classic_removed:
+        parts.append(f"classic-{sorted(diff.classic_removed)}")
     if diff.classic_rebuild:
-        parts.append("classic-rebuild")
+        parts.append(f"classic-rebuild{sorted(diff.classic_rebuild)}")
     if diff.audio_only:
         parts.append("audio-format")
+    if diff.encoder_restart:
+        parts.append(f"encoder-restart{sorted(diff.encoder_restart)}")
     if diff.airplay2_added:
         parts.append(f"airplay2+{sorted(diff.airplay2_added)}")
     if diff.airplay2_removed:

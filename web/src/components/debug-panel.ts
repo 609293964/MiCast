@@ -73,7 +73,13 @@ let activeTestSession = "";
 let debugTestBusy: "upload" | "start" | "stop" | "tts" | "" = "";
 
 function selectedTestDeviceIds(state: State, debug: DebugState | null): string[] {
-  const key = debugTargetKey || (debug?.selected_device_id ? `speaker:${debug.selected_device_id}` : "");
+  // The select visually falls back to its first option when nothing matches —
+  // mirror that here, or the start button stays disabled until the user
+  // re-picks the device the dropdown already shows.
+  const key =
+    debugTargetKey ||
+    (debug?.selected_device_id ? `speaker:${debug.selected_device_id}` : "") ||
+    (debug?.devices.length ? `speaker:${debug.devices[0].did}` : "");
   if (key.startsWith("group:")) {
     return state.fullConfig?.groups.find((group) => group.id === key.slice(6))?.speaker_ids ?? [];
   }

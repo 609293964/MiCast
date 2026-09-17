@@ -339,7 +339,8 @@ window.addEventListener("micast:request-render", () => {
 
 function bindGlobalUI(container: HTMLElement) {
   bindNavigation(container, (section) => {
-    store.setUi({ activeSection: section });
+    // Top-level nav always leaves secondary pages (调音台 etc.) behind.
+    store.setUi({ activeSection: section, tuningDid: null });
     render(store.get());
     if (section === "devices") {
       loadDevices();
@@ -425,7 +426,7 @@ function bindSectionUI(container: HTMLElement) {
         }
       },
       onQRLogin: startQRLogin,
-      onRetry: loadDevices,
+      onRetry: () => loadDevices(true),
       onCookieLogin: async (userId, passToken) => {
         try {
           await api.loginWithCookie(userId, passToken);
@@ -566,7 +567,7 @@ async function finishXiaomiLogin() {
     return;
   }
   render(store.get());
-  loadDevices();
+  loadDevices(true);  // just (re)logged in — bypass the cloud list cache
 }
 
 async function finishOnboarding() {
@@ -637,9 +638,9 @@ async function pollQR(scanToken: string) {
   render(store.get());
 }
 
-async function loadDevices() {
+async function loadDevices(forceRefresh = false) {
   try {
-    const devices = await api.getDevices();
+    const devices = await api.getDevices(forceRefresh);
     store.set({ devices, deviceLoadError: null });
     if (["devices", "receivers", "account"].includes(store.get().ui.activeSection)) {
       requestRender();
@@ -778,6 +779,7 @@ async function init() {
     if (pollTimers.length) return; // already polling
     pollTimers = [
       window.setInterval(async () => {
+        if (document.hidden) return;
         try {
           applyStatus(await api.getStatus());
         } catch {
@@ -785,6 +787,7 @@ async function init() {
         }
       }, 3000),
       window.setInterval(async () => {
+        if (document.hidden) return;
         if (!store.get().xiaomi.logged_in) return;
         try {
           applyPlayback(await api.getPlaybackState());
@@ -826,6 +829,7 @@ async function init() {
   // quietly so an expired cloud login is surfaced even when the user stays
   // on the playback page and no device refresh is running.
   window.setInterval(async () => {
+    if (document.hidden) return;
     if (!store.get().xiaomi.ever_logged_in && !store.get().xiaomi.logged_in) return;
     try {
       const xiaomi = await api.getXiaomiStatus();
@@ -840,6 +844,7 @@ async function init() {
 
   let debugRefreshInFlight = false;
   setInterval(async () => {
+    if (document.hidden) return;  // background tab: stop polling entirely
     if (store.get().ui.activeSection !== "debug") return;
     if (debugRefreshInFlight) return;
     const log = document.querySelector<HTMLElement>("[data-runtime-log]");

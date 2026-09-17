@@ -90,6 +90,25 @@ def _derive_title_from_artist(artist: str) -> str:
     return ""
 
 
+def _looks_like_lyric(text: str) -> bool:
+    """Scrolling-lyrics senders (NetEase) put the current lyric LINE into asar.
+    Real artist names are short and never carry sentence punctuation."""
+    if len(text) > 12:
+        return True
+    return any(mark in text for mark in "，。！？…、,.!?")
+
+
+def _split_title_artist(title: str) -> tuple[str, str]:
+    """Recover (title, artist) from a "title - artist" sender title."""
+    for sep in (" - ", " · ", " — "):
+        idx = title.rfind(sep)
+        if idx > 0:
+            prefix, suffix = title[:idx].strip(), title[idx + len(sep):].strip()
+            if prefix and suffix and len(suffix) <= 12:
+                return prefix, suffix
+    return title, ""
+
+
 def track_meta(body: bytes) -> dict[str, str]:
     """Extract {title, artist, album, derived} from a SET_PARAMETER dmap body."""
     tags = parse_dmap(body)
@@ -102,6 +121,17 @@ def track_meta(body: bytes) -> dict[str, str]:
     if not raw_title:
         return {}
     artist = first("asar")
+    if artist and _looks_like_lyric(artist):
+        # Lyric line parked in asar: not an artist. The real one is usually the
+        # title's suffix ("共您别离 - 张国荣"), which the strip helpers refuse to
+        # cut without a corroborating artist — recover it directly.
+        stripped_title, recovered = _split_title_artist(raw_title)
+        return {
+            "title": stripped_title,
+            "artist": recovered,
+            "album": first("asal"),
+            "derived": "",
+        }
     title = _strip_artist_prefix(_strip_artist_suffix(raw_title, artist), artist)
     return {
         "title": title,

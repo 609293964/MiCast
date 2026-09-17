@@ -50,3 +50,17 @@ def test_track_meta_derives_title_from_artist():
 
 def test_track_meta_truncated_body_no_crash():
     assert track_meta(b"\x00\x01") == {}
+
+
+def test_track_meta_lyric_line_in_artist_recovers_from_title():
+    # NetEase scrolling lyrics park the current line in asar; the real artist
+    # survives as the title's suffix ("共您别离 - 张国荣").
+    meta = track_meta(_dmap({"minm": "共您别离 - 张国荣", "asar": "人在这一刻分开 再不要对对相相"}))
+    assert meta["title"] == "共您别离"
+    assert meta["artist"] == "张国荣"
+
+
+def test_track_meta_lyric_with_punctuation_in_artist():
+    meta = track_meta(_dmap({"minm": "风继续吹 - 张国荣", "asar": "过去多少，快乐记忆"}))
+    assert meta["title"] == "风继续吹"
+    assert meta["artist"] == "张国荣"

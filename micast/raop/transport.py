@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 # RTP continuously, and graceful pauses re-trigger playback on resume.
 RTP_IDLE_TIMEOUT_SECONDS = 15.0
 
+# Jitter-buffer depth in packets. Classic AirPlay carries 352 samples per ALAC
+# packet (~8 ms at 44.1 kHz), so 16 packets is only ~128 ms — a Wi-Fi loss
+# burst plus one retransmit round trip easily exceeds that, and every overflow
+# force-skips the play head (audible as missing beats). ~400 ms gives resends
+# time to land while staying far below the speaker-side stream buffer.
+JITTER_BUFFER_PACKETS = 48
+
 
 def build_timing_reply(packet: bytes) -> bytes | None:
     """Answer a 0x52 timing request with the current NTP timestamp.
@@ -220,7 +227,7 @@ class RaopSession:
         if self.pending:
             nearest = min(self.pending, key=lambda value: (value - self.expected) & 0xFFFF)
             missing = (nearest - self.expected) & 0xFFFF
-            if 0 < missing <= 32:
+            if 0 < missing <= JITTER_BUFFER_PACKETS:
                 if self._can_request_resend():
                     self._request_resend(self.expected, missing)
                 elif not self._resend_blind_logged:
@@ -233,7 +240,7 @@ class RaopSession:
                         self.control_transport is not None,
                         self.client_control_port,
                     )
-        if len(self.pending) > 16:
+        if len(self.pending) > JITTER_BUFFER_PACKETS:
             next_sequence = min(self.pending, key=lambda value: (value - self.expected) & 0xFFFF)
             missing = (next_sequence - self.expected) & 0xFFFF
             # Only a genuine forward gap may advance the play head.  Values in

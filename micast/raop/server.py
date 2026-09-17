@@ -68,6 +68,20 @@ class RaopServer:
         }
 
     @property
+    def active_timing(self) -> dict[str, int]:
+        """Live timing exchange counters.
+
+        The server-level totals are folded in only when a session closes, so
+        during playback they read as 0 and look like a broken clock sync —
+        diagnostics must read the live sessions, same as transport errors.
+        """
+        sessions = list(self._sessions_by_writer.values())
+        return {
+            "timing_requests": sum(item.timing_requests for item in sessions),
+            "timing_responses": sum(item.timing_responses for item in sessions),
+        }
+
+    @property
     def active_input_buffer_ms(self) -> int:
         """Approximate audio waiting for RTP reordering in active sessions."""
         # Classic AirPlay commonly carries 352 samples per ALAC packet at

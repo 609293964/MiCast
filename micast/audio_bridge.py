@@ -129,6 +129,7 @@ class AudioBridge:
             server = item.server
             if server:
                 active_errors = server.active_transport_errors
+                active_timing = getattr(server, "active_timing", {})
                 raop[receiver_id] = {
                     "active_sessions": getattr(server, "recording_sessions", server.sessions),
                     "connected_sessions": server.sessions,
@@ -139,8 +140,8 @@ class AudioBridge:
                     "historical_decode_errors": server.decode_errors,
                     "historical_dropped_packets": server.dropped_packets,
                     "input_buffer_ms": server.active_input_buffer_ms,
-                    "timing_requests": server.timing_requests,
-                    "timing_responses": server.timing_responses,
+                    "timing_requests": active_timing.get("timing_requests", server.timing_requests),
+                    "timing_responses": active_timing.get("timing_responses", server.timing_responses),
                     "clients": server.active_clients,
                 }
         streams = {
@@ -309,6 +310,15 @@ class AudioBridge:
                 self._plan_update_requested = False
                 new_plan = compute_plan(settings)
                 diff = diff_plans(self._plan, new_plan)
+                if _is_debounceable_eq_change(diff):
+                    # Tuning EQ mid-playback commits one plan change per point
+                    # edit; each restarts the encoder and audibly gaps every
+                    # playing speaker. Wait a beat and recompute so a burst of
+                    # edits (or a dragging sender) lands as ONE restart.
+                    await asyncio.sleep(0.6)
+                    self._plan_update_requested = False
+                    new_plan = compute_plan(settings)
+                    diff = diff_plans(self._plan, new_plan)
                 if not diff.noop:
                     logger.info("Applying stream plan change: %s", _diff_summary(diff))
                 await self._apply_plan_diff(diff)
@@ -1476,6 +1486,26 @@ def _stream_owner(stream_id: str, receiver_ids: list[str]) -> str | None:
     """Map a stream id back to its receiver: variants are `<receiver_id>-L/-R/-qN`."""
     matches = [rid for rid in receiver_ids if stream_id == rid or stream_id.startswith(f"{rid}-")]
     return max(matches, key=len) if matches else None
+
+
+def _is_debounceable_eq_change(diff: PlanDiff) -> bool:
+    """True when the diff is ONLY encoder restarts (EQ/loudness/gain tweaks).
+
+    Format changes (audio_only) and structural changes must apply immediately —
+    the caller is a settings toggle expecting the stream to flip now. Pure sound
+    edits tolerate a 600 ms settle window and benefit hugely from coalescing.
+    """
+    return (
+        bool(diff.encoder_restart)
+        and not diff.audio_only
+        and not diff.full_restart_required
+        and not diff.classic_added
+        and not diff.classic_removed
+        and not diff.classic_rebuild
+        and not diff.airplay2_added
+        and not diff.airplay2_removed
+        and not diff.airplay2_rebuild
+    )
 
 
 def _diff_summary(diff: PlanDiff) -> str:

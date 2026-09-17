@@ -32,7 +32,8 @@ function renderAccountBody(state: State): string {
             ${credentialsInvalid
               ? `<button class="button primary" id="btn-qr-login">重新登录</button>
                  <button class="button plain" id="btn-other-login">登录其他账号</button>`
-              : `<button class="button primary" id="btn-retry-provider">重试连接</button>`}
+              : `<button class="button primary" id="btn-retry-provider">重试连接</button>
+                 <button class="button plain" id="btn-other-login">重新登录</button>`}
           </div>
         </div>
         ${credentialsInvalid ? `<p class="section-note">重新登录同一账号会恢复原配置；登录其他账号后，旧账号的设备、入口和分组将被清理。</p>` : ""}

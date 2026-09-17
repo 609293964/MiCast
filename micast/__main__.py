@@ -6,6 +6,7 @@ Frozen Windows builds get the desktop shell (WebView2 window + tray);
 MICAST_NO_DESKTOP=1 forces plain server mode (useful for debugging).
 """
 
+import asyncio
 import os
 import sys
 import threading
@@ -39,12 +40,37 @@ def main() -> None:
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
 
     if unix_socket:
-        socket_path = Path(unix_socket)
-        socket_path.parent.mkdir(parents=True, exist_ok=True)
-        socket_path.unlink(missing_ok=True)
-        uvicorn.run(app, uds=str(socket_path), log_level="info")
+        # fnOS gateway mode: the admin UI stays on the Unix socket, but DLNA
+        # discovery advertises http://<host>:<port>/dlna/... — bind a minimal
+        # TCP app exposing only the DLNA routes so that URL actually answers.
+        settings.apply_resolved_port("port", resolve_port(settings.port, "MICAST_PORT"))
+        _run_with_unix_socket(app, Path(unix_socket))
     else:
         uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
+
+
+def _run_with_unix_socket(app, socket_path: Path) -> None:
+    from fastapi import FastAPI
+
+    from micast.routes import dlna as dlna_routes
+
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    socket_path.unlink(missing_ok=True)
+    dlna_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    dlna_app.include_router(dlna_routes.router)
+
+    async def _serve() -> None:
+        servers = [
+            uvicorn.Server(uvicorn.Config(app, uds=str(socket_path), log_level="info")),
+            uvicorn.Server(
+                uvicorn.Config(
+                    dlna_app, host=settings.host, port=settings.port, log_level="info"
+                )
+            ),
+        ]
+        await asyncio.gather(*(server.serve() for server in servers))
+
+    asyncio.run(_serve())
 
 
 if __name__ == "__main__":

@@ -400,7 +400,14 @@ def stream_media_as_mp3(
     container = None
     out = None
     try:
-        container = av.open(url, options={"user_agent": user_agent})
+        # Media from DLNA control points may carry non-UTF8 (e.g. GBK) tags;
+        # PyAV decodes container metadata strictly by default and av.open
+        # would raise UnicodeDecodeError before we see a single frame.
+        container = av.open(
+            url,
+            options={"user_agent": user_agent},
+            metadata_errors="ignore",
+        )
         if seek_seconds > 0:
             container.seek(int(seek_seconds * 1_000_000), backward=True)
         audio = container.streams.audio[0]

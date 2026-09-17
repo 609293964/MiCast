@@ -3,7 +3,7 @@ import struct
 
 import pytest
 
-from micast.raop.transport import RaopSession
+from micast.raop.transport import JITTER_BUFFER_PACKETS, RaopSession
 
 
 class FakeTransport:
@@ -68,13 +68,16 @@ def test_real_gap_skip_drains_buffer_immediately():
     decoded = []
     session._decode = decoded.append
 
-    for sequence in range(11, 28):
+    # The jitter buffer is JITTER_BUFFER_PACKETS deep; the play head only skips
+    # the gap once the buffer overflows past that.
+    last = 11 + JITTER_BUFFER_PACKETS
+    for sequence in range(11, last + 1):
         session.push(sequence, bytes([sequence]))
 
     assert session.dropped_packets == 1
-    assert session.expected == 28
+    assert session.expected == last + 1
     assert session.pending == {}
-    assert decoded == [bytes([sequence]) for sequence in range(11, 28)]
+    assert decoded == [bytes([sequence]) for sequence in range(11, last + 1)]
 
 
 @pytest.mark.asyncio

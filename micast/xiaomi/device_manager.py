@@ -130,13 +130,22 @@ class DeviceManager:
         try:
             self._devices = await api.device_list()
         except Exception as exc:
-            message = str(exc)
-            if "Login failed" in message or "70016" in message:
+            # Never trust miservice's error text: "Login failed" also wraps
+            # pure network errors, and an expired serviceToken can surface as
+            # an opaque {"code": ...} body. Ask Xiaomi directly: a rejected
+            # passToken kills the login, a working one heals the serviceToken
+            # and earns one retry, and an inconclusive check keeps everything.
+            logger.warning("device_list failed (%s); verifying login", exc)
+            verdict = await self.auth.verify_credentials()
+            if verdict == "rejected":
                 self.auth.invalidate_login()
                 self._service = None
                 self._devices = []
                 raise XiaomiAuthError("小米登录已失效，请重新登录") from exc
-            raise
+            if verdict == "healed" and await self.refresh_service():
+                self._devices = await MinaAPI(self._service, "").device_list()
+            else:
+                raise
         self._devices_fetched_at = time.monotonic()
         settings.merge_speakers(self._devices)
         return self._devices

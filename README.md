@@ -14,6 +14,20 @@
 - **立体声组合**：两台音箱可分配为左、右声道，实时拆分并同步输出。
 - **AirPlay 2**：飞牛 fnOS 原生包提供一个可选的 AirPlay 2 入口；默认关闭，可在首次引导或设置中启用。
 
+## 界面预览
+
+<p align="center">
+  <img src="docs/screenshots/01-player.png" alt="播放：多房间播放一屏掌控" width="49%">
+  <img src="docs/screenshots/02-speakers.png" alt="音箱：发现音箱统一管理" width="49%">
+</p>
+<p align="center">
+  <img src="docs/screenshots/03-eq.png" alt="调音台：每只音箱都有自己的声音" width="49%">
+  <img src="docs/screenshots/04-links.png" alt="链路：声音走向一目了然" width="49%">
+</p>
+<p align="center">
+  <img src="docs/screenshots/05-stereo.png" alt="组合：组合音箱拓展声场" width="49%">
+</p>
+
 ## 更多功能
 
 - DLNA 播放入口与局域网 AirPlay / DLNA 设备发现

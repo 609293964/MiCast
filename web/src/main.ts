@@ -588,6 +588,18 @@ function friendlyError(error: unknown): string {
   return raw.match(/"detail"\s*:\s*"([^"]+)"/)?.[1] || raw;
 }
 
+// A freshly detected expiry opens the QR sheet directly — the user should
+// never have to hunt through settings to re-login. Skipped once dismissed.
+function maybeAutoRecovery(xiaomi: { status?: string }) {
+  if (
+    xiaomi.status === "expired" &&
+    !store.get().recoveryDismissed &&
+    !store.get().qr.open
+  ) {
+    void startQRLogin();
+  }
+}
+
 async function startQRLogin() {
   store.set({
     qr: { open: true, qrUrl: null, scanToken: null, state: "idle" },
@@ -656,6 +668,7 @@ async function loadDevices(forceRefresh = false) {
       ? `获取设备失败: ${e instanceof Error ? e.message : "未知错误"}`
       : "米家连接已失效，请重新连接";
     store.set({ devices: [], xiaomi, deviceLoadError: message });
+    maybeAutoRecovery(xiaomi);
     if (["devices", "receivers", "account"].includes(store.get().ui.activeSection)) {
       requestRender();
     }
@@ -835,6 +848,7 @@ async function init() {
       const xiaomi = await api.getXiaomiStatus();
       if (JSON.stringify(xiaomi) !== JSON.stringify(store.get().xiaomi)) {
         store.set({ xiaomi });
+        maybeAutoRecovery(xiaomi);
         requestRender();
       }
     } catch {

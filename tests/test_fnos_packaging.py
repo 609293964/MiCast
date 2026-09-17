@@ -6,11 +6,22 @@ FNOS = ROOT / "packaging" / "fnos"
 
 
 def _manifest() -> dict[str, str]:
-    return dict(
-        line.split("=", 1)
-        for line in (FNOS / "manifest").read_text(encoding="utf-8").splitlines()
-        if line and not line.startswith("#")
-    )
+    """Parse key=value lines, honouring the triple-quoted multiline values
+    (desc=\"\"\"...\"\"\") that fnOS manifests use for HTML descriptions."""
+    result: dict[str, str] = {}
+    key = None
+    for line in (FNOS / "manifest").read_text(encoding="utf-8").splitlines():
+        if key is not None:
+            if line.rstrip().endswith('"""'):
+                key = None
+            continue
+        if not line or line.startswith("#"):
+            continue
+        k, _, value = line.partition("=")
+        if value.startswith('"""') and not value.rstrip().endswith('"""'):
+            key = k
+        result[k] = value
+    return result
 
 
 def test_fnos_package_declares_gateway_and_python_runtime():
@@ -20,7 +31,7 @@ def test_fnos_package_declares_gateway_and_python_runtime():
 
     assert manifest["appname"] == "micast"
     assert manifest["install_dep_apps"] == "python312"
-    assert manifest["maintainer"] == "DyMode"
+    assert manifest["maintainer"] == "Dy"
     assert route["gatewayPrefix"] == "/app/micast"
     assert route["gatewaySocket"] == "app.sock"
     assert route["url"] == "/app/micast"

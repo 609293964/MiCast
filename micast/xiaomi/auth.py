@@ -139,6 +139,40 @@ class XiaomiAuth:
         user_id = str(tokens["userId"]) if tokens and tokens.get("userId") else None
         return user_id is not None, user_id
 
+    async def verify_credentials(self) -> str:
+        """Classify the stored login after a cloud API failure.
+
+        Returns "rejected" (passToken definitively dead — safe to invalidate),
+        "healed" (passToken fine; a fresh serviceToken was exchanged, stored and
+        the cached services reset — caller should retry its failed request), or
+        "unknown" (verification itself failed, e.g. network — keep the login).
+        """
+        tokens = self._token_store.load()
+        if not tokens or not tokens.get("userId") or not tokens.get("passToken"):
+            return "unknown"
+        user_id = str(tokens["userId"])
+        device_id = tokens.get("deviceId") or hashlib.md5(
+            f"micast-{user_id}".encode()
+        ).hexdigest()[:16]
+        try:
+            pair = await self._exchange_for_sid(user_id, tokens["passToken"], device_id, SID)
+        except XiaomiAuthError as exc:
+            logger.warning("passToken definitively rejected: %s", exc)
+            return "rejected"
+        except Exception:
+            logger.warning("passToken verification inconclusive (network error)")
+            return "unknown"
+        # passToken alive but the old serviceToken failed: store the fresh pair
+        # and drop cached services so the next request uses it.
+        tokens[SID] = pair
+        tokens["deviceId"] = device_id
+        tokens["refreshedAt"] = int(time.time())
+        self._token_store.save(tokens)
+        self._account = None
+        self._service = None
+        logger.info("serviceToken healed after API failure")
+        return "healed"
+
     def invalidate_login(self) -> None:
         """Drop credentials and cached services after Xiaomi rejects the session."""
         _, user_id = self.stored_identity()

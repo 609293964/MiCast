@@ -1,7 +1,21 @@
 appname=micast
-version=0.2.4
+version=0.2.5
 display_name=MiCast
-desc=把手机、电脑上的音频投放到一台或多台小米智能音箱。支持跨型号组播、多音箱同步和立体声组合，通过 AirPlay / DLNA 即连即播。
+desc="""<p>把手机、电脑上的音频投放到一台或多台小米智能音箱，通过 AirPlay / DLNA 即连即播。</p>
+<ul>
+<li>🎵 iPhone / Mac / 安卓 / Windows 原生 AirPlay 与 DLNA 投放</li>
+<li>🔊 跨型号组播、多音箱同步与立体声组合</li>
+<li>🎛 每台音箱独立可视化 EQ 曲线，任意控制点 + 实时频谱预览</li>
+<li>📜 带屏音箱自动显示封面与滚动歌词</li>
+<li>🩺 内置链路诊断，丢包 / 延迟一目了然</li>
+</ul>
+<p><img src="https://raw.githubusercontent.com/DyMode/MiCast/main/docs/screenshots/01-player.png"/></p>
+<p><img src="https://raw.githubusercontent.com/DyMode/MiCast/main/docs/screenshots/02-speakers.png"/></p>
+<p><img src="https://raw.githubusercontent.com/DyMode/MiCast/main/docs/screenshots/03-eq.png"/></p>
+<p><img src="https://raw.githubusercontent.com/DyMode/MiCast/main/docs/screenshots/04-links.png"/></p>
+<p><img src="https://raw.githubusercontent.com/DyMode/MiCast/main/docs/screenshots/05-stereo.png"/></p>
+<p>项目地址：<a href="https://github.com/DyMode/MiCast">DyMode/MiCast</a></p>
+"""
 source=thirdparty
 platform=x86
 maintainer=Dy
@@ -15,4 +29,4 @@ desktop_applaunchname=micast.main
 ctl_stop=true
 checkport=false
 disable_authorization_path=true
-changelog=首个上线版本。
+changelog=0.2.5<br>· 播放稳定性：AirPlay 抖动缓冲加深至约 400ms，丢包重传更从容，大幅减少跳拍<br>· EQ 调整防抖：连续拖动不再触发多次编码器重启<br>· 小米登录自愈：serviceToken 失效自动换新并重试，仅在凭证真正失效时要求重新登录<br>· 登录过期自动弹出扫码框，账号页可直接重新登录<br>· 修复 DLNA 投放含非 UTF-8 标签的媒体时崩溃<br>· 修复网关模式下 DLNA 链接无法访问<br>· 歌词行不再误入歌手名，可从标题后缀回收歌手<br>· 应用介绍支持图文展示

@@ -1,6 +1,6 @@
 #define AppName "MiCast"
 #ifndef AppVersion
-  #define AppVersion "0.2.6"
+  #define AppVersion "0.2.5"
 #endif
 
 [Setup]

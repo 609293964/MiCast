@@ -23,7 +23,9 @@ npm --prefix "$ROOT_DIR/web" ci
 npm --prefix "$ROOT_DIR/web" run build
 
 cp -a "$ROOT_DIR/micast" "$STAGE_DIR/app/"
-cp -a "$ROOT_DIR/web/dist/." "$STAGE_DIR/app/web/"
+# Keep the dist/ level: the app resolves the UI as <root>/web/dist, matching
+# the PowerShell builder's layout.
+cp -a "$ROOT_DIR/web/dist" "$STAGE_DIR/app/web/"
 
 "$PYTHON_BIN" -m pip install \
   --disable-pip-version-check \

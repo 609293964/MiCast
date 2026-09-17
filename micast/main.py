@@ -533,10 +533,25 @@ async def desktop_show() -> dict[str, bool]:
 
 
 # Static web UI. Packaged (PyInstaller) builds carry web/dist inside the
-# bundle (_MEIPASS); source checkouts resolve it from the repo root.
+# bundle (_MEIPASS); source checkouts resolve it from the repo root. The fnOS
+# package imports micast from vendor/ but lays the built UI directly in
+# <appdest>/web/ (no dist/ level), and cmd/main cd's into the app dir — so
+# probe every plausible location instead of assuming one layout.
 project_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 web_root = project_root / "web"
 web_dist = web_root / "dist"
+for candidate in (
+    web_dist,
+    web_root,
+    Path.cwd() / "web" / "dist",
+    Path.cwd() / "web",
+    project_root.parent / "web" / "dist",
+    project_root.parent / "web",
+):
+    if (candidate / "index.html").exists():
+        web_root = candidate.parent if candidate.name == "dist" else candidate
+        web_dist = candidate
+        break
 if web_dist.exists():
     app.mount(
         f"{APP_BASE_PATH}/assets",

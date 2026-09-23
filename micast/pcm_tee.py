@@ -16,7 +16,7 @@ class PCMTee:
 
     def __init__(self, source: asyncio.StreamReader, outputs: int = 2):
         self._source = source
-        self.outputs = [asyncio.StreamReader() for _ in range(outputs)]
+        self.outputs = [BoundedPCMReader() for _ in range(outputs)]
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -44,3 +44,44 @@ class PCMTee:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
+
+
+class BoundedPCMReader:
+    """Small StreamReader-compatible realtime PCM sink.
+
+    ``asyncio.StreamReader.feed_data`` has an unbounded internal byte buffer.
+    A dead stereo branch would therefore retain audio forever; this reader
+    keeps only a short live window and drops the oldest chunk when full.
+    """
+
+    def __init__(self, max_chunks: int = 64):
+        self._queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=max_chunks)
+        self._eof = False
+
+    def feed_data(self, data: bytes) -> None:
+        if self._eof:
+            return
+        try:
+            self._queue.put_nowait(data)
+        except asyncio.QueueFull:
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._queue.get_nowait()
+            self._queue.put_nowait(data)
+
+    def feed_eof(self) -> None:
+        if self._eof:
+            return
+        self._eof = True
+        try:
+            self._queue.put_nowait(None)
+        except asyncio.QueueFull:
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._queue.get_nowait()
+            self._queue.put_nowait(None)
+
+    def at_eof(self) -> bool:
+        return self._eof and self._queue.empty()
+
+    async def read(self, n: int = -1) -> bytes:
+        item = await self._queue.get()
+        return item or b""

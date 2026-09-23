@@ -20,9 +20,22 @@ class Notifier:
     def __init__(self):
         self._last_sent_at = 0.0
         self._client = httpx.AsyncClient(timeout=8.0)
+        self._pending: set[asyncio.Task] = set()
 
     async def close(self) -> None:
+        for task in self._pending:
+            task.cancel()
+        if self._pending:
+            await asyncio.gather(*self._pending, return_exceptions=True)
+        self._pending.clear()
         await self._client.aclose()
+
+    def schedule_expired(self) -> None:
+        """Fire-and-forget with a held reference: an unreferenced task can be
+        garbage-collected before its first await, silently dropping the push."""
+        task = asyncio.create_task(self.notify_expired(), name="notify-expired")
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
 
     async def notify_expired(self) -> bool:
         """Send "login expired" once per resend interval; False when skipped."""
@@ -37,15 +50,21 @@ class Notifier:
         text = "【MiCast】小米账号登录已失效，投放已中断。请打开 MiCast 面板重新扫码登录。"
         try:
             if "wxpusher" in url:
-                await self._client.post(url, json={
-                    "msgtype": "text",
-                    "text": {"content": text},
-                })
+                await self._client.post(
+                    url,
+                    json={
+                        "msgtype": "text",
+                        "text": {"content": text},
+                    },
+                )
             else:  # 飞书自定义机器人
-                await self._client.post(url, json={
-                    "msg_type": "text",
-                    "content": {"text": text},
-                })
+                await self._client.post(
+                    url,
+                    json={
+                        "msg_type": "text",
+                        "content": {"text": text},
+                    },
+                )
             logger.info("登录失效通知已推送")
             return True
         except Exception:
@@ -56,7 +75,7 @@ class Notifier:
 def notify_expired_soon(notifier: Notifier) -> None:
     """Schedule a notification from sync code (auth callbacks are sync)."""
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return
-    loop.create_task(notifier.notify_expired())
+    notifier.schedule_expired()

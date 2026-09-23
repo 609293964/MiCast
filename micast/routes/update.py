@@ -1,6 +1,5 @@
 """Software update routes: check GitHub releases, exe-only in-app download."""
 
-import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
@@ -25,7 +24,9 @@ def install() -> APIRouter:
     @router.post("/download")
     async def download():
         if not update_download_supported():
-            raise HTTPException(status_code=403, detail="当前安装方式不支持应用内下载，请前往发布页手动更新")
+            raise HTTPException(
+                status_code=403, detail="当前安装方式不支持应用内下载，请前往发布页手动更新"
+            )
         try:
             info = await update_checker.check_for_update()
         except Exception as e:
@@ -33,7 +34,8 @@ def install() -> APIRouter:
         asset = info.get("asset")
         if not info.get("update_available") or not asset:
             raise HTTPException(status_code=404, detail="没有可下载的更新")
-        asyncio.create_task(update_checker.download_update(asset))
+        if not update_checker.schedule_download(asset):
+            raise HTTPException(status_code=409, detail="已有下载任务进行中")
         return {"started": True, "asset": asset["name"]}
 
     @router.get("/download/status")

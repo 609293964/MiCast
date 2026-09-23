@@ -31,9 +31,7 @@ def _settings(**overrides) -> Settings:
     s.airplay_engine = "local"
     s.sync_groups_enabled = True
     s.airplay2_enabled = True
-    s.groups = [
-        SpeakerGroupConfig(id="g1", name="全屋", speaker_ids=["a", "b"], anchor_did="a")
-    ]
+    s.groups = [SpeakerGroupConfig(id="g1", name="全屋", speaker_ids=["a", "b"], anchor_did="a")]
     s.receivers = [
         ReceiverConfig(id="r1", name="全屋", target_type="group", target_id="g1", enabled=True),
     ]
@@ -43,6 +41,16 @@ def _settings(**overrides) -> Settings:
     for key, value in overrides.items():
         setattr(s, key, value)
     return s
+
+
+def test_audio_config_update_is_validated_atomically():
+    s = _settings()
+    before = s.audio.model_dump()
+
+    with pytest.raises(ValueError):
+        s.update_audio(format="opus", sample_rate=12345)
+
+    assert s.audio.model_dump() == before
 
 
 def _bare_bridge(monkeypatch, s: Settings) -> AudioBridge:
@@ -78,8 +86,10 @@ async def test_audio_format_change_restarts_encoders_on_both_engines(monkeypatch
     PCM source (a live session!) is torn down."""
     s = _settings()
     bridge = _bare_bridge(monkeypatch, s)
-    classic = AsyncMock()
-    airplay2 = AsyncMock()
+    classic = MagicMock()
+    classic.restart_encoder = AsyncMock()
+    airplay2 = MagicMock()
+    airplay2.restart_encoder = AsyncMock()
     bridge._pipelines = {"r1": classic}
     bridge._airplay2_pipelines = {"ap2": airplay2}
     bridge._plan = compute_plan(s)
@@ -92,6 +102,172 @@ async def test_audio_format_change_restarts_encoders_on_both_engines(monkeypatch
     bridge._rebuild_airplay2_instances_locked.assert_not_called()
     bridge._restart_engine_locked.assert_not_called()
     assert bridge._plan == compute_plan(s)
+
+
+@pytest.mark.asyncio
+async def test_eq_edit_refreshes_pipeline_curve_before_encoder_restart(monkeypatch):
+    s = _settings()
+    s.set_speaker_eq_curve("a", enabled=True, points=[(100, 2), (1000, -1)])
+    bridge = _bare_bridge(monkeypatch, s)
+    pipeline = MagicMock()
+    pipeline.restart_encoder = AsyncMock()
+    bridge._pipelines = {"r1-q1": pipeline}
+    bridge._plan = compute_plan(s)
+    monkeypatch.setattr("micast.audio_bridge.asyncio.sleep", AsyncMock())
+
+    s.set_speaker_eq_curve("a", enabled=True, points=[(100, -3), (1000, 4)])
+    await bridge.apply_config_change()
+
+    pipeline.set_audio_character.assert_called_once_with(
+        eq_curve=((100.0, -3.0), (1000.0, 4.0)), loudness=False
+    )
+    pipeline.restart_encoder.assert_awaited_once()
+    assert bridge._plan == compute_plan(s)
+
+
+@pytest.mark.asyncio
+async def test_rapid_eq_edits_apply_only_the_latest_curve_and_all_callers_wait(monkeypatch):
+    s = _settings()
+    s.set_speaker_eq_curve("a", enabled=True, points=[(100, 1), (1000, -1)])
+    bridge = _bare_bridge(monkeypatch, s)
+    pipeline = MagicMock()
+    pipeline.restart_encoder = AsyncMock()
+    bridge._pipelines = {"r1-q1": pipeline}
+    bridge._plan = compute_plan(s)
+    debounce_entered = asyncio.Event()
+    release_debounce = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def controlled_sleep(_seconds):
+        debounce_entered.set()
+        await release_debounce.wait()
+
+    monkeypatch.setattr("micast.audio_bridge.asyncio.sleep", controlled_sleep)
+    s.set_speaker_eq_curve("a", enabled=True, points=[(100, 2), (1000, -2)])
+    first = asyncio.create_task(bridge.apply_config_change())
+    await debounce_entered.wait()
+
+    s.set_speaker_eq_curve("a", enabled=True, points=[(100, 5), (1000, -5)])
+    second = asyncio.create_task(bridge.apply_config_change())
+    await real_sleep(0)
+    assert not first.done() and not second.done()
+
+    release_debounce.set()
+    await asyncio.gather(first, second)
+
+    pipeline.set_audio_character.assert_called_once_with(
+        eq_curve=((100.0, 5.0), (1000.0, -5.0)), loudness=False
+    )
+    pipeline.restart_encoder.assert_awaited_once()
+    assert bridge._plan == compute_plan(s)
+
+
+@pytest.mark.asyncio
+async def test_config_change_waits_for_busy_restart_lock(monkeypatch):
+    s = _settings()
+    bridge = _bare_bridge(monkeypatch, s)
+    bridge._plan = compute_plan(s)
+    s.audio.format = "flac"
+    pipeline = MagicMock()
+    pipeline.restart_encoder = AsyncMock()
+    bridge._pipelines = {"r1": pipeline}
+
+    await bridge._restart_lock.acquire()
+    task = asyncio.create_task(bridge.apply_config_change())
+    await asyncio.sleep(0)
+    assert not task.done()
+    bridge._restart_lock.release()
+    await task
+
+    pipeline.restart_encoder.assert_awaited_once()
+    assert bridge._plan == compute_plan(s)
+
+
+@pytest.mark.asyncio
+async def test_full_restart_request_is_not_lost_while_lock_is_busy(monkeypatch):
+    s = _settings()
+    bridge = _bare_bridge(monkeypatch, s)
+
+    await bridge._restart_lock.acquire()
+    task = asyncio.create_task(bridge.restart())
+    await asyncio.sleep(0)
+    assert not task.done()
+    bridge._restart_lock.release()
+    await task
+
+    bridge._restart_engine_locked.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_encoder_restart_does_not_claim_plan_was_applied(monkeypatch):
+    s = _settings()
+    bridge = _bare_bridge(monkeypatch, s)
+    old_plan = compute_plan(s)
+    bridge._plan = old_plan
+    s.audio.format = "flac"
+    pipeline = MagicMock()
+    pipeline.restart_encoder = AsyncMock(side_effect=RuntimeError("encoder failed"))
+    bridge._pipelines = {"r1": pipeline}
+
+    with pytest.raises(RuntimeError, match="暂未完全生效"):
+        await bridge.apply_config_change()
+
+    # The failed entry keeps its old fingerprint so the next apply re-diffs it.
+    assert bridge._plan["entries"]["r1"] == old_plan["entries"]["r1"]
+    assert bridge._plan != compute_plan(s)
+
+
+@pytest.mark.asyncio
+async def test_partial_encoder_restart_failure_retries_only_failed_entry(monkeypatch):
+    """One entry's encoder restart fails while another succeeds: the plan must
+    advance for the succeeded entry only, so a retry re-applies just the failed
+    one instead of re-gapping the healthy speaker or forgetting the failure."""
+    s = _settings()
+    bridge = _bare_bridge(monkeypatch, s)
+    old_plan = compute_plan(s)
+    bridge._plan = old_plan
+    s.audio.format = "flac"
+    failing = MagicMock()
+    failing.restart_encoder = AsyncMock(side_effect=RuntimeError("encoder failed"))
+    healthy = MagicMock()
+    healthy.restart_encoder = AsyncMock()
+    bridge._pipelines = {"r1": failing}
+    bridge._airplay2_pipelines = {"ap2": healthy}
+
+    with pytest.raises(RuntimeError, match="暂未完全生效"):
+        await bridge.apply_config_change()
+
+    # r1 keeps its old fingerprint (will re-diff), ap2 is advanced.
+    assert bridge._plan["entries"]["r1"] == old_plan["entries"]["r1"]
+    assert bridge._plan["entries"]["ap2"] == compute_plan(s)["entries"]["ap2"]
+
+    # Retry after the failure is fixed: only r1's encoder restarts again.
+    failing.restart_encoder = AsyncMock()
+    await bridge.apply_config_change()
+
+    assert failing.restart_encoder.await_count == 1
+    assert healthy.restart_encoder.await_count == 1
+    assert bridge._plan == compute_plan(s)
+
+
+@pytest.mark.asyncio
+async def test_failed_audio_restarted_hook_keeps_touched_entries_unapplied(monkeypatch):
+    """A hook failure re-points speakers globally, so every entry the diff
+    touched must stay un-advanced — not just the one whose encoder failed."""
+    s = _settings()
+    bridge = _bare_bridge(monkeypatch, s)
+    old_plan = compute_plan(s)
+    bridge._plan = old_plan
+    s.audio.format = "flac"
+    pipeline = MagicMock()
+    pipeline.restart_encoder = AsyncMock()
+    bridge._pipelines = {"r1": pipeline}
+    bridge.on_audio_restarted = AsyncMock(side_effect=RuntimeError("reconnect failed"))
+
+    with pytest.raises(RuntimeError, match="暂未完全生效"):
+        await bridge.apply_config_change()
+
+    assert bridge._plan == old_plan
 
 
 @pytest.mark.asyncio
@@ -138,10 +314,7 @@ async def test_external_delay_change_reconciles_every_entry_of_group(monkeypatch
     s.groups[0].delays_ms = {"apdev": 900}
     await bridge.apply_config_change()
 
-    calls = {
-        call.args[0]
-        for call in bridge._reconcile_entry_airplay_targets.await_args_list
-    }
+    calls = {call.args[0] for call in bridge._reconcile_entry_airplay_targets.await_args_list}
     assert calls == {"r1", "ap2"}
     bridge._rebuild_airplay2_instances_locked.assert_not_called()
 
@@ -178,7 +351,9 @@ def test_merge_marks_reference_rewrite_for_rebuild():
     s.groups[0].delays_ms = {"old-did": 300}
     s.groups[0].anchor_did = "old-did"
     s.receivers.append(
-        ReceiverConfig(id="speaker-old-did", name="客厅", target_type="speaker", target_id="old-did")
+        ReceiverConfig(
+            id="speaker-old-did", name="客厅", target_type="speaker", target_id="old-did"
+        )
     )
     s.airplay2_instances.append(
         AirPlay2InstanceConfig(id="ap2b", name="直推", target_type="speaker", target_id="old-did")

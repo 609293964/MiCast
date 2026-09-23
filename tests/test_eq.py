@@ -4,19 +4,26 @@ import pytest
 from test_topology import FakeBridge, FakeDeviceManager, _latency, _raop_diag
 
 from micast import topology
-from micast.config import EQ_BANDS_HZ, EqPoint, ReceiverConfig, Settings, SpeakerConfig, SpeakerGroupConfig
+from micast.config import (
+    EQ_BANDS_HZ,
+    EqPoint,
+    ReceiverConfig,
+    Settings,
+    SpeakerConfig,
+    SpeakerGroupConfig,
+)
 from micast.curve_fit import (
     CURVE_FREQ_RANGE,
     NIGHT_ATTENUATION,
     add_curve,
     fit_points,
+    format_graphic_eq,
     gain_table,
     is_flat,
     loudness_band,
     loudness_curve,
     normalize_points,
     parse_graphic_eq,
-    format_graphic_eq,
     pchip_eval,
 )
 from micast.speaker_pipeline import SpeakerPipeline
@@ -47,12 +54,34 @@ def test_eq_points_are_clamped(cfg):
     assert [(p.freq, p.gain_db) for p in speaker.eq_points] == [(100.0, 12.0), (1000.0, -12.0)]
 
 
+def test_harman_preset_identity_persists(cfg):
+    speaker = cfg.set_speaker_eq_curve("didA", enabled=True, points=[(100, 2)], preset="harman")
+    assert speaker.eq_preset == "harman"
+
+
+def test_tuning_revision_and_one_step_undo(cfg):
+    speaker = cfg.set_speaker_eq_curve("didA", enabled=True, points=[(100, 3)], preset="bass")
+    first_revision = speaker.eq_revision
+    cfg.set_speaker_eq_curve("didA", enabled=True, points=[(100, -4)], preset="")
+    speaker = cfg.get_speaker("didA")
+    assert speaker.eq_revision == first_revision + 1
+    assert speaker.eq_undo is not None
+
+    restored = cfg.undo_speaker_tuning("didA")
+    assert [(p.freq, p.gain_db) for p in restored.eq_points] == [(100.0, 3.0)]
+    assert restored.eq_preset == "bass"
+    assert restored.eq_undo is None
+    assert restored.eq_revision == first_revision + 2
+    with pytest.raises(ValueError, match="没有可撤销"):
+        cfg.undo_speaker_tuning("didA")
+
+
 def test_legacy_ten_band_config_migrates_to_points():
     bands = [3, 0, -2] + [0] * 7
     speaker = SpeakerConfig(did="didA", eq_enabled=True, eq_bands=bands)
     # Zero-gain bands survive as 0 dB anchor points (they shape the curve).
     assert [(p.freq, p.gain_db) for p in speaker.eq_points] == [
-        (float(hz), float(g)) for hz, g in zip(EQ_BANDS_HZ, bands)
+        (float(hz), float(g)) for hz, g in zip(EQ_BANDS_HZ, bands, strict=True)
     ]
 
 
@@ -60,14 +89,30 @@ def test_legacy_five_band_config_migrates_to_nearest_iso_band(cfg):
     """Old 60/250/1k/4k/12k gains land on 62/250/1k/4k/16k, not the first five."""
     speaker = SpeakerConfig(did="didA", eq_enabled=True, eq_bands=[3, 1, -2, 2, -4])
     assert [(p.freq, p.gain_db) for p in speaker.eq_points] == [
-        (31.0, 0.0), (62.0, 3.0), (125.0, 0.0), (250.0, 1.0), (500.0, 0.0),
-        (1000.0, -2.0), (2000.0, 0.0), (4000.0, 2.0), (8000.0, 0.0), (16000.0, -4.0),
+        (31.0, 0.0),
+        (62.0, 3.0),
+        (125.0, 0.0),
+        (250.0, 1.0),
+        (500.0, 0.0),
+        (1000.0, -2.0),
+        (2000.0, 0.0),
+        (4000.0, 2.0),
+        (8000.0, 0.0),
+        (16000.0, -4.0),
     ]
     # The deprecated API path migrates the same way for a stale client.
     updated = cfg.set_speaker_eq("didB", enabled=True, bands=[3, 1, -2, 2, -4])
     assert [(p.freq, p.gain_db) for p in updated.eq_points] == [
-        (31.0, 0.0), (62.0, 3.0), (125.0, 0.0), (250.0, 1.0), (500.0, 0.0),
-        (1000.0, -2.0), (2000.0, 0.0), (4000.0, 2.0), (8000.0, 0.0), (16000.0, -4.0),
+        (31.0, 0.0),
+        (62.0, 3.0),
+        (125.0, 0.0),
+        (250.0, 1.0),
+        (500.0, 0.0),
+        (1000.0, -2.0),
+        (2000.0, 0.0),
+        (4000.0, 2.0),
+        (8000.0, 0.0),
+        (16000.0, -4.0),
     ]
 
 
@@ -121,7 +166,10 @@ def test_stereo_variants_combine_channel_and_eq(cfg):
     cfg.receivers = [ReceiverConfig(id="r1", name="立体声", target_type="group", target_id="g1")]
     cfg.groups = [
         SpeakerGroupConfig(
-            id="g1", name="立体声", speaker_ids=["didA", "didB"], mode="stereo",
+            id="g1",
+            name="立体声",
+            speaker_ids=["didA", "didB"],
+            mode="stereo",
             channels={"didA": "left", "didB": "right"},
         )
     ]
@@ -138,7 +186,10 @@ def test_stereo_variants_combine_channel_and_eq(cfg):
 def test_pipeline_filter_includes_curve(cfg, monkeypatch):
     monkeypatch.setattr("micast.speaker_pipeline.settings", cfg)
     pipeline = SpeakerPipeline(
-        device_id="r1", alias="t", pcm_source=None, stream_server=None,
+        device_id="r1",
+        alias="t",
+        pcm_source=None,
+        stream_server=None,
         eq_curve=[(31.0, 3.0), (125.0, -2.0)],
     )
     filt = pipeline._build_audio_filter()
@@ -154,11 +205,14 @@ def test_pipeline_filter_includes_curve(cfg, monkeypatch):
         assert set(names) == {"equalizer"}
         assert 0 < len(filt) <= 24
         joined = ",".join(args for _, args in filt)
-        assert "g=3.00" in joined   # +3 dB bass end of the curve
+        assert "g=3.00" in joined  # +3 dB bass end of the curve
         assert "g=-2.00" in joined  # −2 dB treble end of the curve
 
     flat = SpeakerPipeline(
-        device_id="r1", alias="t", pcm_source=None, stream_server=None,
+        device_id="r1",
+        alias="t",
+        pcm_source=None,
+        stream_server=None,
         eq_curve=[],
     )
     assert flat._build_audio_filter() is None
@@ -210,8 +264,20 @@ def test_topology_shows_eq_stream_variant(cfg, monkeypatch):
         {
             "raop": _raop_diag(),
             "streams": {
-                "r1": {"clients": 1, "flowing": True, "bytes_sent": 0, "dropped_chunks": 0, "latency": _latency()},
-                "r1-q1": {"clients": 1, "flowing": True, "bytes_sent": 0, "dropped_chunks": 0, "latency": _latency()},
+                "r1": {
+                    "clients": 1,
+                    "flowing": True,
+                    "bytes_sent": 0,
+                    "dropped_chunks": 0,
+                    "latency": _latency(),
+                },
+                "r1-q1": {
+                    "clients": 1,
+                    "flowing": True,
+                    "bytes_sent": 0,
+                    "dropped_chunks": 0,
+                    "latency": _latency(),
+                },
             },
         }
     )
@@ -315,8 +381,12 @@ def test_loudness_splits_stream_with_flat_eq(cfg):
 def test_pipeline_loudness_layers_filter_on_flat_curve(cfg, monkeypatch):
     monkeypatch.setattr("micast.speaker_pipeline.settings", cfg)
     pipeline = SpeakerPipeline(
-        device_id="r1", alias="t", pcm_source=None, stream_server=None,
-        eq_curve=[], loudness=True,
+        device_id="r1",
+        alias="t",
+        pcm_source=None,
+        stream_server=None,
+        eq_curve=[],
+        loudness=True,
     )
     assert pipeline._build_audio_filter() is None  # 100% → flat, no encoder
     pipeline.set_loudness_level(20)

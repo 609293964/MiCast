@@ -129,9 +129,10 @@ class DlnaDiscovery:
         parsed = urlparse(location)
         own_ids = {receiver.id for receiver in settings.receivers}
         own_path = path.startswith("/dlna/") and path.endswith("/description.xml")
-        own_address = parsed.hostname == settings.effective_stream_host and (
-            parsed.port or 80
-        ) == settings.port
+        own_address = (
+            parsed.hostname == settings.effective_stream_host
+            and (parsed.port or 80) == settings.port
+        )
         if (own_path and own_address) or any(
             path.endswith(f"/dlna/{receiver_id}/description.xml") for receiver_id in own_ids
         ):

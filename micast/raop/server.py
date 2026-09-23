@@ -266,9 +266,7 @@ class RaopServer:
                 and self.on_play_stop
                 and not self._has_active_recorder(except_session=session)
             ):
-                logger.info(
-                    "AirPlay %s: %s disconnected without TEARDOWN", self.name, peer
-                )
+                logger.info("AirPlay %s: %s disconnected without TEARDOWN", self.name, peer)
                 session.stop_notified = True
                 self.on_play_stop()
             logger.info("AirPlay client disconnected from %s: %s", self.name, peer)
@@ -382,7 +380,10 @@ class RaopServer:
         if not self.daap_meta:
             logger.info(
                 "AirPlay %s: track metadata: %s - %s (%s)",
-                self.name, meta["title"], meta.get("artist", ""), meta.get("album", ""),
+                self.name,
+                meta["title"],
+                meta.get("artist", ""),
+                meta.get("album", ""),
             )
         self.daap_meta = meta
         self._daap_seq += 1

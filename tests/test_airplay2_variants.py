@@ -10,7 +10,9 @@ from micast.audio_bridge import AudioBridge
 from micast.config import AirPlay2InstanceConfig, Settings, SpeakerGroupConfig
 
 
-def _settings_with(instance_cfg: AirPlay2InstanceConfig, groups: list[SpeakerGroupConfig]) -> Settings:
+def _settings_with(
+    instance_cfg: AirPlay2InstanceConfig, groups: list[SpeakerGroupConfig]
+) -> Settings:
     instance = Settings()
     instance.airplay2_instances = [instance_cfg]
     instance.groups = groups
@@ -21,10 +23,18 @@ def test_variant_plan_stereo_group_splits_channels(monkeypatch):
     cfg = AirPlay2InstanceConfig(id="ap2", name="MiCast", target_type="group", target_id="g1")
     monkeypatch.setattr(
         "micast.audio_bridge.settings",
-        _settings_with(cfg, [SpeakerGroupConfig(
-            id="g1", name="立体声", speaker_ids=["a", "b"],
-            mode="stereo", channels={"a": "left", "b": "right"},
-        )]),
+        _settings_with(
+            cfg,
+            [
+                SpeakerGroupConfig(
+                    id="g1",
+                    name="立体声",
+                    speaker_ids=["a", "b"],
+                    mode="stereo",
+                    channels={"a": "left", "b": "right"},
+                )
+            ],
+        ),
     )
     bridge = object.__new__(AudioBridge)
 

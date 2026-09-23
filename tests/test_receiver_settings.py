@@ -33,9 +33,7 @@ def test_speaker_alias_renames_its_airplay_receiver(tmp_path, monkeypatch):
     )
     instance.speakers = [SpeakerConfig(did="speaker-1", alias="客厅")]
     instance.receivers = [
-        ReceiverConfig(
-            id="living", name="旧名称", target_type="speaker", target_id="speaker-1"
-        )
+        ReceiverConfig(id="living", name="旧名称", target_type="speaker", target_id="speaker-1")
     ]
 
     instance.set_alias("speaker-1", "客厅小爱")
@@ -47,9 +45,7 @@ def test_receiver_names_are_migrated_from_targets():
     instance = Settings()
     instance.speakers = [SpeakerConfig(did="speaker-1", alias="客厅小爱")]
     instance.receivers = [
-        ReceiverConfig(
-            id="living", name="旧名称", target_type="speaker", target_id="speaker-1"
-        )
+        ReceiverConfig(id="living", name="旧名称", target_type="speaker", target_id="speaker-1")
     ]
 
     instance._migrate_receivers()
@@ -61,12 +57,16 @@ def test_airplay2_instance_resolves_its_own_targets_without_classic_receiver():
     instance = Settings()
     instance.airplay2_instances = [
         AirPlay2InstanceConfig(
-            id="ap2-living", name="客厅 AirPlay 2",
-            target_type="speaker", target_id="speaker-1",
+            id="ap2-living",
+            name="客厅 AirPlay 2",
+            target_type="speaker",
+            target_id="speaker-1",
         ),
         AirPlay2InstanceConfig(
-            id="ap2-home", name="全屋 AirPlay 2",
-            target_type="group", target_id="group-1",
+            id="ap2-home",
+            name="全屋 AirPlay 2",
+            target_type="group",
+            target_id="group-1",
         ),
     ]
     instance.groups = [
@@ -84,48 +84,79 @@ def test_airplay2_group_instance_resolves_group_for_channel_and_variants():
     instance = Settings()
     instance.airplay2_instances = [
         AirPlay2InstanceConfig(
-            id="ap2-home", name="全屋 AirPlay 2", target_type="group", target_id="group-1",
+            id="ap2-home",
+            name="全屋 AirPlay 2",
+            target_type="group",
+            target_id="group-1",
         )
     ]
     instance.groups = [
         SpeakerGroupConfig(
-            id="group-1", name="全屋", speaker_ids=["speaker-1", "speaker-2"],
-            mode="stereo", channels={"speaker-1": "left", "speaker-2": "right"},
+            id="group-1",
+            name="全屋",
+            speaker_ids=["speaker-1", "speaker-2"],
+            mode="stereo",
+            channels={"speaker-1": "left", "speaker-2": "right"},
         )
     ]
     assert instance.group_for_receiver("ap2-home") is instance.groups[0]
     assert instance.receiver_channel("ap2-home", "speaker-1") == "left"
     assert instance.channel_suffix("ap2-home", "speaker-2") == "-R"
-    assert {v["suffix"] for v in instance.receiver_stream_variants("ap2-home")} == {
-        "-L", "-R", ""
-    }
+    assert {v["suffix"] for v in instance.receiver_stream_variants("ap2-home")} == {"-L", "-R", ""}
 
 
 def test_device_id_change_migrates_every_speaker_reference(tmp_path, monkeypatch):
     instance = Settings()
-    monkeypatch.setattr(type(instance), "config_path", property(lambda self: tmp_path / "micast.json"))
+    monkeypatch.setattr(
+        type(instance), "config_path", property(lambda self: tmp_path / "micast.json")
+    )
     instance.selected_device_id = "old-device-id"
-    instance.speakers = [SpeakerConfig(
-        did="old-device-id", alias="四楼小爱", enabled=True,
-        miot_did="978430386", hardware="OH2",
-    )]
-    instance.receivers = [ReceiverConfig(
-        id="fourth", name="四楼小爱", target_type="speaker", target_id="old-device-id",
-    )]
-    instance.groups = [SpeakerGroupConfig(
-        id="all", name="组合", speaker_ids=["old-device-id", "other-device-id"],
-        delays_ms={"old-device-id": 80}, channels={"old-device-id": "left"},
-        gains_db={"old-device-id": -1.0},
-    )]
-    instance.airplay2_instances = [AirPlay2InstanceConfig(
-        id="ap2", name="四楼 AirPlay 2", target_type="speaker",
-        target_id="old-device-id",
-    )]
+    instance.speakers = [
+        SpeakerConfig(
+            did="old-device-id",
+            alias="四楼小爱",
+            enabled=True,
+            miot_did="978430386",
+            hardware="OH2",
+        )
+    ]
+    instance.receivers = [
+        ReceiverConfig(
+            id="fourth",
+            name="四楼小爱",
+            target_type="speaker",
+            target_id="old-device-id",
+        )
+    ]
+    instance.groups = [
+        SpeakerGroupConfig(
+            id="all",
+            name="组合",
+            speaker_ids=["old-device-id", "other-device-id"],
+            delays_ms={"old-device-id": 80},
+            channels={"old-device-id": "left"},
+            gains_db={"old-device-id": -1.0},
+        )
+    ]
+    instance.airplay2_instances = [
+        AirPlay2InstanceConfig(
+            id="ap2",
+            name="四楼 AirPlay 2",
+            target_type="speaker",
+            target_id="old-device-id",
+        )
+    ]
 
-    instance.merge_speakers([{
-        "deviceID": "new-device-id", "miotDID": "978430386",
-        "name": "四楼小爱", "hardware": "OH2",
-    }])
+    instance.merge_speakers(
+        [
+            {
+                "deviceID": "new-device-id",
+                "miotDID": "978430386",
+                "name": "四楼小爱",
+                "hardware": "OH2",
+            }
+        ]
+    )
 
     assert [item.did for item in instance.speakers] == ["new-device-id"]
     assert instance.selected_device_id == "new-device-id"
@@ -139,21 +170,34 @@ def test_device_id_change_migrates_every_speaker_reference(tmp_path, monkeypatch
 
 def test_legacy_same_name_records_are_consolidated(tmp_path, monkeypatch):
     instance = Settings()
-    monkeypatch.setattr(type(instance), "config_path", property(lambda self: tmp_path / "micast.json"))
+    monkeypatch.setattr(
+        type(instance), "config_path", property(lambda self: tmp_path / "micast.json")
+    )
     instance.selected_device_id = "stale-2"
     instance.speakers = [
         SpeakerConfig(did="current", alias="四楼小爱", enabled=False),
         SpeakerConfig(did="stale-1", alias="四楼小爱", enabled=False),
         SpeakerConfig(did="stale-2", alias="四楼小爱", enabled=True),
     ]
-    instance.receivers = [ReceiverConfig(
-        id="fourth", name="四楼小爱", target_type="speaker", target_id="stale-2",
-    )]
+    instance.receivers = [
+        ReceiverConfig(
+            id="fourth",
+            name="四楼小爱",
+            target_type="speaker",
+            target_id="stale-2",
+        )
+    ]
 
-    instance.merge_speakers([{
-        "deviceID": "current", "miotDID": "978430386",
-        "name": "四楼小爱", "hardware": "OH2",
-    }])
+    instance.merge_speakers(
+        [
+            {
+                "deviceID": "current",
+                "miotDID": "978430386",
+                "name": "四楼小爱",
+                "hardware": "OH2",
+            }
+        ]
+    )
 
     assert len(instance.speakers) == 1
     assert instance.speakers[0].did == "current"
@@ -165,17 +209,29 @@ def test_legacy_same_name_records_are_consolidated(tmp_path, monkeypatch):
 
 def test_account_switch_clears_only_provider_owned_topology(tmp_path, monkeypatch):
     instance = Settings()
-    monkeypatch.setattr(type(instance), "config_path", property(lambda self: tmp_path / "micast.json"))
+    monkeypatch.setattr(
+        type(instance), "config_path", property(lambda self: tmp_path / "micast.json")
+    )
     instance.provider_account_id = "old-account"
     instance.selected_device_id = "speaker-1"
     instance.speakers = [SpeakerConfig(did="speaker-1", alias="旧音箱", enabled=True)]
-    instance.receivers = [ReceiverConfig(
-        id="speaker", name="旧音箱", target_type="speaker", target_id="speaker-1",
-    )]
+    instance.receivers = [
+        ReceiverConfig(
+            id="speaker",
+            name="旧音箱",
+            target_type="speaker",
+            target_id="speaker-1",
+        )
+    ]
     instance.groups = [SpeakerGroupConfig(id="group", name="旧组合", speaker_ids=["speaker-1"])]
-    instance.airplay2_instances = [AirPlay2InstanceConfig(
-        id="ap2", name="旧入口", target_type="speaker", target_id="speaker-1",
-    )]
+    instance.airplay2_instances = [
+        AirPlay2InstanceConfig(
+            id="ap2",
+            name="旧入口",
+            target_type="speaker",
+            target_id="speaker-1",
+        )
+    ]
 
     changed = instance.bind_provider_account("new-account")
 
@@ -190,13 +246,20 @@ def test_account_switch_clears_only_provider_owned_topology(tmp_path, monkeypatc
 
 def test_logout_or_temporary_disconnect_keeps_account_devices(tmp_path, monkeypatch):
     instance = Settings()
-    monkeypatch.setattr(type(instance), "config_path", property(lambda self: tmp_path / "micast.json"))
+    monkeypatch.setattr(
+        type(instance), "config_path", property(lambda self: tmp_path / "micast.json")
+    )
     instance.provider_account_id = "same-account"
     instance.selected_device_id = "speaker-1"
     instance.speakers = [SpeakerConfig(did="speaker-1", alias="客厅", enabled=True)]
-    instance.receivers = [ReceiverConfig(
-        id="living", name="客厅", target_type="speaker", target_id="speaker-1",
-    )]
+    instance.receivers = [
+        ReceiverConfig(
+            id="living",
+            name="客厅",
+            target_type="speaker",
+            target_id="speaker-1",
+        )
+    ]
 
     assert instance.bind_provider_account(None) is False
     assert instance.provider_account_id == "same-account"

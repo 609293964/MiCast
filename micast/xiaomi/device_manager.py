@@ -1,9 +1,13 @@
 """Device discovery and playback control manager."""
 
 import asyncio
+import json
 import logging
+import os
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 from micast.config import settings
 from micast.xiaomi.auth import XiaomiAuth, XiaomiAuthError
@@ -21,8 +25,14 @@ logger = logging.getLogger(__name__)
 RESTORE_MIN_INTERVAL_SECONDS = 15.0
 
 # Seconds between retries for speakers that rejected the session-start play
-# command (offline at start, cloud hiccup); retried until the session ends.
+# command (offline at start, cloud hiccup). Retries back off exponentially and
+# stop after PLAY_ERROR_MAX_ATTEMPTS so a speaker that left the account or is
+# permanently offline does not hammer the cloud forever; the recorded error
+# stays visible until the session stops.
 PLAY_ERROR_RETRY_SECONDS = 30.0
+PLAY_ERROR_MAX_ATTEMPTS = 5
+PLAY_ERROR_BACKOFF_FACTOR = 2.0
+PLAY_ERROR_MAX_BACKOFF_SECONDS = 300.0
 
 # Xiaomi's status helper performs an implicit device-list request before each
 # player query. A two-second watchdog therefore doubled cloud traffic without
@@ -66,6 +76,16 @@ class DeviceManager:
         # Speakers that rejected the play command at session start (offline,
         # cloud timeout…). Retried periodically while the session lives.
         self._play_errors: dict[str, dict] = {}
+        # Failed-retry count per device, driving the backoff above.
+        self._play_error_attempts: dict[str, int] = {}
+        # Learned from real HTTP pulls, not cloud command acknowledgements.
+        # Kept in memory because firmware updates can change decoder behavior.
+        self._codec_capabilities: dict[str, dict[str, bool]] = {}
+        self._codec_capability_meta: dict[str, dict[str, dict]] = {}
+        self._codec_capability_path = settings.config_path.parent / "xiaomi-codec-capabilities.json"
+        self._codec_save_scheduled = False
+        self._codec_save_deadline = 0.0
+        self._load_codec_capabilities()
         self._error_retry_task: asyncio.Task | None = None
         # Optional ground-truth hook (wired by main): True when the speaker is
         # actually pulling its stream. The cloud reports "playing" even when
@@ -98,10 +118,32 @@ class DeviceManager:
         self._owners.clear()
         self._last_restore.clear()
         self._play_errors.clear()
+        self._play_error_attempts.clear()
+        self._codec_capabilities.clear()
+        self._codec_capability_meta.clear()
+        # Engine restarts land here; an unconditional mkdir+fsync on that hot
+        # path is wasteful. The debounced flush covers it (sync fallback when
+        # no loop is running), and close() force-flushes before shutdown.
+        self._schedule_codec_capability_save()
         self._anchor_paused.clear()
         if self._error_retry_task:
             self._error_retry_task.cancel()
             self._error_retry_task = None
+
+    async def close(self) -> None:
+        """Cancel and join every manager-owned background task."""
+        # Persist any capability record still waiting in the debounce window.
+        self._codec_save_deadline = 0.0
+        self._save_codec_capabilities()
+        tasks = [task for task in self._watchdog_tasks.values() if not task.done()]
+        if self._error_retry_task and not self._error_retry_task.done():
+            tasks.append(self._error_retry_task)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._watchdog_tasks.clear()
+        self._error_retry_task = None
 
     @selected_device_id.setter
     def selected_device_id(self, value: str | None) -> None:
@@ -120,8 +162,10 @@ class DeviceManager:
     async def list_devices(self, force: bool = False) -> list[dict]:
         _, account_id = self.auth.stored_identity()
         settings.bind_provider_account(account_id)
-        if not force and self._devices and (
-            time.monotonic() - self._devices_fetched_at < DEVICE_LIST_CACHE_SECONDS
+        if (
+            not force
+            and self._devices
+            and (time.monotonic() - self._devices_fetched_at < DEVICE_LIST_CACHE_SECONDS)
         ):
             return self._devices
         if not await self.refresh_service():
@@ -136,9 +180,8 @@ class DeviceManager:
             # passToken kills the login, a working one heals the serviceToken
             # and earns one retry, and an inconclusive check keeps everything.
             logger.warning("device_list failed (%s); verifying login", exc)
-            verdict = await self.auth.verify_credentials()
+            verdict = await self.auth.recover_after_failure()
             if verdict == "rejected":
-                self.auth.invalidate_login()
                 self._service = None
                 self._devices = []
                 raise XiaomiAuthError("小米登录已失效，请重新登录") from exc
@@ -203,8 +246,7 @@ class DeviceManager:
         same group without stealing each other's speakers.
         """
         return [
-            did for did in settings.receiver_targets(receiver_id)
-            if self.owner_of(did) == owner
+            did for did in settings.receiver_targets(receiver_id) if self.owner_of(did) == owner
         ]
 
     def stream_url_of(self, device_id: str) -> str | None:
@@ -248,9 +290,7 @@ class DeviceManager:
                 logger.debug("Speaker %s already playing %s; skipping", device_id, url)
                 return True
             if owner is not None and current_owner and current_owner != owner:
-                logger.info(
-                    "Speaker %s ownership: %s -> %s", device_id, current_owner, owner
-                )
+                logger.info("Speaker %s ownership: %s -> %s", device_id, current_owner, owner)
             api = MinaAPI(self._service, device_id)
             try:
                 await api.play_music_url(url, audio_id=audio_id)
@@ -322,16 +362,22 @@ class DeviceManager:
             self._playing.discard(device_id)
             self._paused.add(device_id)
             self._play_errors.pop(device_id, None)
+            self._play_error_attempts.pop(device_id, None)
             if owner is not None and self._owners.get(device_id) == owner:
                 self._owners.pop(device_id, None)
             self._stop_watchdog(device_id)
 
-    async def stop_playback(self, device_id: str, owner: str | None = None) -> None:
+    async def stop_playback(
+        self, device_id: str, owner: str | None = None, *, keep_error: bool = False
+    ) -> None:
         """Fully stop a speaker (not pause) and forget its stream state.
 
         Unlike pause, this unloads the stream URL — a paused speaker keeps the
         URL and retries it on its own, which leaves ghost connections on the
-        stream server long after the phone is gone."""
+        stream server long after the phone is gone.
+
+        ``keep_error`` preserves a recorded session-start error (callers that
+        stop the speaker BECAUSE of that error want the error to stay visible)."""
         async with self._lock_for(device_id):
             if owner is not None and self._owners.get(device_id) not in (None, owner):
                 logger.info(
@@ -352,7 +398,9 @@ class DeviceManager:
                         logger.warning("%s failed for %s: %s", command.__name__, device_id, exc)
             self._playing.discard(device_id)
             self._paused.discard(device_id)
-            self._play_errors.pop(device_id, None)
+            if not keep_error:
+                self._play_errors.pop(device_id, None)
+                self._play_error_attempts.pop(device_id, None)
             self._stream_urls.pop(device_id, None)
             self._owners.pop(device_id, None)
             self._stop_watchdog(device_id)
@@ -361,40 +409,200 @@ class DeviceManager:
         return list(self._playing)
 
     def note_play_error(
-        self, device_id: str, receiver_id: str, error: str, url: str | None = None
+        self,
+        device_id: str,
+        receiver_id: str,
+        error: str,
+        url: str | None = None,
+        *,
+        retry: bool = True,
     ) -> None:
         """Record a session-start failure so it can be retried and displayed."""
+        attempts_map = getattr(self, "_play_error_attempts", None)
+        if attempts_map is None:  # tolerate __new__-built instances in tests
+            attempts_map = self._play_error_attempts = {}
         self._play_errors[device_id] = {
             "receiver": receiver_id,
             "error": error,
             "url": url or self._stream_urls.get(device_id),
         }
-        if self._error_retry_task is None or self._error_retry_task.done():
+        attempts_map[device_id] = 0
+        if retry and (self._error_retry_task is None or self._error_retry_task.done()):
             self._error_retry_task = asyncio.create_task(self._error_retry_loop())
 
     def clear_play_error(self, device_id: str) -> None:
         self._play_errors.pop(device_id, None)
+        self._play_error_attempts.pop(device_id, None)
 
     def play_errors(self) -> dict[str, str]:
         return {did: entry["error"] for did, entry in self._play_errors.items()}
 
+    def note_codec_capability(
+        self, device_id: str, fmt: str, supported: bool, reason: str = "stream_verified"
+    ) -> None:
+        if fmt:
+            self._codec_capabilities.setdefault(device_id, {})[fmt] = supported
+            self._codec_capability_meta.setdefault(device_id, {})[fmt] = {
+                "status": "supported" if supported else "unsupported",
+                "verified_at": int(time.time()),
+                "reason": reason,
+            }
+            self._schedule_codec_capability_save()
+
+    def codec_capabilities(self, device_id: str) -> dict[str, bool]:
+        return dict(self._codec_capabilities.get(device_id, {}))
+
+    def codec_capability_details(self, device_id: str) -> dict[str, dict]:
+        return {
+            fmt: dict(meta)
+            for fmt, meta in self._codec_capability_meta.get(device_id, {}).items()
+        }
+
+    def _load_codec_capabilities(self) -> None:
+        try:
+            raw = json.loads(self._codec_capability_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return
+            for did, formats in raw.items():
+                if not isinstance(formats, dict):
+                    continue
+                for fmt, meta in formats.items():
+                    if not isinstance(meta, dict) or meta.get("status") not in {
+                        "supported",
+                        "unsupported",
+                    }:
+                        continue
+                    self._codec_capability_meta.setdefault(str(did), {})[str(fmt)] = dict(meta)
+                    supported = meta["status"] == "supported"
+                    self._codec_capabilities.setdefault(str(did), {})[str(fmt)] = supported
+        except FileNotFoundError:
+            return
+        except Exception:
+            logger.exception("Failed to load persisted Xiaomi codec capabilities")
+
+    def _schedule_codec_capability_save(self) -> None:
+        """Debounce disk writes: a session-start probe can record several
+        speakers within milliseconds, and each is not worth its own fsync."""
+        self._codec_save_deadline = time.monotonic() + 2.0
+        if self._codec_save_scheduled:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._save_codec_capabilities()
+            return
+        self._codec_save_scheduled = True
+        loop.call_later(2.0, self._flush_codec_capability_save)
+
+    def _flush_codec_capability_save(self) -> None:
+        self._codec_save_scheduled = False
+        # A newer record arrived after this flush was scheduled: slide once more.
+        remaining = self._codec_save_deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._save_codec_capabilities()
+                return
+            self._codec_save_scheduled = True
+            loop.call_later(remaining, self._flush_codec_capability_save)
+            return
+        self._save_codec_capabilities()
+
+    def _save_codec_capabilities(self) -> None:
+        try:
+            self._codec_capability_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(self._codec_capability_meta, ensure_ascii=False, indent=2)
+            # Same atomic pattern as the main config: a half-written file on
+            # NAS storage must never be picked up on the next boot.
+            fd, temporary = tempfile.mkstemp(
+                prefix=f".{self._codec_capability_path.name}.",
+                suffix=".tmp",
+                dir=self._codec_capability_path.parent,
+                text=True,
+            )
+            temporary_path = Path(temporary)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_path, self._codec_capability_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Failed to persist Xiaomi codec capabilities")
+
+    def codec_compatibility(self, device_ids: list[str]) -> dict:
+        formats = ("MP3", "FLAC", "WAV", "PCM/WAV")
+        ids = list(dict.fromkeys(device_ids))
+        members = {did: self.codec_capabilities(did) for did in ids}
+        possible = [
+            fmt for fmt in formats if all(cap.get(fmt) is not False for cap in members.values())
+        ]
+        confirmed = [
+            fmt for fmt in formats if ids and all(cap.get(fmt) is True for cap in members.values())
+        ]
+        status = "confirmed" if confirmed else "incompatible" if not possible else "needs_check"
+        return {
+            "members": members,
+            "possible_common_formats": possible,
+            "confirmed_common_formats": confirmed,
+            "recommended_format": "MP3"
+            if "MP3" in possible
+            else (possible[0] if possible else None),
+            "status": status,
+            "unknown_members": [did for did, cap in members.items() if not cap],
+        }
+
     async def _error_retry_loop(self) -> None:
-        """Re-issue the stream to speakers that failed at session start, until
-        they accept it or the error is cleared (session stop / manual stop)."""
+        """Re-issue the stream to speakers that failed at session start.
+
+        Backs off exponentially per device and gives up after
+        PLAY_ERROR_MAX_ATTEMPTS: a speaker removed from the account or powered
+        off for good must not be retried (and cloud-hammered) forever. The
+        recorded error is dropped together with the retry state; normal clears
+        (session stop, manual stop, successful retry) also prune the counter.
+        """
+        attempts_map = getattr(self, "_play_error_attempts", None)
+        if attempts_map is None:  # tolerate __new__-built instances in tests
+            attempts_map = self._play_error_attempts = {}
         while self._play_errors:
-            await asyncio.sleep(PLAY_ERROR_RETRY_SECONDS)
+            pending = [did for did in self._play_errors if did in attempts_map]
+            delays = [
+                min(
+                    PLAY_ERROR_RETRY_SECONDS
+                    * (PLAY_ERROR_BACKOFF_FACTOR ** max(0, attempts_map[did] - 1)),
+                    PLAY_ERROR_MAX_BACKOFF_SECONDS,
+                )
+                for did in pending
+            ]
+            await asyncio.sleep(min(delays) if delays else PLAY_ERROR_RETRY_SECONDS)
             for did, entry in list(self._play_errors.items()):
                 url = entry.get("url")
                 if not url:
                     self._play_errors.pop(did, None)
+                    attempts_map.pop(did, None)
+                    continue
+                if attempts_map.get(did, 0) >= PLAY_ERROR_MAX_ATTEMPTS:
+                    logger.warning(
+                        "Speaker %s still not playing after %d retries; "
+                        "giving up until the next session",
+                        did,
+                        PLAY_ERROR_MAX_ATTEMPTS,
+                    )
+                    self._play_errors.pop(did, None)
+                    attempts_map.pop(did, None)
                     continue
                 try:
                     await self.play_stream(did, url, owner=entry.get("receiver"), force=True)
                 except Exception as exc:
                     logger.debug("Retry of failed speaker %s: %s", did, exc)
+                    attempts_map[did] = attempts_map.get(did, 0) + 1
                     continue
                 logger.info("Speaker %s recovered after a failed start", did)
                 self._play_errors.pop(did, None)
+                attempts_map.pop(did, None)
 
     async def set_volume(self, device_id: str, volume: int) -> int:
         """Set and cache speaker volume after the device accepts it."""
@@ -491,9 +699,7 @@ class DeviceManager:
                         try:
                             await self.on_anchor_recovered(anchor_group)
                         except Exception:
-                            logger.exception(
-                                "anchor-recovered hook failed for %s", anchor_group
-                            )
+                            logger.exception("anchor-recovered hook failed for %s", anchor_group)
                     continue
                 inactive_checks += 1
                 if inactive_checks < 3:
@@ -511,9 +717,7 @@ class DeviceManager:
                     try:
                         await self.on_anchor_offline(anchor_group)
                     except Exception:
-                        logger.exception(
-                            "anchor-offline hook failed for %s", anchor_group
-                        )
+                        logger.exception("anchor-offline hook failed for %s", anchor_group)
                     inactive_checks = 0
                     continue
                 url = self._stream_urls.get(device_id)
@@ -577,6 +781,7 @@ class DeviceManager:
                     "enabled": speaker.enabled if speaker else False,
                     "selected": did == self.selected_device_id,
                     "play_error": self._play_errors.get(did, {}).get("error"),
+                    "codec_capabilities": self.codec_capabilities(did),
                 }
             )
         return result

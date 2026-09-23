@@ -1,5 +1,6 @@
 """Thin wrapper around MiNAService for Xiaomi speaker control."""
 
+import asyncio
 import logging
 import re
 import time
@@ -7,6 +8,7 @@ import time
 from miservice import MiNAService
 
 logger = logging.getLogger(__name__)
+COMMAND_TIMEOUT_SECONDS = 15.0
 
 
 class MinaAPI:
@@ -16,16 +18,31 @@ class MinaAPI:
         self.service = service
         self.device_id = device_id
 
+    async def _call(self, operation):
+        """Bound third-party calls so one device cannot hold its lock forever.
+
+        miservice-fork runs on a caller-owned aiohttp ClientSession, and
+        aiohttp absorbs CancelledError by releasing the connection back to
+        its pool, so wait_for's timeout cancellation is connection-safe and
+        never poisons the shared session.
+        """
+        try:
+            return await asyncio.wait_for(operation, timeout=COMMAND_TIMEOUT_SECONDS)
+        except TimeoutError:
+            raise TimeoutError(
+                f"小米音箱命令超时（{COMMAND_TIMEOUT_SECONDS:.0f}s）：{self.device_id}"
+            ) from None
+
     async def device_list(self) -> list[dict]:
         """Return all Xiaomi AI devices."""
-        result = await self.service.device_list()
+        result = await self._call(self.service.device_list())
         if isinstance(result, list):
             return result
         return result.get("data", [])
 
     async def play_url(self, url: str) -> dict:
         logger.info("Playing URL on %s: %s", self.device_id, url)
-        return await self.service.play_by_url(self.device_id, url)
+        return await self._call(self.service.play_by_url(self.device_id, url))
 
     async def play_music_url(self, url: str, audio_id: str | None = None) -> dict:
         """Use the newer player_play_music ubus method; works better on some devices.
@@ -35,7 +52,7 @@ class MinaAPI:
         """
         logger.info("Playing music URL on %s: %s", self.device_id, url)
         kwargs = {"audio_id": audio_id} if audio_id else {}
-        return await self.service.play_by_music_url(self.device_id, url, **kwargs)
+        return await self._call(self.service.play_by_music_url(self.device_id, url, **kwargs))
 
     async def search_audio_id(
         self, title: str, artist: str = "", fuzzy_fallback: bool = True
@@ -67,7 +84,7 @@ class MinaAPI:
             break
         query = f"{title}-{query_artist}" if query_artist else title
         try:
-            result = await self.service.mina_request(
+            result = await self._call(self.service.mina_request(
                 "/music/search",
                 {
                     "query": query,
@@ -76,7 +93,7 @@ class MinaAPI:
                     "count": "6",
                     "timestamp": str(int(time.time() * 1000)),
                 },
-            )
+            ))
         except Exception as exc:
             logger.warning("曲库搜索失败 (%s): %s", query, exc)
             return ""
@@ -92,8 +109,10 @@ class MinaAPI:
             song_artist = (song.get("artist") or {}).get("name") or ""
             if name.lower() != title.lower():
                 continue
-            if first_artist and first_artist.lower() not in song_artist.lower() and not (
-                song_artist and song_artist.lower() in artist_l
+            if (
+                first_artist
+                and first_artist.lower() not in song_artist.lower()
+                and not (song_artist and song_artist.lower() in artist_l)
             ):
                 continue
             audio_id = str(song.get("audioID") or "")
@@ -105,22 +124,24 @@ class MinaAPI:
             if audio_id:
                 logger.info(
                     "曲库无精确匹配，回退首条 (%s) %s audioID=%s",
-                    query, song_list[0].get("name", ""), audio_id,
+                    query,
+                    song_list[0].get("name", ""),
+                    audio_id,
                 )
                 return audio_id
         return ""
 
     async def pause(self) -> dict:
-        return await self.service.player_pause(self.device_id)
+        return await self._call(self.service.player_pause(self.device_id))
 
     async def play(self) -> dict:
-        return await self.service.player_play(self.device_id)
+        return await self._call(self.service.player_play(self.device_id))
 
     async def stop(self) -> dict:
-        return await self.service.player_stop(self.device_id)
+        return await self._call(self.service.player_stop(self.device_id))
 
     async def set_volume(self, volume: int) -> dict:
-        return await self.service.player_set_volume(self.device_id, volume)
+        return await self._call(self.service.player_set_volume(self.device_id, volume))
 
     async def get_status(self) -> dict:
-        return await self.service.player_get_status(self.device_id)
+        return await self._call(self.service.player_get_status(self.device_id))

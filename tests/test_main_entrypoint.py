@@ -33,7 +33,9 @@ def test_tcp_mode_keeps_host_and_resolved_port(monkeypatch):
     monkeypatch.delenv("MICAST_UNIX_SOCKET", raising=False)
     monkeypatch.setattr(entrypoint.settings, "port", 3000)
     monkeypatch.setattr(entrypoint, "resolve_port", lambda *_: 3456)
-    monkeypatch.setattr(entrypoint.uvicorn, "run", lambda app, **kwargs: calls.append((app, kwargs)))
+    monkeypatch.setattr(
+        entrypoint.uvicorn, "run", lambda app, **kwargs: calls.append((app, kwargs))
+    )
     monkeypatch.setitem(sys.modules, "micast.main", SimpleNamespace(app=fake_app))
 
     entrypoint.main()

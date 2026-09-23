@@ -13,6 +13,7 @@ import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from micast.access import COOKIE_NAME, AccessManager
+from micast.config import settings
 from micast.routes.playback import build_playback_state
 
 logger = logging.getLogger(__name__)
@@ -23,8 +24,10 @@ router = APIRouter(tags=["ws"])
 def install(bridge, device_manager, access_manager: AccessManager | None = None) -> APIRouter:
     @router.websocket("/api/ws")
     async def state_ws(websocket: WebSocket):
-        if access_manager and access_manager.auth_enabled and not access_manager.valid_session(
-            websocket.cookies.get(COOKIE_NAME)
+        if (
+            access_manager
+            and access_manager.auth_enabled
+            and not access_manager.valid_session(websocket.cookies.get(COOKIE_NAME))
         ):
             await websocket.close(code=4401)
             return
@@ -32,6 +35,8 @@ def install(bridge, device_manager, access_manager: AccessManager | None = None)
         try:
             status_json = ""
             playback_json = ""
+            tuning_json = ""
+            config_revision = -1
             ticks = 0
             while True:
                 status = json.dumps(bridge.status, ensure_ascii=False)
@@ -48,6 +53,18 @@ def install(bridge, device_manager, access_manager: AccessManager | None = None)
                         await websocket.send_text(
                             json.dumps({"type": "playback", "data": playback}, ensure_ascii=False)
                         )
+                tuning = {speaker.did: speaker.eq_revision for speaker in settings.speakers}
+                payload = json.dumps(tuning, ensure_ascii=False, sort_keys=True)
+                if payload != tuning_json:
+                    tuning_json = payload
+                    await websocket.send_text(
+                        json.dumps({"type": "tuning", "data": tuning}, ensure_ascii=False)
+                    )
+                if settings.config_revision != config_revision:
+                    config_revision = settings.config_revision
+                    await websocket.send_text(
+                        json.dumps({"type": "config", "revision": config_revision})
+                    )
                 ticks += 1
                 await asyncio.sleep(2)
         except WebSocketDisconnect:

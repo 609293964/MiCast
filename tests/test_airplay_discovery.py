@@ -58,7 +58,9 @@ def test_update_group_sanitizes_airplay_targets(cfg):
 
 def test_receiver_airplay_targets(cfg):
     cfg.groups = [
-        SpeakerGroupConfig(id="g1", name="全屋", speaker_ids=["a", "b"], airplay_targets=["aabbccddeeff"])
+        SpeakerGroupConfig(
+            id="g1", name="全屋", speaker_ids=["a", "b"], airplay_targets=["aabbccddeeff"]
+        )
     ]
     cfg.receivers = [ReceiverConfig(id="r1", name="全屋", target_type="group", target_id="g1")]
     assert cfg.receiver_airplay_targets("r1") == ["aabbccddeeff"]

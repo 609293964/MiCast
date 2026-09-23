@@ -63,9 +63,7 @@ def _run_with_unix_socket(app, socket_path: Path) -> None:
         servers = [
             uvicorn.Server(uvicorn.Config(app, uds=str(socket_path), log_level="info")),
             uvicorn.Server(
-                uvicorn.Config(
-                    dlna_app, host=settings.host, port=settings.port, log_level="info"
-                )
+                uvicorn.Config(dlna_app, host=settings.host, port=settings.port, log_level="info")
             ),
         ]
         await asyncio.gather(*(server.serve() for server in servers))

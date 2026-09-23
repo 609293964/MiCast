@@ -68,7 +68,7 @@ class LyricsSession:
             logger.exception("Lyrics session failed for %s", self.receiver_id)
 
     async def _watch(self) -> None:
-        tried: set[str] = set()       # searched, no hit — don't spam the API
+        tried: set[str] = set()  # searched, no hit — don't spam the API
         matched: dict[str, str] = {}  # title -> audioID, for "back to previous"
         last_seq = self.server.daap_events[-1][0] if self.server.daap_events else 0
         while True:

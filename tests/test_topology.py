@@ -8,7 +8,9 @@ from micast.config import AirPlay2InstanceConfig, ReceiverConfig, Settings, Spea
 
 class FakeBridge:
     def __init__(
-        self, diagnostics: dict, receivers: list[dict] | None = None,
+        self,
+        diagnostics: dict,
+        receivers: list[dict] | None = None,
         airplay2_instances: list[dict] | None = None,
     ):
         self._diagnostics = diagnostics
@@ -22,7 +24,8 @@ class FakeBridge:
     @property
     def status(self):
         return {
-            "status": "running", "receivers": self._receivers,
+            "status": "running",
+            "receivers": self._receivers,
             "airplay2_instances": self._airplay2_instances,
         }
 
@@ -89,7 +92,15 @@ def test_single_speaker_path(fake_settings):
     bridge = FakeBridge(
         {
             "raop": _raop_diag(),
-            "streams": {"r1": {"clients": 1, "flowing": True, "bytes_sent": 100, "dropped_chunks": 0, "latency": _latency()}},
+            "streams": {
+                "r1": {
+                    "clients": 1,
+                    "flowing": True,
+                    "bytes_sent": 100,
+                    "dropped_chunks": 0,
+                    "latency": _latency(),
+                }
+            },
         }
     )
     dm = FakeDeviceManager(playing=["didA"])
@@ -136,7 +147,15 @@ def test_mirror_group_fans_out_one_stream_to_many_speakers(fake_settings):
     bridge = FakeBridge(
         {
             "raop": _raop_diag(),
-            "streams": {"r1": {"clients": 2, "flowing": True, "bytes_sent": 0, "dropped_chunks": 0, "latency": _latency()}},
+            "streams": {
+                "r1": {
+                    "clients": 2,
+                    "flowing": True,
+                    "bytes_sent": 0,
+                    "dropped_chunks": 0,
+                    "latency": _latency(),
+                }
+            },
         }
     )
     dm = FakeDeviceManager(playing=["didA", "didB"])
@@ -169,8 +188,20 @@ def test_stereo_group_splits_into_channel_streams(fake_settings):
         {
             "raop": _raop_diag(),
             "streams": {
-                "r1-L": {"clients": 1, "flowing": True, "bytes_sent": 0, "dropped_chunks": 0, "latency": _latency()},
-                "r1-R": {"clients": 1, "flowing": True, "bytes_sent": 0, "dropped_chunks": 0, "latency": _latency()},
+                "r1-L": {
+                    "clients": 1,
+                    "flowing": True,
+                    "bytes_sent": 0,
+                    "dropped_chunks": 0,
+                    "latency": _latency(),
+                },
+                "r1-R": {
+                    "clients": 1,
+                    "flowing": True,
+                    "bytes_sent": 0,
+                    "dropped_chunks": 0,
+                    "latency": _latency(),
+                },
             },
         }
     )
@@ -194,7 +225,15 @@ def test_inactive_when_no_source_session_and_no_clients(fake_settings):
     bridge = FakeBridge(
         {
             "raop": _raop_diag(sessions=0),
-            "streams": {"r1": {"clients": 0, "flowing": False, "bytes_sent": 0, "dropped_chunks": 0, "latency": _latency()}},
+            "streams": {
+                "r1": {
+                    "clients": 0,
+                    "flowing": False,
+                    "bytes_sent": 0,
+                    "dropped_chunks": 0,
+                    "latency": _latency(),
+                }
+            },
         }
     )
     dm = FakeDeviceManager()
@@ -216,7 +255,15 @@ def test_passthrough_skips_the_transcoder(fake_settings):
     bridge = FakeBridge(
         {
             "raop": _raop_diag(),
-            "streams": {"r1": {"clients": 1, "flowing": True, "bytes_sent": 0, "dropped_chunks": 0, "latency": _latency()}},
+            "streams": {
+                "r1": {
+                    "clients": 1,
+                    "flowing": True,
+                    "bytes_sent": 0,
+                    "dropped_chunks": 0,
+                    "latency": _latency(),
+                }
+            },
         }
     )
     snap = topology.build_topology(bridge, FakeDeviceManager(playing=["didA"]))
@@ -235,6 +282,21 @@ def test_no_speakers_no_cloud_node(fake_settings):
     assert "cloud:xiaomi" not in {n["id"] for n in snap["nodes"]}
 
 
+def test_unmapped_airplay2_target_is_not_rendered_as_speaker(fake_settings):
+    fake_settings.airplay2_instances = [
+        AirPlay2InstanceConfig(
+            id="airplay2",
+            name="MiCast",
+            target_type="speaker",
+            target_id="unmapped",
+            enabled=True,
+        )
+    ]
+    bridge = FakeBridge({"raop": {}, "streams": {}})
+    snap = topology.build_topology(bridge, FakeDeviceManager())
+    assert "spk:unmapped" not in {node["id"] for node in snap["nodes"]}
+
+
 def test_airplay2_path_uses_live_stream_and_owner_as_session(fake_settings):
     fake_settings.airplay2_instances = [
         AirPlay2InstanceConfig(
@@ -246,14 +308,15 @@ def test_airplay2_path_uses_live_stream_and_owner_as_session(fake_settings):
             "raop": {},
             "streams": {
                 "airplay2": {
-                    "clients": 1, "flowing": True, "bytes_sent": 100,
-                    "dropped_chunks": 0, "latency": _latency(),
+                    "clients": 1,
+                    "flowing": True,
+                    "bytes_sent": 100,
+                    "dropped_chunks": 0,
+                    "latency": _latency(),
                 }
             },
         },
-        airplay2_instances=[
-            {"id": "airplay2", "status": "running", "detail": "运行正常"}
-        ],
+        airplay2_instances=[{"id": "airplay2", "status": "running", "detail": "运行正常"}],
     )
     dm = FakeDeviceManager(playing=["didA"], owners={"didA": "airplay2"})
 

@@ -27,17 +27,13 @@ async def test_group_recovery_releases_members_on_one_future_boundary():
     server.register_stream("group-R", stream_format)
     server.begin_group_recovery("group", ["speaker-a", "speaker-b"])
 
-    response_a = await server._serve_stream(
-        _request(), "group-L", "group", "speaker-a"
-    )
+    response_a = await server._serve_stream(_request(), "group-L", "group", "speaker-a")
     first_a = asyncio.create_task(anext(response_a.body_iterator))
     await server.broadcast("group-L", b"old-a" * 4000)
     await asyncio.sleep(0)
     assert not first_a.done()
 
-    response_b = await server._serve_stream(
-        _request(), "group-R", "group", "speaker-b"
-    )
+    response_b = await server._serve_stream(_request(), "group-R", "group", "speaker-b")
     first_b = asyncio.create_task(anext(response_b.body_iterator))
     await server.broadcast("group-L", b"A" * 20_000)
     await server.broadcast("group-R", b"B" * 20_000)
@@ -63,9 +59,7 @@ def test_aborting_group_recovery_releases_waiters():
 async def test_sink_connected_tracks_replacement_client():
     server = StreamServer()
     server.register_stream("group-L", StreamFormat("audio/mpeg", "mp3", 40_000))
-    response = await server._serve_stream(
-        _request(), "group-L", "group", "speaker-a"
-    )
+    response = await server._serve_stream(_request(), "group-L", "group", "speaker-a")
 
     assert server.sink_connected("group", "speaker-a")
     assert not server.sink_connected("group", "speaker-b")

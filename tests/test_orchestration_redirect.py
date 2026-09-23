@@ -77,10 +77,16 @@ async def test_orchestrator_health_checks_expected_endpoint(monkeypatch):
 @pytest.mark.asyncio
 async def test_capabilities_are_verified(monkeypatch):
     async def handler(request):
-        return httpx.Response(200, json={
-            "api_version": "1", "protocols": ["airplay2"],
-            "instance_mode": "dynamic", "max_instances": 8, "features": {},
-        })
+        return httpx.Response(
+            200,
+            json={
+                "api_version": "1",
+                "protocols": ["airplay2"],
+                "instance_mode": "dynamic",
+                "max_instances": 8,
+                "features": {},
+            },
+        )
 
     transport = httpx.MockTransport(handler)
     original = httpx.AsyncClient

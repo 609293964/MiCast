@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import io
 import json
 import logging
 import mimetypes
@@ -20,6 +21,7 @@ from micast.audio_bridge import AudioBridge
 from micast.audio_encoder import transcode_file_to_wav
 from micast.config import settings
 from micast.diagnostics import build_report, collect_state
+from micast.playback_lifecycle import stop_output
 from micast.test_tone import test_tone_wav
 from micast.url_safety import validate_http_url
 from micast.xiaomi.device_manager import DeviceManager
@@ -49,9 +51,9 @@ def _mina_command_accepted(result: object) -> bool:
         return False
     data = result.get("data")
     return not isinstance(data, dict) or data.get("code", 0) == 0
-def _request_offsets(
-    arrivals: dict[str, float], anchor: str, members: list[str]
-) -> dict[str, int]:
+
+
+def _request_offsets(arrivals: dict[str, float], anchor: str, members: list[str]) -> dict[str, int]:
     """Convert test-tone request skew into a coarse magnitude reference.
 
     Request order cannot determine audible direction because each speaker has
@@ -68,6 +70,49 @@ def _request_offsets(
     return {did: value for did, value in result.items() if value != 0}
 
 
+async def _restore_streams(
+    device_manager: DeviceManager,
+    previous: dict[str, tuple[str | None, str | None]],
+    *,
+    attempts: int = 3,
+    retry_delay: float = 0.4,
+) -> list[str]:
+    """Restore every pre-calibration stream and report speakers still failed.
+
+    Xiaomi's cloud command can transiently accept one member and reject the
+    next. Retrying only failed members prevents a calibration from silently
+    leaving half a group stopped. Persistent failures enter the existing
+    background recovery loop as well as being reported to the caller.
+    """
+    pending = {did for did, (url, _owner) in previous.items() if url}
+    for attempt in range(max(1, attempts)):
+        if not pending:
+            break
+
+        async def restore(did: str) -> tuple[str, bool]:
+            url, owner = previous[did]
+            try:
+                result = await asyncio.wait_for(
+                    device_manager.play_stream(did, url, owner=owner, force=True),
+                    timeout=8,
+                )
+                return did, result is not False
+            except Exception:
+                logger.exception("Failed to restore speaker %s after calibration", did)
+                return did, False
+
+        results = await asyncio.gather(*(restore(did) for did in pending))
+        pending = {did for did, ok in results if not ok}
+        if pending and attempt + 1 < attempts:
+            await asyncio.sleep(retry_delay)
+
+    for did in pending:
+        url, owner = previous[did]
+        if url:
+            device_manager.note_play_error(did, owner or "calibration-restore", "恢复播放失败", url)
+    return sorted(pending)
+
+
 def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
     live_calibrations: dict[str, dict] = {}
     upload_dir = Path(tempfile.gettempdir()) / "micast-test-audio"
@@ -75,6 +120,35 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
     upload_dir.mkdir(parents=True, exist_ok=True)
     uploaded_media: dict[str, dict] = {}
     active_tests: dict[str, dict] = {}
+    codec_fixtures: dict[str, tuple[str, Path, str]] = {}
+
+    def ensure_codec_fixtures() -> dict[str, tuple[str, Path, str]]:
+        if codec_fixtures:
+            return codec_fixtures
+        specs = {
+            "MP3": ("mp3", "libmp3lame", "audio/mpeg"),
+            "FLAC": ("flac", "flac", "audio/flac"),
+            "WAV": ("wav", "pcm_s16le", "audio/wav"),
+        }
+        source_bytes = test_tone_wav()
+        for label, (extension, codec, media_type) in specs.items():
+            token = f"codec-{label.lower()}-{secrets.token_urlsafe(6)}"
+            path = upload_dir / f"{token}.{extension}"
+            with av.open(io.BytesIO(source_bytes), mode="r") as source, av.open(
+                str(path), mode="w", format=extension
+            ) as target:
+                stream = target.add_stream(codec, rate=44100)
+                stream.layout = "stereo"
+                for frame in source.decode(audio=0):
+                    frame.sample_rate = 44100
+                    for packet in stream.encode(frame):
+                        target.mux(packet)
+                for packet in stream.encode(None):
+                    target.mux(packet)
+            bridge._stream_server.register_diagnostic_media(token, path, media_type)
+            codec_fixtures[label] = (token, path, media_type)
+        return codec_fixtures
+
 
     def media_info(path: Path) -> tuple[float | None, str]:
         try:
@@ -90,20 +164,29 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
         if not active:
             return {"ok": True, "restored": 0}
         owner = active["owner"]
-        await asyncio.gather(*(
-            device_manager.stop_playback(did, owner=owner) for did in active["members"]
-        ), return_exceptions=True)
+        await asyncio.gather(
+            *(device_manager.stop_playback(did, owner=owner) for did in active["members"]),
+            return_exceptions=True,
+        )
         restored = 0
         if restore:
-            results = await asyncio.gather(*(
-                device_manager.play_stream(did, url, owner=previous_owner, force=True)
-                for did, (url, previous_owner) in active["previous"].items() if url
-            ), return_exceptions=True)
+            results = await asyncio.gather(
+                *(
+                    device_manager.play_stream(did, url, owner=previous_owner, force=True)
+                    for did, (url, previous_owner) in active["previous"].items()
+                    if url
+                ),
+                return_exceptions=True,
+            )
             restored = sum(item is True for item in results)
-            await asyncio.gather(*(
-                device_manager.set_volume(did, volume)
-                for did, volume in active["volumes"].items() if volume is not None
-            ), return_exceptions=True)
+            await asyncio.gather(
+                *(
+                    device_manager.set_volume(did, volume)
+                    for did, volume in active["volumes"].items()
+                    if volume is not None
+                ),
+                return_exceptions=True,
+            )
         return {"ok": True, "restored": restored}
 
     @router.post("/media")
@@ -205,9 +288,10 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
             did: (device_manager.stream_url_of(did), device_manager.owner_of(did))
             for did in members
         }
-        volume_results = await asyncio.gather(*(
-            device_manager.get_volume(did, refresh=True) for did in members
-        ), return_exceptions=True)
+        volume_results = await asyncio.gather(
+            *(device_manager.get_volume(did, refresh=True) for did in members),
+            return_exceptions=True,
+        )
         volumes = {
             did: (value if isinstance(value, int) else None)
             for did, value in zip(members, volume_results, strict=True)
@@ -219,12 +303,15 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
             "source": source,
             "volumes": volumes,
         }
-        results = await asyncio.gather(*(
-            device_manager.play_stream(
-                did, url, owner=owner, force=True, audio_id=str(time.time_ns())
-            )
-            for did in members
-        ), return_exceptions=True)
+        results = await asyncio.gather(
+            *(
+                device_manager.play_stream(
+                    did, url, owner=owner, force=True, audio_id=str(time.time_ns())
+                )
+                for did in members
+            ),
+            return_exceptions=True,
+        )
         failed = sum(isinstance(item, Exception) or item is False for item in results)
         if failed:
             await stop_test(session_id)
@@ -237,10 +324,60 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
             str(payload.get("session_id", "")), bool(payload.get("restore", True))
         )
 
-    async def stop_live_calibration(group_id: str) -> None:
+    @router.post("/codec-test")
+    async def codec_test(payload: dict):
+        members = [str(item) for item in payload.get("device_ids", []) if item]
+        known = {str(item.get("deviceID")) for item in await device_manager.list_devices()}
+        if not members or any(did not in known for did in members):
+            raise HTTPException(status_code=400, detail="请选择可用的检测音箱")
+        fixtures = ensure_codec_fixtures()
+        previous = {
+            did: (device_manager.stream_url_of(did), device_manager.owner_of(did))
+            for did in members
+        }
+        results: dict[str, dict[str, bool]] = {did: {} for did in members}
+        owner = f"codec-test:{secrets.token_urlsafe(8)}"
+        try:
+            for did in members:
+                for label, (token, _path, _media_type) in fixtures.items():
+                    before = bridge._stream_server.diagnostic_hits(token)
+                    url = f"http://{settings.effective_stream_host}:{settings.stream_port}/diagnostic/media/{token}?probe={time.time_ns()}"
+                    try:
+                        accepted = await device_manager.play_stream(
+                            did, url, owner=owner, force=True, audio_id=str(time.time_ns())
+                        )
+                        await asyncio.sleep(2.0)
+                        supported = (
+                            accepted is not False
+                            and bridge._stream_server.diagnostic_hits(token) > before
+                        )
+                    except Exception:
+                        supported = False
+                    results[did][label] = supported
+                    device_manager.note_codec_capability(did, label, supported, "active_probe")
+                    await device_manager.stop_playback(did, owner=owner)
+                results[did]["PCM/WAV"] = results[did].get("WAV", False)
+                device_manager.note_codec_capability(
+                    did, "PCM/WAV", results[did]["PCM/WAV"], "active_probe"
+                )
+        finally:
+            failed_restore = await _restore_streams(device_manager, previous)
+        common = [
+            fmt
+            for fmt in ("MP3", "FLAC", "WAV", "PCM/WAV")
+            if all(item.get(fmt) is True for item in results.values())
+        ]
+        return {
+            "ok": True,
+            "results": results,
+            "common_formats": common,
+            "restore_failed": failed_restore,
+        }
+
+    async def stop_live_calibration(group_id: str) -> list[str]:
         active = live_calibrations.pop(group_id, None)
         if not active:
-            return
+            return []
         bridge._stream_server.end_delay_calibration(active["token"])
 
         async def bounded(operation):
@@ -249,14 +386,14 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
             except TimeoutError:
                 return False
 
-        await asyncio.gather(*(
-            bounded(device_manager.stop_playback(did, owner=active["owner"]))
-            for did in active["members"]
-        ), return_exceptions=True)
-        await asyncio.gather(*(
-            bounded(device_manager.play_stream(did, url, owner=owner, force=True))
-            for did, (url, owner) in active["previous"].items() if url
-        ), return_exceptions=True)
+        await asyncio.gather(
+            *(
+                bounded(device_manager.stop_playback(did, owner=active["owner"]))
+                for did in active["members"]
+            ),
+            return_exceptions=True,
+        )
+        return await _restore_streams(device_manager, active["previous"])
 
     @router.post("/groups/{group_id}/calibration/start")
     async def start_live_calibration(group_id: str, payload: dict | None = None):
@@ -289,6 +426,7 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
             "previous": previous,
         }
         base = f"http://{settings.effective_stream_host}:{settings.stream_port}"
+
         async def start_member(did: str):
             return await asyncio.wait_for(
                 device_manager.play_stream(
@@ -316,7 +454,12 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
 
     @router.post("/groups/{group_id}/calibration/stop")
     async def stop_calibration(group_id: str):
-        await stop_live_calibration(group_id)
+        failed = await stop_live_calibration(group_id)
+        if failed:
+            raise HTTPException(
+                status_code=502,
+                detail=f"校准已结束，但有 {len(failed)} 台音箱暂未恢复播放，系统正在自动重试",
+            )
         return {"ok": True}
 
     @router.get("/device-status/{device_id}")
@@ -401,12 +544,9 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
             # Let the recognizable sample play briefly before restoring the
             # content that was active when calibration began.
             await asyncio.sleep(max(0.0, 3.0 - (time.monotonic() - sample_started)))
-            request_offsets = _request_offsets(
-                session["arrivals"], group.anchor_did, members
-            )
+            request_offsets = _request_offsets(session["arrivals"], group.anchor_did, members)
             spread_ms = round(
-                (max(session["arrivals"].values()) - min(session["arrivals"].values()))
-                * 1000
+                (max(session["arrivals"].values()) - min(session["arrivals"].values())) * 1000
             )
             return {
                 "ok": True,
@@ -420,20 +560,10 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
             # leave a cached/queued test item playing beyond the promised
             # sample window.
             await asyncio.gather(
-                *(
-                    device_manager.stop_playback(did, owner=calibration_owner)
-                    for did in members
-                ),
+                *(device_manager.stop_playback(did, owner=calibration_owner) for did in members),
                 return_exceptions=True,
             )
-            await asyncio.gather(
-                *(
-                    device_manager.play_stream(did, url, owner=owner, force=True)
-                    for did, (url, owner) in previous.items()
-                    if url
-                ),
-                return_exceptions=True,
-            )
+            await _restore_streams(device_manager, previous)
 
     @router.get("/state")
     async def debug_state():
@@ -578,23 +708,7 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
 
     @router.post("/stream/{receiver_id}/kick")
     async def kick_stream(receiver_id: str):
-        """Disconnect sender and stream clients, then stop target speakers."""
-        sender_sessions = await bridge.disconnect_sessions(
-            receiver_id.removesuffix("-L").removesuffix("-R")
-        )
-        kicked = bridge._stream_server.kick_clients(receiver_id)
-        # Stereo pairs expose "<receiver>-L"/"-R" streams; stop via the base id.
-        base_id = receiver_id.removesuffix("-L").removesuffix("-R")
-        targets = settings.receiver_targets(base_id)
-        await asyncio.gather(
-            *(device_manager.stop_playback(did) for did in targets),
-            return_exceptions=True,
-        )
-        return {
-            "ok": True,
-            "kicked": kicked,
-            "sender_sessions": sender_sessions,
-            "stopped": targets,
-        }
+        result = await stop_output(bridge, device_manager, receiver_id)
+        return {"ok": True, "sender_sessions": result["disconnected"], **result}
 
     return router

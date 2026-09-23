@@ -40,7 +40,7 @@ def _strip_artist_suffix(title: str, artist: str) -> str:
         idx = title.find(sep)
         if idx <= 0:
             continue
-        prefix, suffix = title[:idx].strip(), title[idx + len(sep):].strip()
+        prefix, suffix = title[:idx].strip(), title[idx + len(sep) :].strip()
         if not prefix or not suffix:
             continue
         if artist:
@@ -66,7 +66,7 @@ def _strip_artist_prefix(title: str, artist: str) -> str:
         idx = title.find(sep)
         if idx <= 0:
             continue
-        prefix, rest = title[:idx].strip(), title[idx + len(sep):].strip()
+        prefix, rest = title[:idx].strip(), title[idx + len(sep) :].strip()
         if not prefix or not rest:
             continue
         if prefix == artist or artist.startswith(prefix):
@@ -103,7 +103,7 @@ def _split_title_artist(title: str) -> tuple[str, str]:
     for sep in (" - ", " · ", " — "):
         idx = title.rfind(sep)
         if idx > 0:
-            prefix, suffix = title[:idx].strip(), title[idx + len(sep):].strip()
+            prefix, suffix = title[:idx].strip(), title[idx + len(sep) :].strip()
             if prefix and suffix and len(suffix) <= 12:
                 return prefix, suffix
     return title, ""

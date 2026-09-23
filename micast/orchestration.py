@@ -70,9 +70,14 @@ class OrchestratorClient:
             response = await client.get(f"{self.base_url}/v1/capabilities", headers=headers)
         if response.status_code == 404:
             return {
-                "api_version": "unknown", "protocols": [], "instance_mode": "unknown",
-                "max_instances": 1, "features": {}, "verified": False,
-                "status": "unreported", "reason": "capability_endpoint_missing",
+                "api_version": "unknown",
+                "protocols": [],
+                "instance_mode": "unknown",
+                "max_instances": 1,
+                "features": {},
+                "verified": False,
+                "status": "unreported",
+                "reason": "capability_endpoint_missing",
             }
         response.raise_for_status()
         data = response.json()

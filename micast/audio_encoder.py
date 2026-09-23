@@ -208,8 +208,10 @@ class AudioEncoder:
         self.config = config
         self.input_sample_rate = input_sample_rate or settings.pcm_sample_rate
         self.audio_filter = audio_filter
-        self._in: queue.Queue[bytes | None] = queue.Queue()
-        self._out: asyncio.Queue[bytes | None] = asyncio.Queue()
+        # Realtime audio must never accumulate without limit. At 44.1 kHz,
+        # unbounded PCM grows by ~635 MB/hour when an encoder stalls.
+        self._in: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
+        self._out: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._exit_code: int | None = None
@@ -289,7 +291,7 @@ class AudioEncoder:
             self._exit_code = 1
         finally:
             # EOF marker unblocks the pipeline's stdout pump.
-            self._loop.call_soon_threadsafe(self._out.put_nowait, None)
+            self._loop.call_soon_threadsafe(_put_latest_async, self._out, None)
 
     def _transcode(self) -> None:
         assert self._loop is not None
@@ -297,7 +299,7 @@ class AudioEncoder:
         loop = self._loop
 
         def emit(chunk: bytes) -> None:
-            loop.call_soon_threadsafe(out.put_nowait, chunk)
+            loop.call_soon_threadsafe(_put_latest_async, out, chunk)
 
         container = av.open(_StreamSink(emit), mode="w", format=self.config.format)
         stream = _open_encoder(
@@ -332,15 +334,34 @@ class _PCMWriter:
         self._queue = pcm_queue
 
     def write(self, data: bytes) -> None:
-        self._queue.put(data)
+        _put_latest_sync(self._queue, data)
 
     def write_eof(self) -> None:
-        self._queue.put(None)
+        _put_latest_sync(self._queue, None)
 
     async def drain(self) -> None:
         # libavcodec encodes several times faster than realtime; an unbounded
         # queue therefore stays near-empty and no backpressure is needed.
         return
+
+
+def _put_latest_sync(target: queue.Queue, item: bytes | None) -> None:
+    """Bound latency by discarding the oldest realtime chunk on overflow."""
+    try:
+        target.put_nowait(item)
+    except queue.Full:
+        with contextlib.suppress(queue.Empty):
+            target.get_nowait()
+        target.put_nowait(item)
+
+
+def _put_latest_async(target: asyncio.Queue, item: bytes | None) -> None:
+    try:
+        target.put_nowait(item)
+    except asyncio.QueueFull:
+        with contextlib.suppress(asyncio.QueueEmpty):
+            target.get_nowait()
+        target.put_nowait(item)
 
 
 class _EncodedReader:

@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import time
+from contextlib import suppress
 from pathlib import Path
 
 from micast.config import settings
@@ -48,10 +49,8 @@ class AccessManager:
 
     def reset(self) -> None:
         """Wipe credentials and setup flags (清空数据 → 回到引导页)."""
-        try:
+        with suppress(OSError):
             self.path.unlink()
-        except OSError:
-            pass
         self._data = self._load()  # file is gone → fresh defaults
 
     @property
@@ -82,14 +81,16 @@ class AccessManager:
         if enabled and len(password) < 6:
             raise ValueError("密码至少需要 6 个字符")
         salt = secrets.token_bytes(16) if enabled else b""
-        self._data.update({
-            "access_configured": True,
-            "auth_enabled": enabled,
-            "username": username,
-            "salt": base64.urlsafe_b64encode(salt).decode() if salt else "",
-            "password_hash": self._hash(password, salt) if enabled else "",
-            "auth_version": int(self._data.get("auth_version", 0)) + 1,
-        })
+        self._data.update(
+            {
+                "access_configured": True,
+                "auth_enabled": enabled,
+                "username": username,
+                "salt": base64.urlsafe_b64encode(salt).decode() if salt else "",
+                "password_hash": self._hash(password, salt) if enabled else "",
+                "auth_version": int(self._data.get("auth_version", 0)) + 1,
+            }
+        )
         self._data.setdefault("secret", secrets.token_hex(32))
         self._save()
 
@@ -139,4 +140,3 @@ class AccessManager:
             )
         except (ValueError, TypeError):
             return False
-

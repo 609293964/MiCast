@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException
 from micast.audio_bridge import AudioBridge
 from micast.config import settings
 from micast.device_volume import DeviceVolume
+from micast.playback_lifecycle import stop_output
 from micast.volume import db_to_percent
 from micast.xiaomi.device_manager import DeviceManager
 
@@ -103,19 +104,8 @@ def install(bridge: AudioBridge, device_manager: DeviceManager) -> APIRouter:
 
     @router.post("/stop")
     async def stop():
-        """Disconnect AirPlay senders, stop targets, and dismiss the player."""
-        disconnected = await bridge.disconnect_sessions()
-        targets = [
-            str(device.get("deviceID"))
-            for device in device_manager.get_control_targets()
-            if device.get("deviceID")
-            and (
-                device_manager.is_playing(str(device.get("deviceID")))
-                or device_manager.is_paused(str(device.get("deviceID")))
-            )
-        ]
-        await asyncio.gather(*(device_manager.stop_playback(did) for did in targets))
-        return {"ok": True, "stopped": targets, "disconnected": disconnected}
+        result = await stop_output(bridge, device_manager)
+        return {"ok": True, **result}
 
     @router.post("/volume")
     async def set_volume(payload: dict):

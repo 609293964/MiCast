@@ -1,5 +1,6 @@
 """Resolve desired AirPlay targets into local or orchestrated PCM sources."""
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -55,7 +56,9 @@ class ReceiverManager:
     async def stop(self) -> None:
         for receiver in list(self._receivers.values()):
             try:
-                await receiver.pcm_source.stop()
+                await asyncio.wait_for(receiver.pcm_source.stop(), timeout=5.0)
+            except TimeoutError:
+                logger.error("PCM source %s did not stop within 5s", receiver.device_id)
             except Exception:
                 logger.exception("Error stopping PCM source for %s", receiver.device_id)
         self._receivers.clear()

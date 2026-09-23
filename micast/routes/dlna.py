@@ -76,7 +76,11 @@ def install(service: DlnaService) -> APIRouter:
             return _soap_fault(501, "Playback command failed")
         return _soap_response(_service_type(service_name), soap_action, values)
 
-    @router.api_route("/{receiver_id}/{service_name}/event", methods=["SUBSCRIBE", "UNSUBSCRIBE"])
+    @router.api_route(
+        "/{receiver_id}/{service_name}/event",
+        methods=["SUBSCRIBE", "UNSUBSCRIBE"],
+        operation_id="dlna_event_subscription",
+    )
     async def event_subscription(receiver_id: str, service_name: str, request: Request):
         _receiver(service, receiver_id)
         sid = request.headers.get("sid") or f"uuid:{service.uuid_for(receiver_id)}-{service_name}"

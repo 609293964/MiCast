@@ -40,11 +40,7 @@ class LocalAirPlayProvider:
         """Lowercase MAC hex of every running MiCast receiver (for discovery
         self-exclusion). Deterministic per receiver name (uuid5), so it is
         stable across restarts."""
-        return {
-            item.server.mac.hex().lower()
-            for item in self.receivers.values()
-            if item.server
-        }
+        return {item.server.mac.hex().lower() for item in self.receivers.values() if item.server}
 
     async def start(
         self,

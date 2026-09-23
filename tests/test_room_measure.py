@@ -27,7 +27,12 @@ def _to_wav(samples: np.ndarray, rate: int = SWEEP_RATE) -> bytes:
     return buf.getvalue()
 
 
-def _apply_room(samples: np.ndarray, room_points: list[tuple[float, float]], delay_s: float = 0.0, gain: float = 1.0) -> np.ndarray:
+def _apply_room(
+    samples: np.ndarray,
+    room_points: list[tuple[float, float]],
+    delay_s: float = 0.0,
+    gain: float = 1.0,
+) -> np.ndarray:
     """Filter the sweep through a synthetic LTI 'room' of known shape."""
     spectrum = np.fft.rfft(samples, n=len(samples))
     freqs = np.fft.rfftfreq(len(samples), 1 / SWEEP_RATE)

@@ -73,7 +73,6 @@ async def _serve_seekable_media(url: str, ss: float, volume_provider=None) -> St
     return StreamingResponse(generator(), media_type="audio/mpeg")
 
 
-
 class StreamServer:
     """Broadcast multiple audio streams to HTTP clients on /stream/{device_id}."""
 
@@ -85,11 +84,13 @@ class StreamServer:
         self._app = FastAPI()
         self._server: Server | None = None
         self._task: asyncio.Task | None = None
+        self._start_lock = asyncio.Lock()
         self.total_bytes_sent: dict[str, int] = {}
         self.dropped_chunks: dict[str, int] = {}
         self._last_broadcast: dict[str, float] = {}
         self._calibration_sessions: dict[str, dict] = {}
         self._diagnostic_media: dict[str, tuple[Path, str]] = {}
+        self._diagnostic_hits: dict[str, int] = {}
         # One-shot rendezvous used when a grouped speaker disconnects while
         # its AirPlay session is still live. New HTTP clients wait here until
         # every group member has arrived, then start on the same future chunk.
@@ -100,9 +101,7 @@ class StreamServer:
 
     def _setup_routes(self) -> None:
         @self._app.get("/stream/{device_id}/for/{receiver_id}/{sink}")
-        async def stream_for_sink(
-            request: Request, device_id: str, receiver_id: str, sink: str
-        ):
+        async def stream_for_sink(request: Request, device_id: str, receiver_id: str, sink: str):
             # Xiaomi players may discard a URL's query string before pulling
             # it. Keep routing identity in the path so per-speaker delay still
             # survives the cloud/player hand-off.
@@ -142,9 +141,7 @@ class StreamServer:
             if not session.get("group_id"):
                 pcm = session.get("pcm")
                 data = (
-                    test_tone_wav()
-                    if pcm is None
-                    else wav_header(44100, data_bytes=len(pcm)) + pcm
+                    test_tone_wav() if pcm is None else wav_header(44100, data_bytes=len(pcm)) + pcm
                 )
                 return Response(
                     data,
@@ -247,6 +244,7 @@ class StreamServer:
             media = self._diagnostic_media.get(token)
             if media is None or not media[0].is_file():
                 raise HTTPException(status_code=404, detail="Diagnostic media expired")
+            self._diagnostic_hits[token] = self._diagnostic_hits.get(token, 0) + 1
             return FileResponse(
                 media[0],
                 media_type=media[1],
@@ -265,9 +263,14 @@ class StreamServer:
     def register_diagnostic_media(self, token: str, path: Path, media_type: str) -> None:
         """Expose uploaded diagnostic audio on the same port as live streams."""
         self._diagnostic_media[token] = (path, media_type)
+        self._diagnostic_hits[token] = 0
+
+    def diagnostic_hits(self, token: str) -> int:
+        return self._diagnostic_hits.get(token, 0)
 
     def unregister_diagnostic_media(self, token: str) -> None:
         self._diagnostic_media.pop(token, None)
+        self._diagnostic_hits.pop(token, None)
 
     def unregister_stream(self, device_id: str) -> None:
         """Remove a stream endpoint and disconnect clients."""
@@ -319,10 +322,7 @@ class StreamServer:
                 sum(len(chunk) for chunk in queue._queue if isinstance(chunk, bytes)),
             )
         send_queue_ms = round(queued_bytes / byte_rate * 1000) if byte_rate else 0
-        delay_states = [
-            self._client_delay.get(queue, {})
-            for queue in clients
-        ]
+        delay_states = [self._client_delay.get(queue, {}) for queue in clients]
         target_delay_ms = max(
             (int(item.get("target_ms") or 0) for item in delay_states),
             default=0,
@@ -444,9 +444,7 @@ class StreamServer:
                     buffer.extend(chunk)
 
                     manual_ms = (
-                        settings.sink_hold_ms(receiver_id, sink)
-                        if receiver_id and sink
-                        else 0
+                        settings.sink_hold_ms(receiver_id, sink) if receiver_id and sink else 0
                     )
                     state = self._client_delay.get(queue)
                     if state is not None:
@@ -506,22 +504,14 @@ class StreamServer:
 
                     if len(buffer) <= reserve:
                         now = time.monotonic()
-                        if (
-                            state is not None
-                            and state.get("ready_at") is None
-                            and silence
-                        ):
+                        if state is not None and state.get("ready_at") is None and silence:
                             # Startup fill: the speaker just connected and the
                             # delay line has never reached its reserve. Feed a
                             # frame of silence per incoming chunk so the player
                             # doesn't abandon the response while it fills.
                             yield bytes(silence)
                             last_yield_at = now
-                        elif (
-                            state is not None
-                            and state.get("needs_fill")
-                            and silence
-                        ):
+                        elif state is not None and state.get("needs_fill") and silence:
                             # Delay increase in progress: hold the real bytes so
                             # the reserve grows, and keep the player alive with
                             # frame-aligned silence — same trick as startup fill.
@@ -548,9 +538,7 @@ class StreamServer:
                             yield bytes(silence)
                             last_yield_at = now
                             if state is not None:
-                                state["silence_fills"] = (
-                                    int(state.get("silence_fills") or 0) + 1
-                                )
+                                state["silence_fills"] = int(state.get("silence_fills") or 0) + 1
                                 if state["silence_fills"] in (1, 20, 100):
                                     logger.info(
                                         "Client %s on /stream/%s underran; injected "
@@ -664,27 +652,69 @@ class StreamServer:
         return result
 
     async def start(self) -> None:
-        config = Config(
-            self._app, host=settings.host, port=settings.stream_port, log_level="warning"
-        )
-        self._server = Server(config)
-        self._task = asyncio.create_task(self._serve())
+        # Serialise concurrent starters: two interleaved start() calls would
+        # each create a uvicorn Server, and _serve() reads self._server — the
+        # orphaned first task would end up driving (or killing) the second
+        # server while its own socket leaks.
+        async with self._start_lock:
+            if (
+                self._task
+                and not self._task.done()
+                and self._server
+                and self._server.started
+            ):
+                return
+            config = Config(
+                self._app, host=settings.host, port=settings.stream_port, log_level="warning"
+            )
+            server = Server(config)
+            self._server = server
+            self._task = asyncio.create_task(self._serve(server))
+            deadline = asyncio.get_running_loop().time() + 7.0
+            while True:
+                if self._task.done():
+                    # Retries inside _serve may have swapped in a new Server;
+                    # report the original failure and leave no stale state
+                    # behind for the next start()/stop() call.
+                    error = None if self._task.cancelled() else self._task.exception()
+                    self._task = None
+                    self._server = None
+                    if error is not None:
+                        raise RuntimeError("音频流服务启动失败") from error
+                    raise RuntimeError("音频流服务启动失败")
+                # Read self._server (not the local variable): a bind-retry
+                # inside _serve replaces it, and only the CURRENT server's
+                # `started` flag proves the port is actually serving.
+                current = self._server
+                if current is not None and current.started:
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    if current is not None:
+                        current.should_exit = True
+                    await asyncio.gather(self._task, return_exceptions=True)
+                    self._task = None
+                    self._server = None
+                    raise RuntimeError("音频流服务启动超时")
+                await asyncio.sleep(0.05)
         logger.info(
             "Stream server started on http://%s:%s/stream/{device_id}",
             settings.host,
             settings.stream_port,
         )
 
-    async def _serve(self) -> None:
+    async def _serve(self, server: Server) -> None:
         """Run uvicorn, containing bind failures instead of killing the process.
 
         uvicorn calls sys.exit() when startup fails (e.g. port still held by a
         previous instance mid-restart); as a BaseException it would tear down
-        the whole event loop. Retry briefly, then give up gracefully.
+        the whole event loop. Retry briefly, then give up gracefully. The
+        server under serve is threaded through explicitly: retries replace
+        ``self._server`` at a single assignment point so start()'s readiness
+        check and stop()'s shutdown signal always target the live instance.
         """
         for attempt in range(5):
             try:
-                await self._server.serve()
+                await server.serve()
                 return
             except SystemExit:
                 logger.error(
@@ -692,10 +722,11 @@ class StreamServer:
                     settings.stream_port,
                     attempt + 1,
                 )
-                if self._server.should_exit or attempt == 4:
+                if server.should_exit or attempt == 4:
                     return
                 await asyncio.sleep(1)
-                self._server = Server(self._server.config)
+                server = Server(server.config)
+                self._server = server
 
     async def stop(self) -> None:
         for device_id in list(self._streams.keys()):
@@ -703,7 +734,14 @@ class StreamServer:
         if self._server:
             self._server.should_exit = True
             if self._task and not self._task.done():
-                await self._task
+                try:
+                    await asyncio.wait_for(self._task, timeout=5.0)
+                except TimeoutError:
+                    logger.error("Stream server did not stop within 5s; cancelling task")
+                    self._task.cancel()
+                    await asyncio.gather(self._task, return_exceptions=True)
+        self._task = None
+        self._server = None
 
     def kick_clients(self, device_id: str) -> int:
         """Close all client connections of a stream; returns how many were kicked."""

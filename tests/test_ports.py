@@ -1,10 +1,12 @@
 """Port auto-resolution: busy preferred ports slide to a free one."""
 
 import socket
+from types import SimpleNamespace
 
 import pytest
 
 from micast.config import port_in_use, resolve_port
+from micast.routes.config import _dlna_recast_required
 
 
 @pytest.fixture
@@ -32,9 +34,7 @@ def test_busy_port_slides_to_next_free(taken_port, monkeypatch):
 
 def test_pinned_port_fails_loudly(taken_port, monkeypatch):
     # Only real env vars (present before .env loading) count as pins.
-    monkeypatch.setattr(
-        "micast.config._ENV_PINNED", frozenset({"MICAST_TEST_PORT"})
-    )
+    monkeypatch.setattr("micast.config._ENV_PINNED", frozenset({"MICAST_TEST_PORT"}))
     with pytest.raises(RuntimeError, match="已被占用"):
         resolve_port(taken_port, "MICAST_TEST_PORT")
 
@@ -45,6 +45,17 @@ def test_port_in_use_detection(taken_port):
         s.bind(("127.0.0.1", 0))
         free = s.getsockname()[1]
     assert not port_in_use(free)
+
+
+def test_dlna_recast_guidance_follows_latched_media_uri():
+    assert not _dlna_recast_required(None)
+    assert not _dlna_recast_required(SimpleNamespace(states={}))
+    assert not _dlna_recast_required(SimpleNamespace(states={"speaker": SimpleNamespace(uri="")}))
+    # STOPPED media may be resumed without another SetAVTransportURI, so it
+    # still needs an explicit re-cast to pick up the new volume mode.
+    assert _dlna_recast_required(
+        SimpleNamespace(states={"speaker": SimpleNamespace(uri="https://example/media.mp3")})
+    )
 
 
 def test_raop_configure_ports_moves_scan_base(monkeypatch):
@@ -84,6 +95,32 @@ def test_set_ports_validates_and_persists(tmp_path, monkeypatch):
         s.set_ports({"stream_port": 80})
     with pytest.raises(ValueError):
         s.set_ports({"nonsense": 5000})
+
+
+def test_settings_save_is_atomic_and_leaves_no_temporary_file(tmp_path, monkeypatch):
+    from micast.config import Settings
+
+    monkeypatch.setenv("MICAST_DATA_DIR", str(tmp_path))
+    s = Settings()
+    s.update_app_name("客厅")
+
+    assert (tmp_path / "micast.json").read_text(encoding="utf-8").startswith("{")
+    assert not list(tmp_path.glob(".micast.json.*.tmp"))
+
+
+def test_settings_snapshot_restores_fields_and_private_state(tmp_path, monkeypatch):
+    from micast.config import Settings
+
+    monkeypatch.setenv("MICAST_DATA_DIR", str(tmp_path))
+    s = Settings()
+    snapshot = s.snapshot()
+    s.update_app_name("临时名称")
+    changed_revision = s.config_revision
+
+    s.restore(snapshot)
+
+    assert s.app.name != "临时名称"
+    assert s.config_revision < changed_revision + 1
 
 
 def test_resolved_port_not_persisted_as_preferred(tmp_path, monkeypatch):

@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 
 from micast.audio_bridge import AudioBridge
 from micast.config import settings
+from micast.config_apply import apply_config_transaction
 from micast.deployment import airplay2_available, airplay2_mode
 from micast.orchestration import OrchestratorClient
 
@@ -34,8 +35,10 @@ def install(bridge: AudioBridge) -> APIRouter:
                 live_detail = "播放入口启动失败，请检查内部编排服务"
             else:
                 live_detail = live.get("detail") or (
-                    "可连接" if live_status == "running"
-                    else "正在启动" if instance.enabled
+                    "可连接"
+                    if live_status == "running"
+                    else "正在启动"
+                    if instance.enabled
                     else "已停用"
                 )
             instances.append(
@@ -54,12 +57,15 @@ def install(bridge: AudioBridge) -> APIRouter:
         mode = airplay2_mode()
         if not airplay2_available():
             orchestration = {
-                "available": False, "status": "unavailable",
+                "available": False,
+                "status": "unavailable",
                 "detail": "当前安装方式不支持 AirPlay 2",
             }
         elif not settings.airplay2_enabled:
             orchestration = {
-                "available": True, "status": "disabled", "detail": "已关闭",
+                "available": True,
+                "status": "disabled",
+                "detail": "已关闭",
             }
         elif mode == "single":
             live = next(iter(runtime.values()), {})
@@ -67,13 +73,14 @@ def install(bridge: AudioBridge) -> APIRouter:
             orchestration = {
                 "available": True,
                 "status": (
-                    "running" if live_status == "running"
-                    else "error" if live_status == "error"
+                    "running"
+                    if live_status == "running"
+                    else "error"
+                    if live_status == "error"
                     else "disabled"
                 ),
-                "detail": live.get("detail") or (
-                    "运行正常" if live_status == "running" else "正在启动"
-                ),
+                "detail": live.get("detail")
+                or ("运行正常" if live_status == "running" else "正在启动"),
             }
         elif settings.orchestrator_url and settings.orchestrator_token:
             try:
@@ -81,15 +88,20 @@ def install(bridge: AudioBridge) -> APIRouter:
                     settings.orchestrator_url, settings.orchestrator_token
                 ).health()
                 orchestration = {
-                    "available": True, "status": "running", "detail": "运行正常",
+                    "available": True,
+                    "status": "running",
+                    "detail": "运行正常",
                 }
             except Exception as exc:
                 orchestration = {
-                    "available": True, "status": "error", "detail": f"连接失败：{exc}",
+                    "available": True,
+                    "status": "error",
+                    "detail": f"连接失败：{exc}",
                 }
         else:
             orchestration = {
-                "available": True, "status": "error",
+                "available": True,
+                "status": "error",
                 "detail": "AirPlay 2 服务尚未准备好",
             }
         return {
@@ -137,14 +149,18 @@ def install(bridge: AudioBridge) -> APIRouter:
         )
         if not valid_target:
             raise HTTPException(status_code=400, detail="播放目标不存在")
-        item = settings.upsert_airplay2_instance(
-            instance_id=instance_id,
-            name=name, target_type=target_type, target_id=target_id,
-            enabled=bool(payload.get("enabled", True)),
+        item = await apply_config_transaction(
+            lambda: settings.upsert_airplay2_instance(
+                instance_id=instance_id,
+                name=name,
+                target_type=target_type,
+                target_id=target_id,
+                enabled=bool(payload.get("enabled", True)),
+            ),
+            bridge.apply_config_change,
         )
         # Plan diff: a retarget/rename with an unchanged stream-variant set is
         # still rebuilt — the old suffix-set reuse check missed exactly that.
-        await bridge.apply_config_change()
         return item.model_dump()
 
     @router.post("/instances/{instance_id}/enabled")
@@ -165,12 +181,16 @@ def install(bridge: AudioBridge) -> APIRouter:
                 await bridge.stop_airplay2()
             except Exception as exc:
                 raise HTTPException(status_code=502, detail=f"停止播放入口失败：{exc}") from exc
-        updated = settings.upsert_airplay2_instance(
-            instance_id=item.id, name=item.name,
-            target_type=item.target_type, target_id=item.target_id,
-            enabled=enabled,
+        updated = await apply_config_transaction(
+            lambda: settings.upsert_airplay2_instance(
+                instance_id=item.id,
+                name=item.name,
+                target_type=item.target_type,
+                target_id=item.target_id,
+                enabled=enabled,
+            ),
+            bridge.apply_config_change,
         )
-        await bridge.apply_config_change()
         return updated.model_dump()
 
     @router.delete("/instances/{instance_id}")
@@ -196,13 +216,13 @@ def install(bridge: AudioBridge) -> APIRouter:
                     instance_id,
                     exc,
                 )
-        if not settings.remove_airplay2_instance(instance_id):
-            raise HTTPException(status_code=404, detail="未找到播放入口")
         try:
-            await bridge.apply_config_change()
+            await apply_config_transaction(
+                lambda: settings.remove_airplay2_instance(instance_id),
+                bridge.apply_config_change,
+            )
         except Exception as exc:
-            cleanup_warning = cleanup_warning or "本地记录已删除，但内部编排服务同步失败"
-            logger.warning("AirPlay 2 reconcile after local delete failed: %s", exc)
+            raise HTTPException(status_code=502, detail=f"删除播放入口失败：{exc}") from exc
         return {"ok": True, "warning": cleanup_warning or None}
 
     return router

@@ -59,7 +59,10 @@ class _SsdpProtocol(asyncio.DatagramProtocol):
             return
         headers = _headers(text)
         search_target = headers.get("st", "ssdp:all")
-        asyncio.create_task(self.service.respond(addr, search_target))
+        # Response construction is synchronous and non-blocking; creating one
+        # task per multicast discovery packet allows a LAN burst to create an
+        # unbounded task backlog.
+        self.service.respond(addr, search_target)
 
 
 class DlnaService:
@@ -181,7 +184,7 @@ class DlnaService:
             (CONNECTION_MANAGER, f"{device_uuid}::{CONNECTION_MANAGER}"),
         ]
 
-    async def respond(self, addr, requested: str) -> None:
+    def respond(self, addr, requested: str) -> None:
         if not self._transport:
             return
         self._refresh_boot_id()
@@ -291,6 +294,15 @@ class DlnaService:
         state = self.state_for(receiver_id)
         if receiver is None or not state.uri:
             raise ValueError("No media URI or playback target")
+        # Some controllers send SetNextAVTransportURI before the current item
+        # finishes and then issue Play to advance. Promote it here instead of
+        # merely storing NextURI; otherwise the second track is acknowledged
+        # by SOAP but never reaches the Xiaomi targets.
+        if state.state != "STOPPED" and state.next_uri:
+            state.uri, state.metadata = state.next_uri, state.next_metadata
+            state.next_uri = ""
+            state.next_metadata = ""
+            state.session_id = uuid.uuid4().hex
         targets = settings.receiver_targets(receiver_id)
         state.volume_mode = state.volume_mode or settings.sender_volume_mode
         url = self._media_url(receiver_id) if state.volume_mode == "independent" else state.uri
@@ -317,9 +329,7 @@ class DlnaService:
             raise ValueError("No speaker accepted the playback command")
         state.state = "PLAYING"
         if accepted < len(targets):
-            logger.warning(
-                "DLNA %s started on %s/%s speakers", receiver_id, accepted, len(targets)
-            )
+            logger.warning("DLNA %s started on %s/%s speakers", receiver_id, accepted, len(targets))
         else:
             logger.info("DLNA %s playing on %s speaker(s)", receiver_id, accepted)
         if state.volume_mode == "linked" and (state.volume_received or state.muted):

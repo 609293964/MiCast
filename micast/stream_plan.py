@@ -184,8 +184,7 @@ def _group_structure(group: dict[str, Any] | None) -> dict[str, Any] | None:
         "id": group["id"],
         "mode": group["mode"],
         "speakers": [
-            {"did": speaker["did"], "channel": speaker["channel"]}
-            for speaker in group["speakers"]
+            {"did": speaker["did"], "channel": speaker["channel"]} for speaker in group["speakers"]
         ],
     }
 
@@ -251,10 +250,7 @@ def diff_plans(old: PlanSnapshot | None, new: PlanSnapshot) -> PlanDiff:
             or _group_structure(og) != _group_structure(ng)
             or (og is None) != (ng is None)
         )
-        character = (
-            o["variants"] != n["variants"]
-            or _group_character(og) != _group_character(ng)
-        )
+        character = o["variants"] != n["variants"] or _group_character(og) != _group_character(ng)
         audio = o["audio"] != n["audio"]
         if audio:
             diff.audio_only = True

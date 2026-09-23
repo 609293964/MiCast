@@ -61,9 +61,7 @@ class AirPlayDiscovery(ServiceListener):
         if self._browser:
             return
         self._loop = asyncio.get_running_loop()
-        self._browser = await asyncio.to_thread(
-            ServiceBrowser, self._zeroconf, SERVICE_TYPE, self
-        )
+        self._browser = await asyncio.to_thread(ServiceBrowser, self._zeroconf, SERVICE_TYPE, self)
         logger.info("Browsing LAN for AirPlay devices (%s)", SERVICE_TYPE)
 
     async def stop(self) -> None:

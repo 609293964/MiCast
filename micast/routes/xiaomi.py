@@ -78,9 +78,11 @@ def install(auth: XiaomiAuth) -> APIRouter:
             raise HTTPException(status_code=401, detail=str(e)) from e
 
     @router.get("/status")
-    async def xiaomi_status():
-        """Return the current persisted Xiaomi login identity."""
+    async def xiaomi_status(verify: bool = False):
+        """Return login state; optionally verify the stored passToken."""
         try:
+            if verify and auth.stored_identity()[0]:
+                await auth.recover_after_failure()
             return auth.connection_state()
         except Exception as e:
             logger.exception("Failed to load token status")

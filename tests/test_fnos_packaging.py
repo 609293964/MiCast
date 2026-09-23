@@ -63,28 +63,84 @@ def test_fnos_runtime_uses_installed_target_layout():
     main = (FNOS / "cmd" / "main").read_text(encoding="utf-8")
     install = (FNOS / "cmd" / "install_callback").read_text(encoding="utf-8")
 
-    assert '${TRIM_APPDEST}/vendor:${TRIM_APPDEST}' in main
+    assert "${TRIM_APPDEST}/vendor:${TRIM_APPDEST}" in main
     assert 'MICAST_UNIX_SOCKET="$SOCKET_FILE"' in main
     assert 'cd "$TRIM_APPDEST"' in main
-    assert '${TRIM_APPDEST}/vendor' in install
+    assert "${TRIM_APPDEST}/vendor" in install
     assert "${TRIM_APPDEST}/app/vendor" not in main + install
+    # The built-in 8080 default must remain unpinned so a collision can slide
+    # to the next free port. Only a real administrator-provided environment
+    # variable is allowed to make the preference strict.
+    assert 'export MICAST_STREAM_PORT="${MICAST_STREAM_PORT:-8080}"' not in main
+    # fnOS surfaces this temporary log directly to users: keep tracebacks in
+    # micast.log for diagnostics instead of copying source-level details here.
+    assert "tail -n" not in main
 
 
 def test_fnos_keeps_classic_airplay_and_starts_single_airplay2_on_demand():
     main = (FNOS / "cmd" / "main").read_text(encoding="utf-8")
-    receiver = (
-        FNOS / "app" / "airplay2-runtime" / "run-shairport"
-    ).read_text(encoding="utf-8")
+    receiver = (FNOS / "app" / "airplay2-runtime" / "run-shairport").read_text(encoding="utf-8")
 
     assert 'MICAST_AIRPLAY_ENGINE="local"' in main
     assert 'MICAST_AIRPLAY_PROTOCOL="classic"' in main
     assert 'MICAST_AIRPLAY2_MODE="single"' in main
+    assert 'MICAST_AIRPLAY2_MODE="disabled"' in main
+    assert '[ -x "${runtime}/bin/shairport-sync" ]' in main
     assert 'MICAST_AIRPLAY2_PCM_SOURCE="local:' in main
-    assert 'runtime/bin/nqptp' not in main
-    assert 'runtime/bin/nqptp' in receiver
+    assert "runtime/bin/nqptp" not in main
+    assert "runtime/bin/nqptp" in receiver
     assert 'service_type = "airplay2"' in receiver
     # AirPlay 2 首选端口由设置页下发，run-shairport 从该值起扫描空闲端口。
-    assert 'MICAST_AIRPLAY2_PORT' in receiver
+    assert "MICAST_AIRPLAY2_PORT" in receiver
+
+
+def test_fnos_setcap_is_arch_aware_and_warns_instead_of_aborting():
+    for name in ("install_callback", "upgrade_callback"):
+        script = (FNOS / "cmd" / name).read_text(encoding="utf-8")
+        # Loader chosen by architecture (ARM FPK ships the aarch64 runtime).
+        assert 'aarch64|arm64) loader="$runtime/lib/ld-musl-aarch64.so.1"' in script
+        assert '*)             loader="$runtime/lib/ld-musl-x86_64.so.1"' in script
+        # setcap failure / missing tooling degrades native AirPlay 2 with a
+        # visible warning; it must not abort the (un)install.
+        assert "exit 1" not in script.split("setcap", 1)[1]
+        assert "警告" in script
+
+
+def test_fnos_builders_support_arm_without_bundling_x86_airplay2():
+    shell = (ROOT / "scripts" / "build-fnos.sh").read_text(encoding="utf-8")
+    install = (FNOS / "cmd" / "install_callback").read_text(encoding="utf-8")
+
+    assert "x86|arm" in shell
+    assert "manylinux_2_28_aarch64" in shell
+    assert 'if [ "$PLATFORM" = "arm" ]' in shell
+    assert 'if [ -d "$runtime" ]' in install
+
+
+def test_fnos_powershell_builder_is_a_thin_wrapper():
+    powershell = (ROOT / "scripts" / "build-fnos.ps1").read_text(encoding="utf-8")
+
+    # 真正的实现只在 build-fnos.sh；ps1 只是找到 bash.exe 并透传参数。
+    assert "build-fnos.sh" in powershell
+    assert "bash.exe" in powershell
+    assert "manylinux_2_28_aarch64" not in powershell
+    assert "pip install" not in powershell
+    assert "fnpack-1.2.3" not in powershell
+
+
+def test_fnos_builders_check_version_consistency():
+    shell = (ROOT / "scripts" / "build-fnos.sh").read_text(encoding="utf-8")
+
+    assert "__version__" in shell
+    assert "version=" in shell
+    assert "版本不一致" in shell
+
+    # 双保险：运行时解析出的两侧版本必须真正相等。
+    import re
+
+    init_py = (ROOT / "micast" / "__init__.py").read_text(encoding="utf-8")
+    app_version = re.search(r'__version__\s*=\s*"([^"]+)"', init_py).group(1)
+    manifest_version = _manifest()["version"]
+    assert app_version == manifest_version
 
 
 def test_fnos_lifecycle_handles_health_upgrade_and_uninstall_policies():

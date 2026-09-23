@@ -50,7 +50,9 @@ def sweep_signal(rate: int = SWEEP_RATE, seconds: float = SWEEP_SECONDS) -> np.n
     t = np.arange(n, dtype=np.float64) / rate
     ratio = SWEEP_F1 / SWEEP_F0
     # ESS phase: instantaneous frequency rises exponentially f0 → f1.
-    phase = 2 * np.pi * SWEEP_F0 * seconds / np.log(ratio) * (np.exp(t / seconds * np.log(ratio)) - 1)
+    phase = (
+        2 * np.pi * SWEEP_F0 * seconds / np.log(ratio) * (np.exp(t / seconds * np.log(ratio)) - 1)
+    )
     sig = SWEEP_AMPLITUDE * np.sin(phase)
     # Fade head/tail to avoid clicks.
     fade = int(0.02 * rate)
@@ -122,9 +124,9 @@ def _align(recording: np.ndarray, reference: np.ndarray, rate: int) -> np.ndarra
     """
     n = len(recording) + len(reference) - 1
     nfft = 1 << (n - 1).bit_length()
-    corr = np.fft.irfft(
-        np.fft.rfft(recording, nfft) * np.conj(np.fft.rfft(reference, nfft)), nfft
-    )[: len(recording)]
+    corr = np.fft.irfft(np.fft.rfft(recording, nfft) * np.conj(np.fft.rfft(reference, nfft)), nfft)[
+        : len(recording)
+    ]
     if corr.size == 0:
         return recording
     lag = int(np.argmax(corr))
@@ -157,13 +159,12 @@ def measure_response(recording_wav: bytes) -> tuple[list[float], list[float]]:
     window = np.hanning(seg)
     sxy = np.zeros(seg // 2 + 1, dtype=np.complex128)
     sxx = np.zeros(seg // 2 + 1)
-    count = 0
-    for start in range(0, usable - seg + 1, seg // 2):
+    segment_starts = range(0, usable - seg + 1, seg // 2)
+    for start in segment_starts:
         r = np.fft.rfft(rec[start : start + seg] * window)
         x = np.fft.rfft(ref[start : start + seg] * window)
         sxy += r * np.conj(x)
         sxx += np.abs(x) ** 2
-        count += 1
     transfer = np.abs(sxy) / np.maximum(sxx, 1e-12)
     freqs_fft = np.fft.rfftfreq(seg, 1 / SWEEP_RATE)
 
@@ -200,7 +201,7 @@ def compensation_points(
     ]
     comp_freqs: list[float] = []
     comp_gains: list[float] = []
-    for f, g in zip(measured_freqs, smooth):
+    for f, g in zip(measured_freqs, smooth, strict=False):
         desired = pchip_eval(tgt, f) if tgt else 0.0
         comp = desired - g
         if f < BOOST_LIMIT_LOW_HZ:

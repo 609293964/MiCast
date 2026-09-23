@@ -9,6 +9,8 @@ curve x position of its center frequency.
 
 from __future__ import annotations
 
+import time as _time
+
 import numpy as np
 
 FFT_SIZE = 8192  # ~186 ms at 44.1 kHz; 5.4 Hz bins resolve the bass bands
@@ -17,7 +19,9 @@ FREQ_RANGE = (20.0, 20000.0)
 DB_FLOOR = -66.0  # below this the band renders as zero
 
 
-def band_edges(count: int = BAND_COUNT, fmin: float = FREQ_RANGE[0], fmax: float = FREQ_RANGE[1]) -> np.ndarray:
+def band_edges(
+    count: int = BAND_COUNT, fmin: float = FREQ_RANGE[0], fmax: float = FREQ_RANGE[1]
+) -> np.ndarray:
     """count+1 log-spaced band edges; bars tile the axis without gaps."""
     return np.logspace(np.log10(fmin), np.log10(fmax), count + 1)
 
@@ -25,8 +29,6 @@ def band_edges(count: int = BAND_COUNT, fmin: float = FREQ_RANGE[0], fmax: float
 # The pump-loop tap is gated on an actual viewer: with no tuning page open the
 # hot path costs a single boolean check, not a per-chunk copy. Polling clients
 # (the GET fallback) register as a fresh timestamp instead of a connection.
-import time as _time
-
 _subscribers = 0
 _last_poll = 0.0
 
@@ -75,16 +77,16 @@ class SpectrumAnalyzer:
     def feed(self, chunk: bytes) -> None:
         n = len(chunk)
         if n >= len(self._buf):
-            self._buf[:] = chunk[-len(self._buf):]
+            self._buf[:] = chunk[-len(self._buf) :]
             self._write = 0
             self._filled = len(self._buf)
             return
         end = self._write + n
         if end <= len(self._buf):
-            self._buf[self._write:end] = chunk
+            self._buf[self._write : end] = chunk
         else:
             first = len(self._buf) - self._write
-            self._buf[self._write:] = chunk[:first]
+            self._buf[self._write :] = chunk[:first]
             self._buf[: n - first] = chunk[first:]
         self._write = end % len(self._buf)
         self._filled = min(len(self._buf), self._filled + n)
@@ -94,7 +96,7 @@ class SpectrumAnalyzer:
         if self._filled < len(self._buf):
             return [0.0] * BAND_COUNT
         # Unroll the ring so the FFT sees a contiguous, most-recent window.
-        data = bytes(self._buf[self._write:]) + bytes(self._buf[: self._write])
+        data = bytes(self._buf[self._write :]) + bytes(self._buf[: self._write])
         pcm = np.frombuffer(data, dtype="<i2").reshape(-1, 2).mean(axis=1) / 32768.0
         mag = np.abs(np.fft.rfft(pcm * self._window))
         # Compensate the Hann window's coherent gain so a full-scale sine

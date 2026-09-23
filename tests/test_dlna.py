@@ -141,6 +141,19 @@ async def test_dlna_accepts_next_track_uri(monkeypatch):
     assert service.state_for("living").next_uri == "http://media.local/next.mp3"
 
 
+async def test_dlna_play_promotes_queued_next_track(monkeypatch):
+    configure(monkeypatch)
+    manager = FakeDeviceManager()
+    service = DlnaService(manager)
+    await service.set_uri("living", "http://media.local/first.mp3")
+    await service.play("living")
+    await service.set_next_uri("living", "http://media.local/second.mp3")
+    await service.play("living")
+    state = service.state_for("living")
+    assert state.uri == "http://media.local/second.mp3"
+    assert state.next_uri == ""
+
+
 def test_dlna_uses_stable_unique_device_ids(monkeypatch):
     configure(monkeypatch)
     service = DlnaService(FakeDeviceManager())

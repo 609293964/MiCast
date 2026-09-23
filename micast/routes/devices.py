@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 
 from micast.audio_bridge import AudioBridge
 from micast.config import EQ_PRESET_POINTS, settings
+from micast.config_apply import apply_config_transaction
 from micast.curve_fit import CURVE_FREQ_RANGE, CURVE_GAIN_RANGE, TARGET_CURVES
 from micast.xiaomi.auth import XiaomiAuthError
 from micast.xiaomi.device_manager import DeviceManager
@@ -72,6 +73,10 @@ def install(device_manager: DeviceManager, bridge: AudioBridge | None = None) ->
                         "model": d.get("hardware"),
                         "presence": d.get("presence", "unknown"),
                         "play_error": device_manager.play_errors().get(did),
+                        "codec_capabilities": device_manager.codec_capabilities(did) if did else {},
+                        "codec_capability_details": (
+                            device_manager.codec_capability_details(did) if did else {}
+                        ),
                         "playing": device_manager.is_playing(did),
                         "muted": device_manager.is_muted(did),
                         "enabled": speaker.enabled if speaker else False,
@@ -80,17 +85,22 @@ def install(device_manager: DeviceManager, bridge: AudioBridge | None = None) ->
                         "eq": {
                             "enabled": speaker.eq_enabled if speaker else False,
                             "points": (
-                                [[p.freq, p.gain_db] for p in speaker.eq_points]
-                                if speaker
-                                else []
+                                [[p.freq, p.gain_db] for p in speaker.eq_points] if speaker else []
                             ),
                             "preset": speaker.eq_preset if speaker else "",
                             "target": speaker.eq_target if speaker else "",
                             "night_mode": speaker.night_mode if speaker else False,
-                            "loudness_comp_enabled": speaker.loudness_comp_enabled if speaker else False,
+                            "loudness_comp_enabled": speaker.loudness_comp_enabled
+                            if speaker
+                            else False,
                             "content_profile": speaker.content_profile if speaker else "",
+                            "revision": speaker.eq_revision if speaker else 0,
+                            "undo_available": bool(speaker and speaker.eq_undo is not None),
                             "profiles": (
-                                {k: [[p.freq, p.gain_db] for p in v] for k, v in speaker.eq_profiles.items()}
+                                {
+                                    k: [[p.freq, p.gain_db] for p in v]
+                                    for k, v in speaker.eq_profiles.items()
+                                }
                                 if speaker
                                 else {}
                             ),
@@ -122,16 +132,21 @@ def install(device_manager: DeviceManager, bridge: AudioBridge | None = None) ->
         if not did or not isinstance(enabled, bool) or not isinstance(bands, list):
             raise HTTPException(status_code=400, detail="did, enabled and bands required")
         try:
-            speaker = settings.set_speaker_eq(
-                did, enabled=enabled, bands=bands, preset=str(payload.get("preset", ""))
+            async def apply_audio() -> None:
+                if bridge:
+                    await bridge.apply_config_change()
+
+            speaker = await apply_config_transaction(
+                lambda: settings.set_speaker_eq(
+                    did, enabled=enabled, bands=bands, preset=str(payload.get("preset", ""))
+                ),
+                apply_audio,
             )
         except (TypeError, ValueError) as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         # EQ changes which stream a speaker pulls (split by EQ signature), so
         # pipelines are rebuilt and playing speakers re-pointed, not just the
         # encoder restarted. Rapid slider drags are debounced by the UI.
-        if bridge:
-            await bridge.apply_config_change()
         return {
             "did": did,
             "eq": {
@@ -153,11 +168,19 @@ def install(device_manager: DeviceManager, bridge: AudioBridge | None = None) ->
         did = payload.get("did")
         if did is None:
             raise HTTPException(status_code=400, detail="did required")
-        ok = device_manager.select_device(did)
-        if not ok:
-            raise HTTPException(status_code=404, detail="device not found")
-        if bridge and settings.receiver_mode == "single":
-            await bridge.restart()
+
+        def mutate_select():
+            if not device_manager.select_device(did):
+                raise LookupError(did)
+
+        async def apply_single_mode() -> None:
+            if bridge and settings.receiver_mode == "single":
+                await bridge.restart()
+
+        try:
+            await apply_config_transaction(mutate_select, apply_single_mode)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="device not found") from None
         return {"selected": did}
 
     @router.post("/alias")
@@ -166,9 +189,14 @@ def install(device_manager: DeviceManager, bridge: AudioBridge | None = None) ->
         alias = str(payload.get("alias", "")).strip()
         if not did or not alias:
             raise HTTPException(status_code=400, detail="did and alias required")
-        device_manager.set_alias(did, alias)
-        if bridge:
-            await bridge.apply_config_change()
+
+        async def apply_alias() -> None:
+            if bridge:
+                await bridge.apply_config_change()
+
+        await apply_config_transaction(
+            lambda: device_manager.set_alias(did, alias), apply_alias
+        )
         return {"did": did, "alias": alias}
 
     @router.post("/enabled")
@@ -177,9 +205,14 @@ def install(device_manager: DeviceManager, bridge: AudioBridge | None = None) ->
         enabled = payload.get("enabled")
         if not did or not isinstance(enabled, bool):
             raise HTTPException(status_code=400, detail="did and enabled boolean required")
-        device_manager.set_enabled(did, enabled)
-        if bridge:
-            await bridge.apply_config_change()
+
+        async def apply_enabled() -> None:
+            if bridge:
+                await bridge.apply_config_change()
+
+        await apply_config_transaction(
+            lambda: device_manager.set_enabled(did, enabled), apply_enabled
+        )
         return {"did": did, "enabled": enabled}
 
     return router

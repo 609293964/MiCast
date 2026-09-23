@@ -13,15 +13,11 @@ def install(bridge: AudioBridge) -> APIRouter:
     async def list_dlna_devices():
         discovery = bridge.dlna_discovery
         attached = {
-            target_id: group.id
-            for group in settings.groups
-            for target_id in group.dlna_targets
+            target_id: group.id for group in settings.groups for target_id in group.dlna_targets
         }
         statuses = bridge.diagnostics.get("dlna_targets", {})
         runtime_by_id = {
-            runtime["id"]: runtime
-            for targets in statuses.values()
-            for runtime in targets.values()
+            runtime["id"]: runtime for targets in statuses.values() for runtime in targets.values()
         }
         devices = []
         for device in discovery.devices() if discovery else []:

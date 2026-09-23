@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Awaitable, Callable
 
 from micast.config import resolve_port, settings
@@ -24,6 +25,13 @@ logger = logging.getLogger(__name__)
 # silent stream forever — the topology then shows a permanent 滞留 edge.
 STREAM_SWEEP_INTERVAL_SECONDS = 15.0
 STREAM_IDLE_KICK_SECONDS = 10.0
+# EQ drag edits commit one plan change per point; the settle window lets a
+# burst land as ONE encoder restart. Used by wait_config_settled() (before the
+# config transaction) and by the in-apply fallback debounce.
+EQ_SETTLE_SECONDS = 0.6
+# Hooks run while _restart_lock is held and issue cloud commands; a hanging
+# call must not freeze every later config apply, so bound each hook await.
+_HOOK_TIMEOUT_SECONDS = 5.0
 
 
 class AudioBridge:
@@ -51,6 +59,8 @@ class AudioBridge:
         # stop so recovery never pauses the user's device.
         self._maintenance_sessions: set[str] = set()
         self._sweeper_task: asyncio.Task | None = None
+        self._aux_tasks: set[asyncio.Task] = set()
+        self._stale_active_since: dict[str, float] = {}
         # Receivers with a live sender session right now. Gates the pipelines'
         # PCM-stall watchdog (no session → no bytes is normal, not a stall).
         self._active_sessions: set[str] = set()
@@ -72,8 +82,18 @@ class AudioBridge:
         # Stream-plan snapshot: the last config state the running pipelines were
         # built from. Every config mutation funnels through apply_config_change,
         # which diffs the fresh plan against this and rebuilds only what moved.
+        # This baseline is IN-MEMORY ONLY: it is recomputed from settings at
+        # engine start (and after any full restart), never persisted. A partial
+        # apply failure keeps the failed entries' OLD fingerprints here (see
+        # apply_config_change), so the next apply re-diffs exactly those
+        # entries — a retry neither forgets the failure nor redoes work that
+        # already landed.
         self._plan: PlanSnapshot | None = None
         self._plan_update_requested = False
+        # EQ debounce state shared by wait_config_settled(): rapid commits
+        # extend one deadline and only the first caller actually sleeps.
+        self._settle_deadline = 0.0
+        self._settle_waiting = False
         # Fired when a group's Xiaomi membership changed (group_id, removed dids);
         # main.py wires its reconcile_group closure here.
         self.on_group_membership_changed: Callable[[str, list[str]], Awaitable[None]] | None = None
@@ -141,7 +161,9 @@ class AudioBridge:
                     "historical_dropped_packets": server.dropped_packets,
                     "input_buffer_ms": server.active_input_buffer_ms,
                     "timing_requests": active_timing.get("timing_requests", server.timing_requests),
-                    "timing_responses": active_timing.get("timing_responses", server.timing_responses),
+                    "timing_responses": active_timing.get(
+                        "timing_responses", server.timing_responses
+                    ),
                     "clients": server.active_clients,
                 }
         streams = {
@@ -232,6 +254,10 @@ class AudioBridge:
             logger.exception("Failed to start audio bridge: %s", e)
             self._status = "error"
             self._error_count += 1
+            with contextlib.suppress(Exception):
+                await self._stop_engine()
+            self._running = False
+            raise RuntimeError("音频核心启动失败") from e
 
         self._sweeper_task = asyncio.create_task(self._sweep_stale_stream_clients())
 
@@ -248,18 +274,40 @@ class AudioBridge:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._sweeper_task
             self._sweeper_task = None
+        for task in list(self._aux_tasks):
+            task.cancel()
+        if self._aux_tasks:
+            await asyncio.gather(*list(self._aux_tasks), return_exceptions=True)
+        self._aux_tasks.clear()
 
         await self._stop_engine()
 
         self._plan = None
         self._status = "idle"
 
+    def _spawn_aux(self, coroutine, label: str) -> asyncio.Task:
+        """Track bridge-owned helper tasks until normal completion or stop."""
+        task = asyncio.create_task(coroutine, name=f"bridge:{label}")
+        self._aux_tasks.add(task)
+
+        def done(finished: asyncio.Task) -> None:
+            self._aux_tasks.discard(finished)
+            if finished.cancelled():
+                return
+            error = finished.exception()
+            if error:
+                logger.error(
+                    "Bridge helper %s failed",
+                    finished.get_name(),
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(done)
+        return task
+
     async def restart(self) -> None:
         """Restart the bridge after config changes; rapid calls coalesce to one."""
         self._restart_requested = True
-        if self._restart_lock.locked():
-            # A restart is already running and will see the latest settings.
-            return
         async with self._restart_lock:
             while self._restart_requested:
                 self._restart_requested = False
@@ -290,51 +338,109 @@ class AudioBridge:
             logger.exception("Failed to restart audio bridge: %s", e)
             self._status = "error"
             self._error_count += 1
+            raise RuntimeError("音频服务重新启动失败，请稍后重试") from e
 
-    async def apply_config_change(self) -> None:
+    async def wait_config_settled(self) -> None:
+        """EQ-settle debounce window, shared by rapid successive callers.
+
+        Runs BEFORE the config transaction (apply_config_transaction) so the
+        wait never holds the process-wide config lock: while a drag settles,
+        every other config/tuning route stays responsive. Callers funnel into
+        apply_config_change(debounce=False) afterwards; the in-lock recompute
+        there applies the FINAL settings, so nothing this window coalesced is
+        lost.
+        """
+        self._settle_deadline = time.monotonic() + EQ_SETTLE_SECONDS
+        if self._settle_waiting:
+            return  # one waiter already sleeping on behalf of everyone
+        self._settle_waiting = True
+        try:
+            while True:
+                remaining = self._settle_deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                await asyncio.sleep(remaining)
+        finally:
+            self._settle_waiting = False
+
+    async def apply_config_change(self, debounce: bool = True) -> None:
         """Single entry point for every config mutation.
 
         Recomputes the stream plan, diffs it against what the running pipelines
         were built from, and rebuilds only what moved (per the dispatch table in
         ``_apply_plan_diff``). Rapid successive mutations (slider drags) coalesce
         via the dirty flag: the plan is recomputed at apply time.
+
+        The optional EQ debounce wait (debounce=True) happens OUTSIDE
+        ``_restart_lock`` but INSIDE whatever lock the caller holds: tuning
+        routes hold the process-wide config transaction lock across
+        apply_runtime, so they must run ``wait_config_settled()`` first and
+        pass debounce=False — sleeping here would freeze every config route
+        for the whole drag. Rollback paths likewise pass debounce=False: the
+        settle already happened (or failed) before the transaction opened.
         """
         if not self._running:
             return
         self._plan_update_requested = True
-        if self._restart_lock.locked():
-            # A pass is already running and will see the latest settings.
-            return
-        async with self._restart_lock:
-            while self._plan_update_requested:
+        settled = not debounce
+        while True:
+            new_plan = compute_plan(settings)
+            diff = diff_plans(self._plan, new_plan)
+            if _is_debounceable_eq_change(diff) and not settled:
+                # Tuning EQ mid-playback commits one plan change per point
+                # edit; each restarts the encoder and audibly gaps every
+                # playing speaker. Wait a beat — lock-free — and recompute so
+                # a burst of edits (or a dragging sender) lands as ONE restart.
+                self._plan_update_requested = False
+                await asyncio.sleep(EQ_SETTLE_SECONDS)
+                settled = True
+                continue
+            if diff.noop:
+                break
+            async with self._restart_lock:
                 self._plan_update_requested = False
                 new_plan = compute_plan(settings)
                 diff = diff_plans(self._plan, new_plan)
-                if _is_debounceable_eq_change(diff):
-                    # Tuning EQ mid-playback commits one plan change per point
-                    # edit; each restarts the encoder and audibly gaps every
-                    # playing speaker. Wait a beat and recompute so a burst of
-                    # edits (or a dragging sender) lands as ONE restart.
-                    await asyncio.sleep(0.6)
-                    self._plan_update_requested = False
-                    new_plan = compute_plan(settings)
-                    diff = diff_plans(self._plan, new_plan)
                 if not diff.noop:
                     logger.info("Applying stream plan change: %s", _diff_summary(diff))
-                await self._apply_plan_diff(diff)
+                failed = await self._apply_plan_diff(diff)
+                if failed:
+                    # Advance the plan per entry: entries that applied keep the
+                    # new fingerprint, failed ones keep the old one so the next
+                    # apply still sees their diff (and only theirs) to retry.
+                    merged_entries = dict(new_plan["entries"])
+                    old_entries = self._plan["entries"] if self._plan else {}
+                    for entry_id in failed:
+                        if entry_id in old_entries:
+                            merged_entries[entry_id] = old_entries[entry_id]
+                        else:
+                            merged_entries.pop(entry_id, None)
+                    new_plan = {"engine": new_plan["engine"], "entries": merged_entries}
                 self._plan = new_plan
+                if failed:
+                    raise RuntimeError("声音设置暂未完全生效，请重试")
+            settled = not debounce
+            if not self._plan_update_requested:
+                break
 
-    async def _apply_plan_diff(self, diff: PlanDiff) -> None:
-        """Dispatch a plan diff to the narrowest rebuild path. Lock held."""
+    async def _apply_plan_diff(self, diff: PlanDiff) -> set[str]:
+        """Dispatch a plan diff to the narrowest rebuild path. Lock held.
+
+        Returns the entry ids whose runtime apply failed. The caller merges
+        those entries' old fingerprints into ``self._plan`` and raises, so a
+        retry re-diffs only what actually failed instead of either forgetting
+        the failure (stale plan) or redoing work that already landed.
+        """
         if diff.full_restart_required:
             await self._restart_engine_locked()
-            return
+            return set()
         if diff.classic_added_removed and settings.airplay_engine != "local":
             # The orchestrator engine has no per-entry lifecycle — restart it.
             await self._restart_engine_locked()
-            return
+            return set()
 
         audio_hook = False
+        failed_entries: set[str] = set()
         if settings.airplay_engine == "local":
             if diff.classic_added_removed:
                 await self._reconcile_classic_entries_locked(diff)
@@ -347,18 +453,32 @@ class AudioBridge:
         # Entries already rebuilt or re-created above got fresh encoders.
         encoder_restart -= diff.classic_rebuild | diff.classic_added | diff.classic_removed
         if encoder_restart:
-            logger.info(
-                "Restarting encoders for EQ/audio change: %s", sorted(encoder_restart)
-            )
+            logger.info("Restarting encoders for EQ/audio change: %s", sorted(encoder_restart))
             pipelines = {**self._pipelines, **self._airplay2_pipelines}
             for key, pipeline in pipelines.items():
-                if _stream_owner(key, sorted(encoder_restart)) is None:
+                owner = _stream_owner(key, sorted(encoder_restart))
+                if owner is None:
                     continue
                 try:
+                    suffix = key[len(owner) :]
+                    variant = next(
+                        (
+                            item
+                            for item in settings.receiver_stream_variants(owner)
+                            if item["suffix"] == suffix
+                        ),
+                        None,
+                    )
+                    if variant is None:
+                        raise RuntimeError(f"stream variant disappeared: {key}")
+                    pipeline.set_audio_character(
+                        eq_curve=variant["eq"], loudness=variant.get("loudness", False)
+                    )
                     await pipeline.restart_encoder()
                 except Exception:
                     logger.exception("Failed to restart encoder %s", key)
                     self._error_count += 1
+                    failed_entries.add(owner)
             if diff.audio_only:
                 # Codec/format changed under live connections; speakers must
                 # reconnect to pick up the new stream. EQ-only edits keep the
@@ -386,15 +506,33 @@ class AudioBridge:
         if diff.membership_changed and self.on_group_membership_changed:
             for group_id, removed in sorted(diff.membership_changed.items()):
                 try:
-                    await self.on_group_membership_changed(group_id, removed)
+                    # The hook issues cloud commands while _restart_lock is
+                    # held; bound it so one hanging API call cannot wedge
+                    # every later config apply behind the lock.
+                    await asyncio.wait_for(
+                        self.on_group_membership_changed(group_id, removed),
+                        timeout=_HOOK_TIMEOUT_SECONDS,
+                    )
                 except Exception:
                     logger.exception("group-membership hook failed for %s", group_id)
 
         if audio_hook and self.on_audio_restarted:
             try:
-                await self.on_audio_restarted()
+                await asyncio.wait_for(
+                    self.on_audio_restarted(), timeout=_HOOK_TIMEOUT_SECONDS
+                )
             except Exception:
                 logger.exception("audio-restarted hook failed")
+                # The hook re-points every playing speaker, so a failure may
+                # affect any entry this diff touched — keep them all un-advanced.
+                failed_entries |= (
+                    set(diff.encoder_restart)
+                    | set(diff.classic_rebuild)
+                    | set(diff.classic_added)
+                    | set(diff.airplay2_rebuild)
+                )
+
+        return failed_entries
 
     async def _reconcile_entry_airplay_targets(self, entry_id: str) -> None:
         """Re-assert one entry's external AirPlay targets (classic or AirPlay 2).
@@ -452,9 +590,6 @@ class AudioBridge:
             await self.restart()
             return
         self._audio_restart_requested = True
-        if self._restart_lock.locked():
-            # A restart is already running and will see the latest settings.
-            return
         async with self._restart_lock:
             while self._audio_restart_requested:
                 self._audio_restart_requested = False
@@ -467,7 +602,9 @@ class AudioBridge:
                         self._error_count += 1
                 if self.on_audio_restarted:
                     try:
-                        await self.on_audio_restarted()
+                        await asyncio.wait_for(
+                            self.on_audio_restarted(), timeout=_HOOK_TIMEOUT_SECONDS
+                        )
                     except Exception:
                         logger.exception("audio-restarted hook failed")
 
@@ -1023,7 +1160,7 @@ class AudioBridge:
             await self._rebuild_pipelines_locked()
         if self.on_audio_restarted:
             try:
-                await self.on_audio_restarted()
+                await asyncio.wait_for(self.on_audio_restarted(), timeout=_HOOK_TIMEOUT_SECONDS)
             except Exception:
                 logger.exception("audio-restarted hook failed")
 
@@ -1065,7 +1202,10 @@ class AudioBridge:
             if receiver_id in self._sender_volumes:
                 await self._local_volume(receiver_id, self._sender_volumes[receiver_id])
             if not resume and self.on_volume_session_start:
-                asyncio.create_task(self.on_volume_session_start(receiver_id))
+                self._spawn_aux(
+                    self.on_volume_session_start(receiver_id),
+                    f"volume-session:{receiver_id}",
+                )
         tap = self._target_taps.get(receiver_id)
         if tap is None and self._airplay_targets and settings.receiver_airplay_targets(receiver_id):
             # A session on an entry whose pipelines predate the target list —
@@ -1217,6 +1357,7 @@ class AudioBridge:
         # latches set makes freshly-created silent pipelines immediately look
         # stalled and creates a restart loop.
         self._active_sessions.clear()
+        self._stale_active_since.clear()
         if self._airplay_targets:
             await self._airplay_targets.stop_all()
         if self._dlna_targets:
@@ -1266,9 +1407,7 @@ class AudioBridge:
         """Stop one entry's pipelines and PCM tee, leaving every other entry
         (and its phone sessions) running."""
         stream_ids = [
-            key
-            for key in self._pipelines
-            if key == entry_id or key.startswith(f"{entry_id}-")
+            key for key in self._pipelines if key == entry_id or key.startswith(f"{entry_id}-")
         ]
         for stream_id in stream_ids:
             pipeline = self._pipelines.pop(stream_id, None)
@@ -1434,6 +1573,15 @@ class AudioBridge:
             return 0
         return await self._local_provider.disconnect(receiver_id)
 
+    @property
+    def stream_server(self) -> StreamServer:
+        """Read-only access to the stream server for playback lifecycle code."""
+        return self._stream_server
+
+    def is_session_active(self, receiver_id: str) -> bool:
+        """Whether a sender session is currently live for this receiver."""
+        return receiver_id in self._active_sessions
+
     def stream_client_count(self, stream_id: str) -> int:
         """How many speakers are currently pulling a stream (ground truth for
         "is audio really flowing out")."""
@@ -1465,21 +1613,77 @@ class AudioBridge:
                 logger.exception("Stale stream client sweep failed")
 
     def _sweep_stale_once(self) -> None:
+        """Last-resort cleanup for speaker connections the teardown path missed.
+
+        Session expiry is timed per OWNER from the moment NO member stream is
+        flowing anymore: as long as any grouped sink still receives audio the
+        session is alive, and one flaky member must not restart the group's
+        timer nor let a paused group expire while another member plays.
+        """
+        now = time.monotonic()
         receiver_ids = [receiver.id for receiver in settings.active_receivers()]
         receiver_ids.extend(
             instance.id for instance in settings.airplay2_instances if instance.enabled
         )
+        owners_with_clients: set[str] = set()
+        flowing_owners: set[str] = set()
+        idle_streams: dict[str, list[str]] = {}
         for stream_id in self._stream_server.stream_ids():
-            if not self._stream_server.client_count(stream_id):
-                continue
-            if self._stream_server.is_flowing(stream_id, window=STREAM_IDLE_KICK_SECONDS):
-                continue
             owner = _stream_owner(stream_id, receiver_ids)
             if owner is None:
                 continue
-            if owner in self._active_sessions:
-                continue  # paused sender session: the waiting speaker is wanted
-            self._stream_server.kick_clients(stream_id)
+            if not self._stream_server.client_count(stream_id):
+                continue
+            owners_with_clients.add(owner)
+            if self._stream_server.is_flowing(stream_id, window=STREAM_IDLE_KICK_SECONDS):
+                flowing_owners.add(owner)
+                continue
+            idle_streams.setdefault(owner, []).append(stream_id)
+
+        seen_idle: set[str] = set()
+        expired: set[str] = set()
+        for owner in sorted(owners_with_clients):
+            if owner in flowing_owners:
+                # A live member keeps the whole session alive; the next fully
+                # silent window starts a fresh timer.
+                self._stale_active_since.pop(owner, None)
+                continue
+            if owner not in self._active_sessions:
+                continue
+            seen_idle.add(owner)
+            # Read per sweep so a settings change hot-applies without an
+            # engine restart; 0 disables the expiry (pause indefinitely).
+            stale_timeout = float(settings.stale_session_timeout)
+            if stale_timeout <= 0:
+                continue  # paused sender session kept by configuration
+            started = self._stale_active_since.setdefault(owner, now)
+            if now - started < stale_timeout:
+                continue  # fully silent session: keep the waiting speakers briefly
+            logger.warning(
+                "Expiring stale active session %s after %.1fs without stream data",
+                owner,
+                now - started,
+            )
+            expired.add(owner)
+            self._active_sessions.discard(owner)
+            self._stale_active_since.pop(owner, None)
+            if self.on_session_stop:
+                self._spawn_aux(
+                    self.on_session_stop(owner),
+                    f"stale-session-stop:{owner}",
+                )
+        for owner in list(self._stale_active_since):
+            if owner not in seen_idle:
+                self._stale_active_since.pop(owner, None)
+        # Idle members of an expired or ownerless session are stale; idle
+        # members of a still-active session keep their connection — kicking
+        # them would only trigger needless speaker reconnects (a paused sender
+        # or a silent group sink while another member plays).
+        for owner, stream_ids in idle_streams.items():
+            if owner in self._active_sessions and owner not in expired:
+                continue
+            for stream_id in stream_ids:
+                self._stream_server.kick_clients(stream_id)
 
 
 def _stream_owner(stream_id: str, receiver_ids: list[str]) -> str | None:

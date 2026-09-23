@@ -67,9 +67,11 @@ def curve_signature(points: Sequence[ControlPoint] | None) -> tuple[ControlPoint
     return tuple((round(f, 1), round(g, 2)) for f, g in normalize_points(points))
 
 
-def legacy_bands_to_points(bands_hz: Sequence[int], gains_db: Sequence[float]) -> list[ControlPoint]:
+def legacy_bands_to_points(
+    bands_hz: Sequence[int], gains_db: Sequence[float]
+) -> list[ControlPoint]:
     """Old 10-band (or migrated 5-band) slider state → control points."""
-    return normalize_points(zip(bands_hz, gains_db))
+    return normalize_points(zip(bands_hz, gains_db, strict=False))
 
 
 # ---------------------------------------------------------------------------
@@ -145,9 +147,7 @@ def gain_table(
     return [(f, pchip_eval(points, f)) for f in freqs]
 
 
-def add_curve(
-    base: Sequence[ControlPoint], extra: Sequence[ControlPoint]
-) -> list[ControlPoint]:
+def add_curve(base: Sequence[ControlPoint], extra: Sequence[ControlPoint]) -> list[ControlPoint]:
     """Pointwise sum of two curves on the union of their control frequencies.
 
     Used to layer a fixed shelf (night-mode bass attenuation) onto a speaker's
@@ -208,13 +208,28 @@ def equalizer_chain(table: Sequence[ControlPoint], bands: int = FALLBACK_BANDS) 
 TARGET_CURVES: dict[str, list[ControlPoint]] = {
     "flat": [],
     "harman": [
-        (20, 6.0), (60, 5.0), (120, 3.5), (200, 2.0), (400, 1.0),
-        (1000, 0.0), (2000, 0.5), (4000, -0.5), (8000, -2.0),
-        (12000, -3.5), (16000, -4.5), (20000, -5.0),
+        (20, 6.0),
+        (60, 5.0),
+        (120, 3.5),
+        (200, 2.0),
+        (400, 1.0),
+        (1000, 0.0),
+        (2000, 0.5),
+        (4000, -0.5),
+        (8000, -2.0),
+        (12000, -3.5),
+        (16000, -4.5),
+        (20000, -5.0),
     ],
     "diffuse_field": [
-        (20, 3.0), (100, 2.0), (500, 0.5), (1000, 0.0),
-        (4000, -1.0), (8000, -3.0), (16000, -5.0), (20000, -6.0),
+        (20, 3.0),
+        (100, 2.0),
+        (500, 0.5),
+        (1000, 0.0),
+        (4000, -1.0),
+        (8000, -3.0),
+        (16000, -5.0),
+        (20000, -6.0),
     ],
 }
 
@@ -229,7 +244,13 @@ def target_table(name: str, size: int = GAIN_TABLE_SIZE) -> list[ControlPoint]:
 # intact (see add_curve); the near-0 dB top anchors keep the shelf from leaning
 # on the treble side.
 NIGHT_ATTENUATION: list[ControlPoint] = [
-    (20, -5.0), (40, -4.5), (80, -3.5), (160, -2.0), (320, -0.8), (640, 0.0), (20000, 0.0),
+    (20, -5.0),
+    (40, -4.5),
+    (80, -3.5),
+    (160, -2.0),
+    (320, -0.8),
+    (640, 0.0),
+    (20000, 0.0),
 ]
 
 
@@ -244,9 +265,18 @@ NIGHT_ATTENUATION: list[ControlPoint] = [
 LOUDNESS_BANDS = 11  # 0..10 → 0%..100% listening level
 
 _LOUDNESS_REFERENCE: list[ControlPoint] = [
-    (20, 10.0), (40, 9.0), (80, 7.5), (160, 5.5), (320, 3.5),
-    (640, 2.0), (1000, 1.0), (2000, 1.5), (4000, 3.0),
-    (8000, 5.0), (16000, 7.0), (20000, 8.0),
+    (20, 10.0),
+    (40, 9.0),
+    (80, 7.5),
+    (160, 5.5),
+    (320, 3.5),
+    (640, 2.0),
+    (1000, 1.0),
+    (2000, 1.5),
+    (4000, 3.0),
+    (8000, 5.0),
+    (16000, 7.0),
+    (20000, 8.0),
 ]
 
 
@@ -308,7 +338,9 @@ def fit_points(
     """
     flo, fhi = CURVE_FREQ_RANGE
     pairs = sorted(
-        (min(fhi, max(flo, f)), g) for f, g in zip(freqs, gains_db) if flo <= f <= fhi
+        (min(fhi, max(flo, f)), g)
+        for f, g in zip(freqs, gains_db, strict=False)
+        if flo <= f <= fhi
     )
     if not pairs:
         return []

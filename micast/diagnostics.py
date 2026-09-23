@@ -13,7 +13,7 @@ import logging
 import platform
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
@@ -122,7 +122,7 @@ async def build_report(bridge, device_manager) -> dict[str, Any]:
     for item in logs:
         item["message"] = sanitize_text(item.get("message", ""))
     return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "app": "MiCast",
         "version": __version__,
         "platform": platform.platform(),

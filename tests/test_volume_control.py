@@ -1,4 +1,5 @@
 """Volume policy tests with fake pipelines/devices; never contact speakers."""
+
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -13,7 +14,9 @@ def test_sender_mode_is_latched_and_linked_does_not_attenuate(monkeypatch):
         bridge = object.__new__(AudioBridge)
         gains = []
         bridge._pipelines = {
-            "one-L": SimpleNamespace(set_input_volume=gains.append, set_loudness_level=lambda _p: None)
+            "one-L": SimpleNamespace(
+                set_input_volume=gains.append, set_loudness_level=lambda _p: None
+            )
         }
         bridge._volume_modes = {}
         bridge._sender_volumes = {}
@@ -29,17 +32,21 @@ def test_sender_mode_is_latched_and_linked_does_not_attenuate(monkeypatch):
         await bridge._local_volume("one", 25)
         assert gains[-1] == 100  # no double attenuation
         bridge.on_receiver_volume.assert_awaited_with("one", 25)
+
     asyncio.run(run())
 
 
 def test_relative_volume_preserves_difference_and_clamps():
     async def run():
         values = {"a": 40, "b": 30, "c": 98}
+
         async def get(did, refresh=False):
             return values[did]
+
         async def put(did, value):
             values[did] = value
             return value
+
         manager = SimpleNamespace(get_volume=get, set_volume=put)
         old_routes = list(playback.router.routes)
         try:
@@ -52,4 +59,5 @@ def test_relative_volume_preserves_difference_and_clamps():
             assert values == {"a": 20, "b": 35, "c": 100}
         finally:
             playback.router.routes[:] = old_routes
+
     asyncio.run(run())

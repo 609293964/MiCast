@@ -6,7 +6,9 @@ import re
 import shutil
 import socket
 import sys
+import tempfile
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -112,9 +114,10 @@ def storage_mode() -> str:
         return "managed"
     if getattr(sys, "frozen", False):
         executable_dir = Path(sys.executable).resolve().parent
-        if os.environ.get("MICAST_PORTABLE", "").strip() == "1" or (
-            executable_dir / "portable.flag"
-        ).exists():
+        if (
+            os.environ.get("MICAST_PORTABLE", "").strip() == "1"
+            or (executable_dir / "portable.flag").exists()
+        ):
             return "portable"
         return "installed"
     return "development"
@@ -244,6 +247,18 @@ class EqPoint(BaseModel):
     gain_db: float = Field(ge=CURVE_GAIN_RANGE[0], le=CURVE_GAIN_RANGE[1])
 
 
+class SpeakerEqUndo(BaseModel):
+    """One server-side undo checkpoint for all audible per-speaker tuning."""
+
+    enabled: bool = False
+    points: list[EqPoint] = Field(default_factory=list)
+    preset: str = ""
+    target: str = ""
+    night_mode: bool = False
+    loudness_comp_enabled: bool = False
+    content_profile: str = ""
+
+
 class AppConfig(BaseModel):
     """Application-level settings."""
 
@@ -280,6 +295,12 @@ class SpeakerConfig(BaseModel):
     # eq_profiles; switching a scene copies it into eq_points.
     content_profile: str = ""
     eq_profiles: dict[str, list[EqPoint]] = Field(default_factory=dict)
+    # Monotonic persisted revision used for cross-client optimistic locking.
+    eq_revision: int = Field(default=0, ge=0)
+    # A single durable checkpoint (one slot, overwritten by every new
+    # checkpoint): undo still works after leaving the page or opening it on
+    # another device, but only one tuning step can be undone.
+    eq_undo: SpeakerEqUndo | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -300,8 +321,7 @@ class SpeakerConfig(BaseModel):
             gains = [max(lo, min(hi, float(b))) for b in bands[:EQ_BAND_COUNT]]
             gains += [0.0] * (EQ_BAND_COUNT - len(gains))
             data["eq_points"] = [
-                {"freq": float(hz), "gain_db": g}
-                for hz, g in zip(EQ_BANDS_HZ, gains, strict=True)
+                {"freq": float(hz), "gain_db": g} for hz, g in zip(EQ_BANDS_HZ, gains, strict=True)
             ]
         return data
 
@@ -379,9 +399,7 @@ class SpeakerGroupConfig(BaseModel):
                         continue
             anchor = min(members, key=lambda m: abs_lag.get(m, 0)) if members else None
             base = abs_lag.get(anchor, 0) if anchor else 0
-            out["delays_ms"] = {
-                m: abs_lag[m] - base for m in members if abs_lag[m] != base
-            }
+            out["delays_ms"] = {m: abs_lag[m] - base for m in members if abs_lag[m] != base}
             out["anchor_did"] = anchor
             return out
 
@@ -418,9 +436,7 @@ class SpeakerGroupConfig(BaseModel):
 def _sanitize_airplay_targets(items) -> list[str]:
     return list(
         dict.fromkeys(
-            str(item).lower()
-            for item in items
-            if re.fullmatch(r"[0-9a-f]{12}", str(item).lower())
+            str(item).lower() for item in items if re.fullmatch(r"[0-9a-f]{12}", str(item).lower())
         )
     )
 
@@ -497,6 +513,10 @@ class Settings(BaseSettings):
     # Opt-in session-start device volume. Zero is mute, not an off sentinel.
     default_volume: int = Field(default=0, ge=0, le=100)
     default_volume_enabled: bool = False
+    # How long a paused AirPlay session may hold stream clients without any
+    # data before the sweeper expires it and stops the Xiaomi playback.
+    # Seconds; 0 disables the expiry entirely (pause indefinitely).
+    stale_session_timeout: int = Field(default=60, ge=0)
     sender_volume_mode: str = Field(default="independent", pattern=r"^(independent|linked)$")
     # Webhook (飞书自定义机器人 / WxPusher) notified when the Xiaomi login
     # expires; empty = disabled.
@@ -516,6 +536,12 @@ class Settings(BaseSettings):
     # preferred one so a one-off conflict doesn't permanently move the port.
     _preferred_port: int | None = PrivateAttr(default=None)
     _preferred_stream_port: int | None = PrivateAttr(default=None)
+    _config_revision: int = PrivateAttr(default=0)
+
+    @property
+    def config_revision(self) -> int:
+        """Process-local monotonic revision used to notify connected UIs."""
+        return self._config_revision
 
     def apply_resolved_port(self, field: str, resolved: int) -> None:
         """Adopt the resolved port while remembering the preferred value."""
@@ -624,6 +650,7 @@ class Settings(BaseSettings):
             "touchscreen_lyrics": self.touchscreen_lyrics,
             "default_volume": self.default_volume,
             "default_volume_enabled": self.default_volume_enabled,
+            "stale_session_timeout": self.stale_session_timeout,
             "sender_volume_mode": self.sender_volume_mode,
             "notify_webhook_url": self.notify_webhook_url,
             "provider_account_id": self.provider_account_id,
@@ -633,20 +660,52 @@ class Settings(BaseSettings):
             "groups": [group.model_dump() for group in self.groups],
             "airplay2_instances": [item.model_dump() for item in self.airplay2_instances],
             "saved_curves": {
-                name: [p.model_dump() for p in points]
-                for name, points in self.saved_curves.items()
+                name: [p.model_dump() for p in points] for name, points in self.saved_curves.items()
             },
         }
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        payload = json.dumps(data, indent=2, ensure_ascii=False)
+        # Never expose a partially-written JSON file. This matters on NAS
+        # storage where a process/container can disappear halfway through a
+        # write and make the application unbootable on the next start.
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{self.config_path.name}.",
+            suffix=".tmp",
+            dir=self.config_path.parent,
+            text=True,
         )
+        temporary_path = Path(temporary)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, self.config_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        self._config_revision += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a deep runtime snapshot suitable for config rollback."""
+        return {
+            "fields": deepcopy(self.__dict__),
+            "private": deepcopy(self.__pydantic_private__),
+        }
+
+    def restore(self, snapshot: dict[str, Any], *, persist: bool = True) -> None:
+        """Restore an earlier snapshot after a runtime apply failure."""
+        self.__dict__.clear()
+        self.__dict__.update(deepcopy(snapshot["fields"]))
+        self.__pydantic_private__.clear()
+        self.__pydantic_private__.update(deepcopy(snapshot["private"]))
+        if persist:
+            self.save_to_file()
 
     def update_audio(self, **kwargs) -> None:
-        """Update audio config at runtime and persist."""
-        for key, value in kwargs.items():
-            if hasattr(self.audio, key):
-                setattr(self.audio, key, value)
+        """Validate and replace audio config atomically, then persist."""
+        current = self.audio.model_dump()
+        current.update({key: value for key, value in kwargs.items() if key in current})
+        self.audio = AudioConfig.model_validate(current)
         self.save_to_file()
 
     def update_app_name(self, name: str) -> None:
@@ -709,8 +768,7 @@ class Settings(BaseSettings):
         if not enabled:
             for group in self.groups:
                 group.delays_ms = {
-                    key: max(-5000, min(5000, int(value)))
-                    for key, value in group.delays_ms.items()
+                    key: max(-5000, min(5000, int(value))) for key, value in group.delays_ms.items()
                 }
         self.save_to_file()
 
@@ -720,6 +778,13 @@ class Settings(BaseSettings):
 
     def set_default_volume(self, volume: int) -> None:
         self.default_volume = max(0, min(100, int(volume)))
+        self.save_to_file()
+
+    def set_stale_session_timeout(self, seconds: int) -> None:
+        seconds = int(seconds)
+        if seconds < 0:
+            raise ValueError("stale_session_timeout must be a non-negative integer")
+        self.stale_session_timeout = seconds
         self.save_to_file()
 
     def set_notify_webhook(self, url: str) -> None:
@@ -745,13 +810,15 @@ class Settings(BaseSettings):
             current = self.airplay2_instances[0] if self.airplay2_instances else None
             target_type = current.target_type if current else "speaker"
             target_id = current.target_id if current else (self.selected_device_id or "unmapped")
-            self.airplay2_instances = [AirPlay2InstanceConfig(
-                id="airplay2",
-                name="MiCast",
-                target_type=target_type,
-                target_id=target_id,
-                enabled=True,
-            )]
+            self.airplay2_instances = [
+                AirPlay2InstanceConfig(
+                    id="airplay2",
+                    name="MiCast",
+                    target_type=target_type,
+                    target_id=target_id,
+                    enabled=True,
+                )
+            ]
         self.save_to_file()
 
     def bind_provider_account(self, account_id: str | None) -> bool:
@@ -778,13 +845,21 @@ class Settings(BaseSettings):
         return True
 
     def upsert_airplay2_instance(
-        self, *, instance_id: str | None, name: str,
-        target_type: str, target_id: str, enabled: bool = True,
+        self,
+        *,
+        instance_id: str | None,
+        name: str,
+        target_type: str,
+        target_id: str,
+        enabled: bool = True,
     ) -> AirPlay2InstanceConfig:
         current = next((item for item in self.airplay2_instances if item.id == instance_id), None)
         updated = AirPlay2InstanceConfig(
-            id=instance_id or uuid.uuid4().hex[:12], name=name.strip(),
-            target_type=target_type, target_id=target_id, enabled=enabled,
+            id=instance_id or uuid.uuid4().hex[:12],
+            name=name.strip(),
+            target_type=target_type,
+            target_id=target_id,
+            enabled=enabled,
         )
         if current:
             self.airplay2_instances[self.airplay2_instances.index(current)] = updated
@@ -808,8 +883,7 @@ class Settings(BaseSettings):
         return [
             receiver
             for receiver in self.receivers
-            if receiver.enabled
-            and (self.sync_groups_enabled or receiver.target_type != "group")
+            if receiver.enabled and (self.sync_groups_enabled or receiver.target_type != "group")
         ]
 
     def set_orchestrator(self, url: str, token: str | None = None) -> None:
@@ -963,11 +1037,10 @@ class Settings(BaseSettings):
         target: str | None = None,
     ) -> SpeakerConfig:
         speaker = self._get_or_create_speaker(did)
+        self._checkpoint_speaker_tuning(speaker)
         speaker.eq_enabled = enabled
-        speaker.eq_points = [
-            EqPoint(freq=f, gain_db=g) for f, g in normalize_points(points)
-        ]
-        speaker.eq_preset = preset if preset in EQ_PRESETS else ""
+        speaker.eq_points = [EqPoint(freq=f, gain_db=g) for f, g in normalize_points(points)]
+        speaker.eq_preset = preset if preset in EQ_PRESET_POINTS else ""
         # A manual curve edit (or calibration/import) is a custom curve, not a
         # scene — clear the active-scene label so it stops claiming a saved one.
         speaker.content_profile = ""
@@ -982,6 +1055,66 @@ class Settings(BaseSettings):
                 or (target.startswith("preset:") and target[7:] in EQ_PRESET_POINTS)
                 else ""
             )
+        self.save_to_file()
+        return speaker
+
+    def set_speaker_eq_target(self, did: str, target: str) -> SpeakerConfig:
+        """Persist the editor's visual reference without changing audio state."""
+
+        speaker = self._get_or_create_speaker(did)
+        speaker.eq_target = (
+            target
+            if target in TARGET_CURVES
+            or (target.startswith("saved:") and target[6:] in self.saved_curves)
+            or (target.startswith("preset:") and target[7:] in EQ_PRESET_POINTS)
+            else ""
+        )
+        # Reference selection is display state, not an audio adjustment: keep
+        # the existing undo checkpoint but publish a revision for other tabs.
+        speaker.eq_revision += 1
+        self.save_to_file()
+        return speaker
+
+    @staticmethod
+    def _speaker_tuning_snapshot(speaker: SpeakerConfig) -> SpeakerEqUndo:
+        return SpeakerEqUndo(
+            enabled=speaker.eq_enabled,
+            points=[EqPoint(freq=p.freq, gain_db=p.gain_db) for p in speaker.eq_points],
+            preset=speaker.eq_preset,
+            target=speaker.eq_target,
+            night_mode=speaker.night_mode,
+            loudness_comp_enabled=speaker.loudness_comp_enabled,
+            content_profile=speaker.content_profile,
+        )
+
+    def _checkpoint_speaker_tuning(self, speaker: SpeakerConfig) -> None:
+        """Capture the single undo slot before an audible tuning change.
+
+        The checkpoint covers exactly the audible tuning surface — EQ curve
+        (enabled/points/preset), the reference target overlay, night mode,
+        equal-loudness compensation and the active scene — so undo restores
+        what the listener hears. ``set_speaker_eq_target`` deliberately does
+        NOT checkpoint: it only moves the editor's visual reference, so it
+        bumps ``eq_revision`` for cross-client sync but keeps the existing
+        checkpoint intact.
+        """
+        speaker.eq_undo = self._speaker_tuning_snapshot(speaker)
+        speaker.eq_revision += 1
+
+    def undo_speaker_tuning(self, did: str) -> SpeakerConfig:
+        speaker = self._get_or_create_speaker(did)
+        snapshot = speaker.eq_undo
+        if snapshot is None:
+            raise ValueError("没有可撤销的调音调整")
+        speaker.eq_enabled = snapshot.enabled
+        speaker.eq_points = [EqPoint(freq=p.freq, gain_db=p.gain_db) for p in snapshot.points]
+        speaker.eq_preset = snapshot.preset
+        speaker.eq_target = snapshot.target
+        speaker.night_mode = snapshot.night_mode
+        speaker.loudness_comp_enabled = snapshot.loudness_comp_enabled
+        speaker.content_profile = snapshot.content_profile
+        speaker.eq_undo = None
+        speaker.eq_revision += 1
         self.save_to_file()
         return speaker
 
@@ -1005,9 +1138,7 @@ class Settings(BaseSettings):
         name = self._validate_curve_name(name)
         if name in self.saved_curves:
             raise ValueError("已存在同名曲线")
-        self.saved_curves[name] = [
-            EqPoint(freq=f, gain_db=g) for f, g in normalize_points(points)
-        ]
+        self.saved_curves[name] = [EqPoint(freq=f, gain_db=g) for f, g in normalize_points(points)]
         self.save_to_file()
 
     def delete_saved_curve(self, name: str) -> None:
@@ -1025,12 +1156,18 @@ class Settings(BaseSettings):
 
     def set_speaker_night_mode(self, did: str, enabled: bool) -> SpeakerConfig:
         speaker = self._get_or_create_speaker(did)
+        if speaker.night_mode == bool(enabled):
+            return speaker
+        self._checkpoint_speaker_tuning(speaker)
         speaker.night_mode = bool(enabled)
         self.save_to_file()
         return speaker
 
     def set_speaker_loudness(self, did: str, enabled: bool) -> SpeakerConfig:
         speaker = self._get_or_create_speaker(did)
+        if speaker.loudness_comp_enabled == bool(enabled):
+            return speaker
+        self._checkpoint_speaker_tuning(speaker)
         speaker.loudness_comp_enabled = bool(enabled)
         self.save_to_file()
         return speaker
@@ -1059,6 +1196,7 @@ class Settings(BaseSettings):
         points = speaker.eq_profiles.get(profile)
         if not points:
             raise ValueError(f"content profile not saved: {profile}")
+        self._checkpoint_speaker_tuning(speaker)
         speaker.eq_points = [EqPoint(freq=p.freq, gain_db=p.gain_db) for p in points]
         speaker.eq_enabled = True
         speaker.eq_preset = ""
@@ -1113,7 +1251,13 @@ class Settings(BaseSettings):
                 eq_counts[base] = eq_counts.get(base, 0) + 1
                 suffix = f"{base}-q{eq_counts[base]}"
             variants.append(
-                {"suffix": suffix, "base": base, "channel": channel, "eq": curve, "loudness": loudness}
+                {
+                    "suffix": suffix,
+                    "base": base,
+                    "channel": channel,
+                    "eq": curve,
+                    "loudness": loudness,
+                }
             )
         # Network devices with a channel assignment need that channel's
         # stream too (DLNA renderers pull it directly) — even when the group
@@ -1125,7 +1269,13 @@ class Settings(BaseSettings):
                 if side in assigned_sides and (base, None, False) not in seen:
                     seen.add((base, None, False))
                     variants.append(
-                        {"suffix": base, "base": base, "channel": side, "eq": None, "loudness": False}
+                        {
+                            "suffix": base,
+                            "base": base,
+                            "channel": side,
+                            "eq": None,
+                            "loudness": False,
+                        }
                     )
         # The plain base stream always exists: it is a cheap raw-PCM bypass
         # (no encoder) and serves mirror speakers, DLNA renderers without a
@@ -1254,8 +1404,7 @@ class Settings(BaseSettings):
             }
         if gains_db is not None:
             data["gains_db"] = {
-                str(key): max(-12.0, min(12.0, float(value)))
-                for key, value in gains_db.items()
+                str(key): max(-12.0, min(12.0, float(value))) for key, value in gains_db.items()
             }
         if airplay_targets is not None:
             data["airplay_targets"] = _sanitize_airplay_targets(airplay_targets)
@@ -1456,7 +1605,8 @@ class Settings(BaseSettings):
             # Legacy files did not persist miotDID.  If one currently-discovered
             # speaker has this name, consolidate its obsolete same-name records.
             legacy_duplicates = [
-                item for item in self.speakers
+                item
+                for item in self.speakers
                 if item.did != did
                 and item.did not in consumed
                 and native_name
@@ -1498,12 +1648,10 @@ class Settings(BaseSettings):
             if instance.target_type == "speaker" and instance.target_id == old_did:
                 instance.target_id = new_did
         for group in self.groups:
-            group.speaker_ids = list(dict.fromkeys(
-                new_did if item == old_did else item for item in group.speaker_ids
-            ))
-            for mapping in (
-                group.delays_ms, group.channels, group.gains_db
-            ):
+            group.speaker_ids = list(
+                dict.fromkeys(new_did if item == old_did else item for item in group.speaker_ids)
+            )
+            for mapping in (group.delays_ms, group.channels, group.gains_db):
                 if old_did in mapping:
                     value = mapping.pop(old_did)
                     mapping.setdefault(new_did, value)

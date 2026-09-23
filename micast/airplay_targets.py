@@ -12,6 +12,7 @@ import logging
 from array import array
 
 from micast.airplay_discovery import AirPlayDiscovery
+from micast.pcm_tee import BoundedPCMReader
 from micast.raop.alac_encoder import FRAME_SAMPLES, AlacPacketizer
 from micast.raop.client import RaopError, RaopSender
 from micast.volume import apply_pcm_gain
@@ -194,7 +195,7 @@ class AirPlayTargetManager:
                 continue
             runtime = _TargetRuntime(did, device.name, delay_ms, channel)
             runtime.desired_volume = self._linked_volumes.get(receiver_id, initial_volume)
-            runtime.reader = asyncio.StreamReader()
+            runtime.reader = BoundedPCMReader()
             hub.targets[did] = runtime
             runtime.task = asyncio.create_task(self._run(runtime))
 

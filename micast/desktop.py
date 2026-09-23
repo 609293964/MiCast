@@ -53,9 +53,7 @@ def _running_instance_port() -> int | None:
 def _claim_instance(port: int) -> None:
     with contextlib.suppress(OSError):
         _lock_path().parent.mkdir(parents=True, exist_ok=True)
-        _lock_path().write_text(
-            json.dumps({"pid": os.getpid(), "port": port}), encoding="utf-8"
-        )
+        _lock_path().write_text(json.dumps({"pid": os.getpid(), "port": port}), encoding="utf-8")
 
 
 def _acquire_singleton_mutex():
@@ -87,9 +85,7 @@ def _install_file_logging() -> None:
     log_path = default_log_dir() / "micast.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     handler = logging.FileHandler(log_path, encoding="utf-8")
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logging.getLogger().addHandler(handler)
 
 
@@ -136,9 +132,7 @@ def run_desktop() -> None:
 
     from micast.main import app  # noqa: PLC0415 — after logging is set up
 
-    config = uvicorn.Config(
-        app, host=settings.host, port=settings.port, log_level="info"
-    )
+    config = uvicorn.Config(app, host=settings.host, port=settings.port, log_level="info")
     server = uvicorn.Server(config)
     server_thread = threading.Thread(target=server.run, daemon=True)
     server_thread.start()
@@ -162,8 +156,11 @@ def run_desktop() -> None:
             window.hide()
 
     window = webview.create_window(
-        "MiCast", url,
-        width=1120, height=780, min_size=(820, 600),
+        "MiCast",
+        url,
+        width=1120,
+        height=780,
+        min_size=(820, 600),
         js_api=_DesktopApi(),
     )
     app.state.desktop_show = lambda: window.show()
@@ -197,9 +194,11 @@ def run_desktop() -> None:
         def prompt():
             nonlocal prompt_open
             try:
-                handled = bool(window.evaluate_js(
-                    "Boolean(window.micastClosePrompt && (window.micastClosePrompt(), true))"
-                ))
+                handled = bool(
+                    window.evaluate_js(
+                        "Boolean(window.micastClosePrompt && (window.micastClosePrompt(), true))"
+                    )
+                )
             except Exception:
                 handled = False
             prompt_open = False

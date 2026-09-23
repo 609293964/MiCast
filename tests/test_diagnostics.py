@@ -15,7 +15,7 @@ def test_sanitize_redacts_credential_pairs():
 def test_sanitize_redacts_cookie_and_webhook_tokens():
     # The cookie scrub intentionally masks to end of line: cookie values
     # contain spaces, so a partial mask would leak the tail pairs.
-    assert sanitize_text('cookie: a=1; passToken=xyz') == "cookie: ***"
+    assert sanitize_text("cookie: a=1; passToken=xyz") == "cookie: ***"
     out = sanitize_text("GET https://open.feishu.cn/open-apis/bot/v2/hook/deadbeefcafe 200")
     assert "deadbeefcafe" not in out
     assert "open.feishu.cn" in out  # host stays readable

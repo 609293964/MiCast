@@ -56,13 +56,8 @@ def build_topology(bridge, device_manager) -> dict:
     edges: list[dict] = []
     speaker_ids: list[str] = []
 
-    receivers = [
-        (receiver, "classic", None)
-        for receiver in settings.active_receivers()
-    ]
-    airplay2_status = {
-        item.get("id"): item for item in bridge.status.get("airplay2_instances", [])
-    }
+    receivers = [(receiver, "classic", None) for receiver in settings.active_receivers()]
+    airplay2_status = {item.get("id"): item for item in bridge.status.get("airplay2_instances", [])}
     receivers.extend(
         (instance, "airplay2", airplay2_status.get(instance.id, {}))
         for instance in settings.airplay2_instances
@@ -72,7 +67,9 @@ def build_topology(bridge, device_manager) -> dict:
         rid = receiver.id
         info = receiver_status.get(rid, {})
         raop_info = raop.get(rid, {})
-        targets = settings.receiver_targets(rid)
+        # ``unmapped`` is an AirPlay 2 setup placeholder, not a device. It
+        # must never become a visible speaker or a fake downstream route.
+        targets = [did for did in settings.receiver_targets(rid) if did != "unmapped"]
         stream_active = any(
             stream_id == rid or stream_id.startswith(f"{rid}-")
             for stream_id, stream_info in streams.items()
@@ -168,7 +165,10 @@ def build_topology(bridge, device_manager) -> dict:
             stream_info = streams.get(stream_id, {})
             nodes.append(
                 _stream_node(
-                    stream_id, receiver.name, variant["channel"], stream_info,
+                    stream_id,
+                    receiver.name,
+                    variant["channel"],
+                    stream_info,
                     eq=bool(variant["eq"]),
                 )
             )
@@ -176,9 +176,7 @@ def build_topology(bridge, device_manager) -> dict:
             for did in targets:
                 if settings.stream_suffix(rid, did) != variant["suffix"]:
                     continue
-                edges.append(
-                    _pull_edge(stream_id, did, stream_info, delays, group, receiver.name)
-                )
+                edges.append(_pull_edge(stream_id, did, stream_info, delays, group, receiver.name))
 
         # External AirPlay devices attached to the group: MiCast pushes RAOP
         # to them straight from the engine (they pull nothing over HTTP).
@@ -190,8 +188,11 @@ def build_topology(bridge, device_manager) -> dict:
                     "kind": "speaker",
                     "label": runtime.get("name") or target_id,
                     "status": (
-                        "playing" if streaming
-                        else "error" if runtime.get("status") == "error" else "idle"
+                        "playing"
+                        if streaming
+                        else "error"
+                        if runtime.get("status") == "error"
+                        else "idle"
                     ),
                     "enabled": True,
                     "airplay_target": True,
@@ -217,8 +218,11 @@ def build_topology(bridge, device_manager) -> dict:
                     "kind": "speaker",
                     "label": runtime.get("name") or target_id,
                     "status": (
-                        "playing" if playing
-                        else "error" if runtime.get("status") == "error" else "idle"
+                        "playing"
+                        if playing
+                        else "error"
+                        if runtime.get("status") == "error"
+                        else "idle"
                     ),
                     "enabled": True,
                     "dlna_target": True,

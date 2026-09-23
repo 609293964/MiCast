@@ -50,6 +50,11 @@ def _get_machine_id() -> str:
                     return line.split('"')[-2]
     except Exception:
         logger.exception("Failed to read machine id")
+        logger.warning(
+            "无法读取机器特征，加密密钥回退到内置默认 key：token 文件绑定此回退 key，"
+            "换机、重装系统或更换安装目录后都会无法解密，届时需要重新扫码登录。"
+            "如需跨机迁移，请设置 MICAST_ENCRYPTION_KEY 环境变量固定密钥。"
+        )
 
     return "micast-default-key"
 

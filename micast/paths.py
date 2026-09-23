@@ -9,4 +9,3 @@ def app_path(path: str = "") -> str:
     if not path:
         return APP_BASE_PATH
     return f"{APP_BASE_PATH}/{path.lstrip('/')}"
-

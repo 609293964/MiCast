@@ -75,6 +75,9 @@ class SpeakerPipeline:
         self._session_active = session_active
         self._on_source_stall = on_source_stall
         self._stall_task: asyncio.Task | None = None
+        self._recovery_task: asyncio.Task | None = None
+        self._aux_tasks: set[asyncio.Task] = set()
+        self._generation = 0
         self._source_restart_lock = asyncio.Lock()
         self._last_feed_at = 0.0
         # Armed only while a newly-started sender session has not produced its
@@ -172,6 +175,23 @@ class SpeakerPipeline:
     def set_input_volume(self, percent: int) -> None:
         self._input_volume = max(0, min(100, int(percent)))
 
+    def set_audio_character(
+        self,
+        *,
+        eq_curve: list[tuple[float, float]] | tuple[tuple[float, float], ...] | None,
+        loudness: bool,
+    ) -> None:
+        """Update the filter inputs consumed by the next encoder start.
+
+        Pipelines are intentionally long-lived across ordinary EQ edits. The
+        curve therefore has to be refreshed explicitly before restarting the
+        encoder; otherwise it keeps rendering the constructor-time curve even
+        though the saved stream plan has moved on.
+        """
+        self._eq_curve = list(eq_curve) if eq_curve else None
+        self._loudness = bool(loudness)
+        self._loudness_band = loudness_band(self._loudness_level)
+
     def set_loudness_level(self, percent: int) -> None:
         """Update the listening level driving equal-loudness compensation.
 
@@ -188,7 +208,27 @@ class SpeakerPipeline:
             return
         self._loudness_band = band
         if not self._loudness_restarting:
-            asyncio.create_task(self._rebuild_loudness())
+            self._spawn_aux(self._rebuild_loudness(), "loudness-rebuild")
+
+    def _spawn_aux(self, coroutine, label: str) -> asyncio.Task:
+        """Own a short-lived helper task and consume its failures."""
+        task = asyncio.create_task(coroutine, name=f"pipeline:{self._stream_id}:{label}")
+        self._aux_tasks.add(task)
+
+        def done(finished: asyncio.Task) -> None:
+            self._aux_tasks.discard(finished)
+            if finished.cancelled():
+                return
+            error = finished.exception()
+            if error:
+                logger.error(
+                    "Pipeline helper %s failed",
+                    finished.get_name(),
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(done)
+        return task
 
     async def _rebuild_loudness(self) -> None:
         """Rebuild only the encoder after a loudness band crossing."""
@@ -225,6 +265,7 @@ class SpeakerPipeline:
         if self._running:
             return
         self._running = True
+        self._generation += 1
         self._status = "running"
         self._last_feed_at = time.monotonic()
         self._stall_armed = True
@@ -289,6 +330,7 @@ class SpeakerPipeline:
         if not self._running:
             return
         self._running = False
+        self._generation += 1
         self._status = "stopping"
         logger.info("Stopping pipeline for %s", self._stream_id)
 
@@ -296,6 +338,18 @@ class SpeakerPipeline:
             self._stall_task.cancel()
             await asyncio.gather(self._stall_task, return_exceptions=True)
         self._stall_task = None
+
+        current = asyncio.current_task()
+        if self._recovery_task and self._recovery_task is not current:
+            self._recovery_task.cancel()
+            await asyncio.gather(self._recovery_task, return_exceptions=True)
+        if self._recovery_task is not current:
+            self._recovery_task = None
+        for task in list(self._aux_tasks):
+            task.cancel()
+        if self._aux_tasks:
+            await asyncio.gather(*list(self._aux_tasks), return_exceptions=True)
+        self._aux_tasks.clear()
 
         for task in self._tasks:
             task.cancel()
@@ -361,7 +415,9 @@ class SpeakerPipeline:
                 if self._on_source_stall is not None:
                     # A ReaderPCMSource cannot repair its upstream RAOP/TCP
                     # producer by restarting around the same dead reader.
-                    asyncio.create_task(self._on_source_stall(self._stream_id))
+                    self._spawn_aux(
+                        self._on_source_stall(self._stream_id), "source-stall-recovery"
+                    )
                     return
                 await self._restart_source()
         except asyncio.CancelledError:
@@ -479,14 +535,28 @@ class SpeakerPipeline:
                     self._encoder.returncode,
                 )
                 self._status = "restarting"
-                asyncio.create_task(self._delayed_restart())
+                if self._recovery_task is None or self._recovery_task.done():
+                    generation = self._generation
+                    self._recovery_task = asyncio.create_task(self._delayed_restart(generation))
         except asyncio.CancelledError:
             pass
         except Exception:
             logger.exception("Error watching encoder for %s", self._stream_id)
 
-    async def _delayed_restart(self) -> None:
-        await asyncio.sleep(3)
-        if self._running:
-            await self.stop()
-            await self.start()
+    async def _delayed_restart(self, generation: int) -> None:
+        try:
+            await asyncio.sleep(3)
+            # A manual/config-driven rebuild supersedes this recovery. Without
+            # the generation check an old encoder failure can stop a healthy
+            # replacement pipeline several seconds later.
+            if self._running and self._generation == generation:
+                await self.stop()
+                await self.start()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Delayed pipeline recovery failed for %s", self._stream_id)
+            self._status = "error"
+        finally:
+            if self._recovery_task is asyncio.current_task():
+                self._recovery_task = None

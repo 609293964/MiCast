@@ -60,15 +60,21 @@ def test_delay_holds_normalizes_to_most_ahead_member(monkeypatch):
     DLNA renderers have no delay path and are excluded."""
     monkeypatch.setattr(Settings, "save_to_file", lambda self: None)
     group = SpeakerGroupConfig(
-        id="g1", name="全屋", speaker_ids=["a", "b", "c"],
-        delays_ms={"a": -100, "b": 0, "c": 0}, anchor_did="b",
+        id="g1",
+        name="全屋",
+        speaker_ids=["a", "b", "c"],
+        delays_ms={"a": -100, "b": 0, "c": 0},
+        anchor_did="b",
     )
     assert group.delay_holds() == {"a": 0, "b": 100, "c": 100}
 
     # A negative offset (pull earlier) is expressed by padding the siblings.
     group = SpeakerGroupConfig(
-        id="g2", name="全屋", speaker_ids=["a", "b"],
-        delays_ms={"b": -200}, anchor_did="a",
+        id="g2",
+        name="全屋",
+        speaker_ids=["a", "b"],
+        delays_ms={"b": -200},
+        anchor_did="a",
     )
     assert group.delay_holds() == {"a": 200, "b": 0}
 
@@ -91,8 +97,11 @@ def test_receiver_airplay_delays(monkeypatch):
     cfg = Settings()
     cfg.groups = [
         SpeakerGroupConfig(
-            id="g1", name="全屋", speaker_ids=["a"],
-            airplay_targets=["aabbccddeeff"], delays_ms={"aabbccddeeff": 300},
+            id="g1",
+            name="全屋",
+            speaker_ids=["a"],
+            airplay_targets=["aabbccddeeff"],
+            delays_ms={"aabbccddeeff": 300},
         )
     ]
     cfg.add_receiver("全屋", "group", "g1")
@@ -155,9 +164,7 @@ async def test_play_error_retry_loop(monkeypatch):
     manager._stream_urls = {}
     manager._error_retry_task = None
 
-    monkeypatch.setattr(
-        "micast.xiaomi.device_manager.PLAY_ERROR_RETRY_SECONDS", 0.01
-    )
+    monkeypatch.setattr("micast.xiaomi.device_manager.PLAY_ERROR_RETRY_SECONDS", 0.01)
     attempts: list[tuple[str, str]] = []
 
     async def fake_play_stream(did, url, owner=None, force=False):
@@ -177,3 +184,32 @@ async def test_play_error_retry_loop(monkeypatch):
     assert attempts[-1] == ("did1", "http://x/stream/1")
     if manager._error_retry_task:
         await manager._error_retry_task
+
+
+@pytest.mark.asyncio
+async def test_play_error_retry_loop_gives_up_after_cap(monkeypatch):
+    """A speaker that keeps rejecting the play command (removed from the
+    account, powered off for good) must not be retried forever: after
+    PLAY_ERROR_MAX_ATTEMPTS the error is dropped and the loop goes idle."""
+    manager = DeviceManager.__new__(DeviceManager)
+    manager._play_errors = {}
+    manager._play_error_attempts = {}
+    manager._stream_urls = {}
+    manager._error_retry_task = None
+
+    monkeypatch.setattr("micast.xiaomi.device_manager.PLAY_ERROR_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr("micast.xiaomi.device_manager.PLAY_ERROR_MAX_ATTEMPTS", 3)
+    attempts: list[str] = []
+
+    async def failing_play_stream(did, url, owner=None, force=False):
+        attempts.append(did)
+        raise RuntimeError("gone")
+
+    manager.play_stream = failing_play_stream
+    manager.note_play_error("did1", "rcv1", "boom", "http://x/stream/1")
+    if manager._error_retry_task:
+        await manager._error_retry_task
+
+    assert manager._play_errors == {}
+    assert manager._play_error_attempts == {}
+    assert len(attempts) == 3  # capped, not infinite

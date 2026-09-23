@@ -10,6 +10,7 @@ import json
 import re
 import secrets
 import time
+from collections.abc import Callable
 from urllib.parse import quote
 
 from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -18,6 +19,7 @@ from pydantic import BaseModel
 
 from micast.audio_bridge import AudioBridge
 from micast.config import CONTENT_PROFILES, settings
+from micast.config_apply import apply_config_transaction
 from micast.curve_fit import (
     CURVE_FREQ_RANGE,
     CURVE_GAIN_RANGE,
@@ -34,6 +36,7 @@ from micast.room_measure import (
     recording_level_dbfs,
     sweep_pcm,
 )
+from micast.routes.models import TuningStateResponse
 from micast.spectrum import (
     spectrum_client_connected,
     spectrum_client_disconnected,
@@ -53,19 +56,37 @@ class LevelMatchPayload(BaseModel):
 
 
 def install(bridge: AudioBridge | None, device_manager: DeviceManager | None = None) -> APIRouter:
+    async def apply_audio() -> None:
+        if bridge:
+            await bridge.apply_config_change(debounce=False)
+
+    async def apply_audio_settled() -> None:
+        """EQ/audio commits debounce BEFORE the config transaction opens.
+
+        The 0.6s settle runs here, lock-free; the transaction then applies the
+        final state directly (debounce=False), so the process-wide config lock
+        is never held across the wait and rollback never re-sleeps.
+        """
+        if bridge:
+            # Test doubles may not implement the settle hook; real bridges do.
+            waiter = getattr(bridge, "wait_config_settled", None)
+            if waiter is not None:
+                await waiter()
+        await apply_audio()
+
     def _speaker_state(did: str) -> dict:
         speaker = settings.get_speaker(did)
         return {
             "did": did,
             "enabled": speaker.eq_enabled if speaker else False,
-            "points": (
-                [[p.freq, p.gain_db] for p in speaker.eq_points] if speaker else []
-            ),
+            "points": ([[p.freq, p.gain_db] for p in speaker.eq_points] if speaker else []),
             "preset": speaker.eq_preset if speaker else "",
             "target": speaker.eq_target if speaker else "",
             "night_mode": speaker.night_mode if speaker else False,
             "loudness_comp_enabled": speaker.loudness_comp_enabled if speaker else False,
             "content_profile": speaker.content_profile if speaker else "",
+            "revision": speaker.eq_revision if speaker else 0,
+            "undo_available": bool(speaker and speaker.eq_undo is not None),
             "profiles": (
                 {k: [[p.freq, p.gain_db] for p in v] for k, v in speaker.eq_profiles.items()}
                 if speaker
@@ -75,7 +96,37 @@ def install(bridge: AudioBridge | None, device_manager: DeviceManager | None = N
             "gain_range": list(CURVE_GAIN_RANGE),
         }
 
-    @router.get("/{did}")
+    class RevisionConflict(Exception):
+        """Stale client's eq_revision; raised inside the config lock."""
+
+    def _revision_guard(did: str, payload: dict) -> Callable[[], None]:
+        """Build a guard that must run as the first step of the mutate step.
+
+        Checking before apply_config_transaction would leave a TOCTOU window:
+        another commit can land between the check and lock acquisition.
+        """
+
+        def guard() -> None:
+            expected = payload.get("expected_revision")
+            if type(expected) is not int:
+                return
+            speaker = settings.get_speaker(did)
+            actual = speaker.eq_revision if speaker else 0
+            if expected != actual:
+                raise RevisionConflict
+
+        return guard
+
+    def _conflict() -> HTTPException:
+        return HTTPException(
+            status_code=409,
+            detail="这台音箱的调音已在另一端更新，已为你载入最新设置",
+        )
+
+    async def persist_only() -> None:
+        return None
+
+    @router.get("/{did}", response_model=TuningStateResponse)
     async def get_curve(did: str):
         return _speaker_state(did)
 
@@ -90,20 +141,48 @@ def install(bridge: AudioBridge | None, device_manager: DeviceManager | None = N
             clean = normalize_points(points)
         except (TypeError, ValueError) as e:
             raise HTTPException(status_code=400, detail=f"invalid points: {e}") from e
-        try:
-            settings.set_speaker_eq_curve(
+
+        def mutate_eq():
+            _revision_guard(did, payload)()
+            return settings.set_speaker_eq_curve(
                 did,
                 enabled=enabled,
                 points=clean,
                 preset=str(payload.get("preset", "")),
-                target=payload.get("target") if "target" in payload else None,
+                target=None,
             )
+
+        try:
+            await apply_config_transaction(
+                mutate_eq,
+                apply_audio_settled,
+                rollback_runtime=apply_audio,
+            )
+        except RevisionConflict:
+            raise _conflict() from None
         except (TypeError, ValueError) as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         # Curve edits re-split streams by EQ signature; pipelines rebuild and
         # playing speakers re-point. The editor debounces drag commits.
-        if bridge:
-            await bridge.apply_config_change()
+        return _speaker_state(did)
+
+    @router.post("/target")
+    async def set_target(payload: dict):
+        did = payload.get("did")
+        target = payload.get("target")
+        if not did or not isinstance(target, str):
+            raise HTTPException(status_code=400, detail="did and target required")
+
+        def mutate_target():
+            _revision_guard(did, payload)()
+            return settings.set_speaker_eq_target(did, target)
+
+        try:
+            await apply_config_transaction(mutate_target, persist_only)
+        except RevisionConflict:
+            raise _conflict() from None
+        # A reference is canvas-only: persist and synchronize it without
+        # rebuilding encoders or interrupting current playback.
         return _speaker_state(did)
 
     # ------------------------------------------------------------------
@@ -116,9 +195,19 @@ def install(bridge: AudioBridge | None, device_manager: DeviceManager | None = N
         enabled = payload.get("enabled")
         if not did or not isinstance(enabled, bool):
             raise HTTPException(status_code=400, detail="did and enabled required")
-        settings.set_speaker_night_mode(did, enabled)
-        if bridge:
-            await bridge.apply_config_change()
+
+        def mutate_night_mode():
+            _revision_guard(did, payload)()
+            return settings.set_speaker_night_mode(did, enabled)
+
+        try:
+            await apply_config_transaction(
+                mutate_night_mode,
+                apply_audio_settled,
+                rollback_runtime=apply_audio,
+            )
+        except RevisionConflict:
+            raise _conflict() from None
         return _speaker_state(did)
 
     @router.post("/loudness")
@@ -127,10 +216,43 @@ def install(bridge: AudioBridge | None, device_manager: DeviceManager | None = N
         enabled = payload.get("enabled")
         if not did or not isinstance(enabled, bool):
             raise HTTPException(status_code=400, detail="did and enabled required")
-        settings.set_speaker_loudness(did, enabled)
-        if bridge:
-            await bridge.apply_config_change()
+
+        def mutate_loudness():
+            _revision_guard(did, payload)()
+            return settings.set_speaker_loudness(did, enabled)
+
+        try:
+            await apply_config_transaction(
+                mutate_loudness,
+                apply_audio_settled,
+                rollback_runtime=apply_audio,
+            )
+        except RevisionConflict:
+            raise _conflict() from None
         return _speaker_state(did)
+
+    @router.post("/undo")
+    async def undo_tuning(payload: dict):
+        did = payload.get("did")
+        if not did:
+            raise HTTPException(status_code=400, detail="请选择音箱")
+
+        def mutate_undo():
+            _revision_guard(str(did), payload)()
+            return settings.undo_speaker_tuning(str(did))
+
+        try:
+            await apply_config_transaction(
+                mutate_undo,
+                apply_audio_settled,
+                rollback_runtime=apply_audio,
+            )
+        except RevisionConflict:
+            raise _conflict() from None
+        except ValueError as exc:
+            # Nothing to undo is a state problem, not a conflict.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _speaker_state(str(did))
 
     # ---- Global curve library ----
     # Library mutations never touch the audio path; they only persist named
@@ -182,12 +304,21 @@ def install(bridge: AudioBridge | None, device_manager: DeviceManager | None = N
         profile = str(payload.get("profile", ""))
         if not did or profile not in CONTENT_PROFILES:
             raise HTTPException(status_code=400, detail="did and valid profile required")
+
+        def mutate_profile():
+            _revision_guard(did, payload)()
+            return settings.set_speaker_content_profile(did, profile)
+
         try:
-            settings.set_speaker_content_profile(did, profile)
+            await apply_config_transaction(
+                mutate_profile,
+                apply_audio_settled,
+                rollback_runtime=apply_audio,
+            )
+        except RevisionConflict:
+            raise _conflict() from None
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
-        if bridge:
-            await bridge.apply_config_change()
         return _speaker_state(did)
 
     @router.post("/profile/delete")
@@ -224,7 +355,7 @@ def install(bridge: AudioBridge | None, device_manager: DeviceManager | None = N
         name = re.sub(r"[^\w.-]+", "_", speaker.alias or did) or did
         ascii_name = re.sub(r"[^A-Za-z0-9._-]+", "_", name) or did
         disposition = (
-            f"attachment; filename=\"micast-{ascii_name}-eq.txt\"; "
+            f'attachment; filename="micast-{ascii_name}-eq.txt"; '
             f"filename*=UTF-8''{quote(f'micast-{name}-eq.txt')}"
         )
         return PlainTextResponse(
@@ -239,9 +370,21 @@ def install(bridge: AudioBridge | None, device_manager: DeviceManager | None = N
         points = parse_graphic_eq(str(payload.get("text", "")))
         if not points:
             raise HTTPException(status_code=400, detail="无法解析 GraphicEQ 曲线")
-        settings.set_speaker_eq_curve(did, enabled=True, points=points, preset="", target=None)
-        if bridge:
-            await bridge.apply_config_change()
+
+        def mutate_import():
+            _revision_guard(did, payload)()
+            return settings.set_speaker_eq_curve(
+                did, enabled=True, points=points, preset="", target=None
+            )
+
+        try:
+            await apply_config_transaction(
+                mutate_import,
+                apply_audio_settled,
+                rollback_runtime=apply_audio,
+            )
+        except RevisionConflict:
+            raise _conflict() from None
         return _speaker_state(did)
 
     # ------------------------------------------------------------------
@@ -353,7 +496,7 @@ def install(bridge: AudioBridge | None, device_manager: DeviceManager | None = N
 
     @router.post("/calibration/analyze")
     async def analyze_calibration(
-        file: UploadFile = File(...),
+        file: UploadFile = File(...),  # noqa: B008 - FastAPI dependency declaration
         did: str = "",
         target: str = "",
     ):
@@ -381,15 +524,25 @@ def install(bridge: AudioBridge | None, device_manager: DeviceManager | None = N
         points = payload.get("points")
         if not did or not isinstance(points, list) or not points:
             raise HTTPException(status_code=400, detail="did and points required")
-        settings.set_speaker_eq_curve(
-            did,
-            enabled=True,
-            points=normalize_points(points),
-            preset="",
-            target=str(payload.get("target", "")),
-        )
-        if bridge:
-            await bridge.apply_config_change()
+
+        def mutate_calibration():
+            _revision_guard(did, payload)()
+            return settings.set_speaker_eq_curve(
+                did,
+                enabled=True,
+                points=normalize_points(points),
+                preset="",
+                target=str(payload.get("target", "")),
+            )
+
+        try:
+            await apply_config_transaction(
+                mutate_calibration,
+                apply_audio_settled,
+                rollback_runtime=apply_audio,
+            )
+        except RevisionConflict:
+            raise _conflict() from None
         return _speaker_state(did)
 
     @router.post("/level-match")
@@ -409,9 +562,11 @@ def install(bridge: AudioBridge | None, device_manager: DeviceManager | None = N
         gains = dict(group.gains_db)
         for did, level in known.items():
             gains[did] = round(max(-12.0, reference - level), 1)
-        settings.update_group(group.id, gains_db=gains)
-        if bridge:
-            await bridge.apply_config_change()
+        await apply_config_transaction(
+            lambda: settings.update_group(group.id, gains_db=gains),
+            apply_audio_settled,
+            rollback_runtime=apply_audio,
+        )
         return {"group_id": group.id, "gains_db": gains}
 
     return router

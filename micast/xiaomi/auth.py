@@ -41,7 +41,8 @@ class XiaomiAuth:
         self._miot_account: MiAccount | None = None
         self._service: MiNAService | None = None
         self._miot_service: MiIOService | None = None
-        self.on_login_expired = None  # sync callback, fired from invalidate_login
+        self.on_login_expired = None  # backwards-compatible single callback
+        self._expiry_listeners: list = []
         self._state_path = settings.config_path.parent / "xiaomi-account.json"
 
     def _account_state(self) -> dict:
@@ -64,7 +65,17 @@ class XiaomiAuth:
     def connection_state(self) -> dict:
         logged_in, user_id = self.stored_identity()
         saved = self._account_state()
-        status = "connected" if logged_in else str(saved.get("status") or "never_connected")
+        saved_status = str(saved.get("status") or "never_connected")
+        has_provider_history = bool(saved.get("ever_logged_in") or settings.speakers)
+        # A previously connected account with unreadable/missing encrypted
+        # tokens is an expired session, not a brand-new installation. This
+        # lets the UI offer recovery after a machine-key or token-file change.
+        if logged_in:
+            status = "connected"
+        elif has_provider_history and saved_status != "disconnected":
+            status = "expired"
+        else:
+            status = saved_status
         return {
             "logged_in": logged_in,
             "user_id": user_id or saved.get("user_id"),
@@ -139,6 +150,20 @@ class XiaomiAuth:
         user_id = str(tokens["userId"]) if tokens and tokens.get("userId") else None
         return user_id is not None, user_id
 
+    def subscribe_expiry(self, callback) -> None:
+        """Subscribe to the single account-expired event.
+
+        Consumers receive the event without owning token cleanup. This keeps
+        UI notifications, diagnostics and integrations from each reimplementing
+        expiry handling.
+        """
+        if callback not in self._expiry_listeners:
+            self._expiry_listeners.append(callback)
+
+    def unsubscribe_expiry(self, callback) -> None:
+        if callback in self._expiry_listeners:
+            self._expiry_listeners.remove(callback)
+
     async def verify_credentials(self) -> str:
         """Classify the stored login after a cloud API failure.
 
@@ -151,9 +176,9 @@ class XiaomiAuth:
         if not tokens or not tokens.get("userId") or not tokens.get("passToken"):
             return "unknown"
         user_id = str(tokens["userId"])
-        device_id = tokens.get("deviceId") or hashlib.md5(
-            f"micast-{user_id}".encode()
-        ).hexdigest()[:16]
+        device_id = (
+            tokens.get("deviceId") or hashlib.md5(f"micast-{user_id}".encode()).hexdigest()[:16]
+        )
         try:
             pair = await self._exchange_for_sid(user_id, tokens["passToken"], device_id, SID)
         except XiaomiAuthError as exc:
@@ -182,11 +207,22 @@ class XiaomiAuth:
         self._miot_account = None
         self._service = None
         self._miot_service = None
-        if self.on_login_expired:
+        callbacks = list(self._expiry_listeners)
+        if self.on_login_expired and self.on_login_expired not in callbacks:
+            callbacks.append(self.on_login_expired)
+        for callback in callbacks:
             try:
-                self.on_login_expired()
+                callback()
             except Exception:
-                logger.exception("on_login_expired callback failed")
+                logger.exception("login-expired callback failed")
+
+    async def recover_after_failure(self) -> str:
+        """Classify a failed Xiaomi request and invalidate only when certain."""
+        verdict = await self.verify_credentials()
+        logger.info("Xiaomi credential verification result: %s", verdict)
+        if verdict == "rejected":
+            self.invalidate_login()
+        return verdict
 
     def logout(self) -> None:
         """Intentional disconnect; unlike expiry this must not prompt recovery."""
@@ -210,14 +246,12 @@ class XiaomiAuth:
         if not tokens or not tokens.get("userId") or not tokens.get("passToken"):
             return False
         user_id = str(tokens["userId"])
-        device_id = tokens.get("deviceId") or hashlib.md5(
-            f"micast-{user_id}".encode()
-        ).hexdigest()[:16]
+        device_id = (
+            tokens.get("deviceId") or hashlib.md5(f"micast-{user_id}".encode()).hexdigest()[:16]
+        )
 
         try:
-            tokens[SID] = await self._exchange_for_sid(
-                user_id, tokens["passToken"], device_id, SID
-            )
+            tokens[SID] = await self._exchange_for_sid(user_id, tokens["passToken"], device_id, SID)
         except XiaomiAuthError:
             logger.warning("passToken rejected during renewal; session is dead")
             self.invalidate_login()

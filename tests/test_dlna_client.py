@@ -1,6 +1,5 @@
 """DLNA discovery XML parsing, target config, and classify_device."""
 
-
 from micast.airplay_discovery import classify_device
 from micast.config import Settings, SpeakerGroupConfig
 from micast.dlna_client import DlnaDevice, DlnaDiscovery, _soap_action
@@ -70,7 +69,5 @@ def test_update_group_sanitizes_dlna_targets(monkeypatch):
     monkeypatch.setattr(Settings, "save_to_file", lambda self: None)
     cfg = Settings()
     cfg.groups = [SpeakerGroupConfig(id="g1", name="全屋", speaker_ids=["a", "b"])]
-    group = cfg.update_group(
-        "g1", dlna_targets=["uuid:abc", " uuid:abc ", "", "uuid:def"]
-    )
+    group = cfg.update_group("g1", dlna_targets=["uuid:abc", " uuid:abc ", "", "uuid:def"])
     assert group.dlna_targets == ["uuid:abc", "uuid:def"]

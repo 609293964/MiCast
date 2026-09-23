@@ -1,13 +1,17 @@
 """In-process PyAV encoder: format headers, filter chain, resample, lifecycle."""
 
+import asyncio
 import io
 import math
+import queue
 import struct
 
 import av
 
 from micast.audio_encoder import (
     AudioEncoder,
+    _put_latest_async,
+    _put_latest_sync,
     mp3_silence,
     raw_pcm_format,
     transcode_file_to_wav,
@@ -36,8 +40,28 @@ def test_mp3_silence_is_decodable_and_cached():
     assert sum(frame.samples for frame in frames) >= 48000
 
 
-async def _encode(fmt: str, pcm: bytes, *, rate_in: int = 44100, rate_out: int = 48000,
-                  audio_filter: str | None = None) -> bytes:
+def test_realtime_queues_drop_oldest_instead_of_growing():
+    sync_queue = queue.Queue(maxsize=2)
+    _put_latest_sync(sync_queue, b"old")
+    _put_latest_sync(sync_queue, b"middle")
+    _put_latest_sync(sync_queue, b"latest")
+    assert [sync_queue.get_nowait(), sync_queue.get_nowait()] == [b"middle", b"latest"]
+
+    async_queue = asyncio.Queue(maxsize=2)
+    _put_latest_async(async_queue, b"old")
+    _put_latest_async(async_queue, b"middle")
+    _put_latest_async(async_queue, b"latest")
+    assert [async_queue.get_nowait(), async_queue.get_nowait()] == [b"middle", b"latest"]
+
+
+async def _encode(
+    fmt: str,
+    pcm: bytes,
+    *,
+    rate_in: int = 44100,
+    rate_out: int = 48000,
+    audio_filter: str | None = None,
+) -> bytes:
     encoder = AudioEncoder(
         _audio_config(fmt, rate_out), input_sample_rate=rate_in, audio_filter=audio_filter
     )
@@ -109,8 +133,7 @@ async def test_pan_filter_picks_one_channel():
     for i in range(44100 // 2):
         v = int(10000 * math.sin(2 * math.pi * 440 * i / 44100))
         pcm += struct.pack("<hh", v, 0)
-    data = await _encode("wav", bytes(pcm), rate_out=44100,
-                         audio_filter="pan=stereo|c0=FR|c1=FR")
+    data = await _encode("wav", bytes(pcm), rate_out=44100, audio_filter="pan=stereo|c0=FR|c1=FR")
     start = data.index(b"data") + 8
     samples = struct.unpack(f"<{(len(data) - start) // 2}h", data[start:])
     assert max(abs(s) for s in samples) < 100  # FR was silent → near silence out

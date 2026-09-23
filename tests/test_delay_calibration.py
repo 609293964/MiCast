@@ -8,17 +8,16 @@ from micast.stream_server import StreamServer
 def test_request_offsets_preserve_observed_order_without_claiming_audible_direction():
     arrivals = {"anchor": 100.0, "early": 99.8, "late": 100.35}
 
-    assert _request_offsets(
-        arrivals, "anchor", ["anchor", "early", "late"]
-    ) == {"early": -200, "late": 350}
+    assert _request_offsets(arrivals, "anchor", ["anchor", "early", "late"]) == {
+        "early": -200,
+        "late": 350,
+    }
 
 
 def test_request_offsets_round_to_control_step_and_clamp_outliers():
     arrivals = {"anchor": 100.0, "near": 100.024, "outlier": 130.0}
 
-    assert _request_offsets(
-        arrivals, "anchor", ["anchor", "near", "outlier"]
-    ) == {"outlier": 20000}
+    assert _request_offsets(arrivals, "anchor", ["anchor", "near", "outlier"]) == {"outlier": 20000}
 
 
 @pytest.mark.asyncio

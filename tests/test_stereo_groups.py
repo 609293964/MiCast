@@ -24,12 +24,8 @@ def _no_persistence(monkeypatch):
 
 def _settings_with_stereo_group() -> Settings:
     settings = Settings()
-    settings.groups = [
-        SpeakerGroupConfig(id="g1", name="组播", speaker_ids=["didA", "didB"])
-    ]
-    settings.receivers = [
-        ReceiverConfig(id="r1", name="组播", target_type="group", target_id="g1")
-    ]
+    settings.groups = [SpeakerGroupConfig(id="g1", name="组播", speaker_ids=["didA", "didB"])]
+    settings.receivers = [ReceiverConfig(id="r1", name="组播", target_type="group", target_id="g1")]
     return settings
 
 
@@ -52,9 +48,7 @@ def test_stereo_mode_allows_network_only_group():
     # No speaker channels: only the always-present base stream.
     assert [v["suffix"] for v in variants] == [""]
     # Assigning network channels creates channel streams for DLNA to pull.
-    settings.update_group(
-        "g1", network_channels={"aabbccddeeff": "left", "001122334455": "right"}
-    )
+    settings.update_group("g1", network_channels={"aabbccddeeff": "left", "001122334455": "right"})
     variants = settings.receiver_stream_variants("r1")
     assert [v["suffix"] for v in variants] == ["-L", "-R", ""]
     assert settings.receiver_channel_variant_suffix("r1", "left") == "-L"
@@ -82,9 +76,7 @@ def test_stereo_mode_defaults_channels_first_left_second_right():
     assert settings.channel_suffix("r1", "didA") == "-L"
     other = Settings()
     other.groups = [SpeakerGroupConfig(id="g2", name="m", speaker_ids=["didA"])]
-    other.receivers = [
-        ReceiverConfig(id="r2", name="m", target_type="group", target_id="g2")
-    ]
+    other.receivers = [ReceiverConfig(id="r2", name="m", target_type="group", target_id="g2")]
     assert other.channel_suffix("r2", "didA") == ""
 
 
@@ -98,9 +90,7 @@ def test_swapping_channels_keeps_one_per_side():
 
 def test_gains_and_delays_are_clamped():
     settings = _settings_with_stereo_group()
-    group = settings.update_group(
-        "g1", gains_db={"didA": 99.0}, delays_ms={"didB": 99999}
-    )
+    group = settings.update_group("g1", gains_db={"didA": 99.0}, delays_ms={"didB": 99999})
     assert group.gains_db["didA"] == 12.0
     assert group.delays_ms["didB"] == 5000
     # Signed offsets clamp at the lower bound too.
@@ -120,12 +110,18 @@ def test_sink_hold_is_scoped_to_receiver_group():
     settings = Settings()
     settings.groups = [
         SpeakerGroupConfig(
-            id="g1", name="first", speaker_ids=["shared", "a"],
-            delays_ms={"shared": 100}, anchor_did="a",
+            id="g1",
+            name="first",
+            speaker_ids=["shared", "a"],
+            delays_ms={"shared": 100},
+            anchor_did="a",
         ),
         SpeakerGroupConfig(
-            id="g2", name="playing", speaker_ids=["shared", "b"],
-            delays_ms={"shared": 900}, anchor_did="b",
+            id="g2",
+            name="playing",
+            speaker_ids=["shared", "b"],
+            delays_ms={"shared": 900},
+            anchor_did="b",
         ),
     ]
     settings.receivers = [
@@ -144,12 +140,20 @@ def test_hidden_startup_sync_can_be_cleared():
     second = asyncio.Queue()
     server._client_delay = {
         first: {
-            "receiver": "r1", "sink": "didA", "manual_ms": 0,
-            "startup_ms": 0, "ready_at": 100.0, "calibrated": False,
+            "receiver": "r1",
+            "sink": "didA",
+            "manual_ms": 0,
+            "startup_ms": 0,
+            "ready_at": 100.0,
+            "calibrated": False,
         },
         second: {
-            "receiver": "r1", "sink": "didB", "manual_ms": 1000,
-            "startup_ms": 0, "ready_at": 101.2, "calibrated": False,
+            "receiver": "r1",
+            "sink": "didB",
+            "manual_ms": 1000,
+            "startup_ms": 0,
+            "ready_at": 101.2,
+            "calibrated": False,
         },
     }
 
@@ -179,9 +183,7 @@ def test_reanchor_preserves_physical_holds():
 def _pipeline(monkeypatch, group) -> SpeakerPipeline:
     import micast.speaker_pipeline as sp
 
-    monkeypatch.setattr(
-        sp.settings, "groups", [group], raising=False
-    )
+    monkeypatch.setattr(sp.settings, "groups", [group], raising=False)
     return SpeakerPipeline(
         device_id="r1",
         alias="组播 (左声道)",

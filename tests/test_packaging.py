@@ -40,9 +40,7 @@ def test_data_dir_packaged_falls_back_to_user_dir(monkeypatch):
     monkeypatch.setattr(config.sys, "executable", "/Applications/MiCast")
     monkeypatch.setattr(config.sys, "platform", "darwin")
     monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/Users/tester")))
-    assert config.default_data_dir() == Path(
-        "/Users/tester/Library/Application Support/MiCast"
-    )
+    assert config.default_data_dir() == Path("/Users/tester/Library/Application Support/MiCast")
 
 
 def test_windows_distribution_definitions_cover_portable_and_installed_modes():
@@ -50,9 +48,7 @@ def test_windows_distribution_definitions_cover_portable_and_installed_modes():
     build_script = (root / "scripts" / "build-windows-distributions.ps1").read_text(
         encoding="utf-8"
     )
-    installer = (root / "packaging" / "windows" / "MiCast.iss").read_text(
-        encoding="utf-8"
-    )
+    installer = (root / "packaging" / "windows" / "MiCast.iss").read_text(encoding="utf-8")
 
     assert "portable.flag" in build_script
     assert "MiCast-Portable.zip" in build_script
@@ -64,9 +60,7 @@ def test_windows_distribution_definitions_cover_portable_and_installed_modes():
 def test_multiarch_docker_build_keeps_web_build_off_qemu():
     root = Path(__file__).resolve().parents[1]
     dockerfile = (root / "docker" / "Dockerfile").read_text(encoding="utf-8")
-    workflow = (root / ".github" / "workflows" / "docker.yml").read_text(
-        encoding="utf-8"
-    )
+    workflow = (root / ".github" / "workflows" / "docker.yml").read_text(encoding="utf-8")
 
     assert "FROM --platform=$BUILDPLATFORM node:20-alpine AS web-build" in dockerfile
     assert "group: docker-${{ github.sha }}" in workflow

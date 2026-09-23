@@ -29,9 +29,7 @@ def _settings() -> Settings:
     s.airplay_engine = "local"
     s.sync_groups_enabled = True
     s.airplay2_enabled = True
-    s.groups = [
-        SpeakerGroupConfig(id="g1", name="全屋", speaker_ids=["a", "b"], anchor_did="a")
-    ]
+    s.groups = [SpeakerGroupConfig(id="g1", name="全屋", speaker_ids=["a", "b"], anchor_did="a")]
     s.receivers = [
         ReceiverConfig(id="r1", name="全屋", target_type="group", target_id="g1", enabled=True),
     ]

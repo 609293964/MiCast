@@ -8,10 +8,27 @@ if [ ! -d "${TRIM_APPDEST}/vendor" ]; then
   exit 1
 fi
 runtime="${TRIM_APPDEST}/airplay2-runtime"
-chmod 0755 "$runtime/bin/nqptp" "$runtime/bin/shairport-sync" "$runtime/run-shairport"
-if ! command -v setcap >/dev/null 2>&1; then
-  echo "系统缺少 setcap，无法启用原生 AirPlay 2 所需的 NQPTP。" > "$TRIM_TEMP_LOGFILE"
-  exit 1
+if [ -d "$runtime" ]; then
+  chmod 0755 "$runtime/bin/nqptp" "$runtime/bin/shairport-sync" "$runtime/run-shairport"
+  # The bundled musl loader matches the package architecture: the ARM FPK
+  # ships an aarch64 runtime, the x86 FPK an x86-64 one.
+  case "$(uname -m)" in
+    aarch64|arm64) loader="$runtime/lib/ld-musl-aarch64.so.1" ;;
+    *)             loader="$runtime/lib/ld-musl-x86_64.so.1" ;;
+  esac
+  # NQPTP needs cap_net_bind_service for the AirPlay 2 timing port. setcap can
+  # be missing or refused on restricted systems — native AirPlay 2 then
+  # degrades but the app itself runs, so warn visibly instead of aborting.
+  if command -v setcap >/dev/null 2>&1 && [ -f "$loader" ]; then
+    if ! setcap cap_net_bind_service=+ep "$loader" 2>>"$TRIM_TEMP_LOGFILE"; then
+      {
+        echo "警告：setcap 授权失败，原生 AirPlay 2（NQPTP 特权端口）可能不可用。"
+      } >> "$TRIM_TEMP_LOGFILE" 2>&1
+    fi
+  else
+    {
+      echo "警告：缺少 setcap 或运行时加载器 $loader，无法启用原生 AirPlay 2 所需的 NQPTP 特权端口。"
+    } >> "$TRIM_TEMP_LOGFILE" 2>&1
+  fi
 fi
-setcap cap_net_bind_service=+ep "$runtime/lib/ld-musl-x86_64.so.1"
 rm -f "${TRIM_PKGVAR}/micast.pid" "${TRIM_APPDEST}/app.sock"

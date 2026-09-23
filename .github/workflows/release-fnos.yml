@@ -8,12 +8,31 @@ on:
 permissions:
   contents: write
 
+# One run per ref: re-pushing a tag (delete + push) or re-dispatching cancels
+# the superseded build instead of letting two release jobs race the upload.
+concurrency:
+  group: release-fnos-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
+    strategy:
+      matrix:
+        platform: [x86, arm]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+
+      - name: 校验 tag 版本与代码/manifest 一致
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          APP_VERSION="$(sed -n 's/^[[:space:]]*__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' micast/__init__.py | head -n 1)"
+          MANIFEST_VERSION="$(sed -n 's/^version=//p' packaging/fnos/manifest | tr -d '\r' | head -n 1)"
+          echo "tag=$TAG_VERSION app=$APP_VERSION manifest=$MANIFEST_VERSION"
+          [ "$TAG_VERSION" = "$APP_VERSION" ] || { echo "tag 版本与 micast/__init__.py 的 __version__ 不一致" >&2; exit 1; }
+          [ "$TAG_VERSION" = "$MANIFEST_VERSION" ] || { echo "tag 版本与 manifest version 不一致" >&2; exit 1; }
 
       - uses: actions/setup-python@v7
         with:
@@ -32,15 +51,15 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: Build the fnOS package
-        run: bash scripts/build-fnos.sh
+        run: bash scripts/build-fnos.sh "${{ matrix.platform }}"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: MiCast-fnos
-          path: dist/fnos/*.fpk
+          name: MiCast-fnos-${{ matrix.platform }}
+          path: dist/fnos/micast-${{ matrix.platform }}-*.fpk
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/fnos/*.fpk
+          files: dist/fnos/micast-${{ matrix.platform }}-*.fpk

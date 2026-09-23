@@ -77,7 +77,6 @@ start_service() {
   export MICAST_DATA_DIR="$TRIM_PKGVAR"
   export MICAST_UNIX_SOCKET="$SOCKET_FILE"
   export MICAST_DEPLOYMENT="fnos"
-  export MICAST_STREAM_PORT="${MICAST_STREAM_PORT:-8080}"
   export PYTHON_BIN
   runtime="${TRIM_APPDEST}/airplay2-runtime"
   token_file="${TRIM_PKGVAR}/callback-token"
@@ -87,11 +86,16 @@ start_service() {
     chmod 0600 "$token_file"
   fi
   export MICAST_ORCHESTRATOR_TOKEN="$(cat "$token_file")"
-  export MICAST_AIRPLAY2_RUNTIME="$runtime"
   export MICAST_AIRPLAY_ENGINE="local"
   export MICAST_AIRPLAY_PROTOCOL="classic"
-  export MICAST_AIRPLAY2_MODE="single"
-  export MICAST_AIRPLAY2_PCM_SOURCE="local:${runtime}/run-shairport"
+  if [ -x "${runtime}/bin/shairport-sync" ] && [ -x "${runtime}/bin/nqptp" ] && [ -x "${runtime}/run-shairport" ]; then
+    export MICAST_AIRPLAY2_RUNTIME="$runtime"
+    export MICAST_AIRPLAY2_MODE="single"
+    export MICAST_AIRPLAY2_PCM_SOURCE="local:${runtime}/run-shairport"
+  else
+    export MICAST_AIRPLAY2_MODE="disabled"
+    unset MICAST_AIRPLAY2_RUNTIME MICAST_AIRPLAY2_PCM_SOURCE
+  fi
   export MICAST_DEVICE_ID="airplay2"
   export MICAST_AIRPLAY_NAME="MiCast"
   cd "$TRIM_APPDEST" || return 1
@@ -108,8 +112,7 @@ start_service() {
   done
   {
     echo "MiCast 启动失败。"
-    echo "日志：${LOG_FILE}"
-    tail -n 30 "$LOG_FILE" 2>/dev/null || true
+    echo "请稍后重试；如果仍无法启动，请在反馈时附上日志文件：${LOG_FILE}"
   } > "$TRIM_TEMP_LOGFILE"
   return 1
 }

@@ -2,7 +2,7 @@
 
 ## 应用结构
 
-- 架构：x86
+- 架构：x86、ARM64（manifest 平台名为 `arm`）
 - 依赖：应用中心 `python312`
 - 公开入口：`/app/micast/`
 - 网关 Socket：`${TRIM_APPDEST}/app.sock`
@@ -26,4 +26,14 @@
 pwsh -NoProfile -File scripts/build-fnos.ps1
 ```
 
-Linux x86 可运行 `bash scripts/build-fnos.sh`。产物输出到 `dist/fnos/`。
+ARM 包使用：
+
+```powershell
+pwsh -NoProfile -File scripts/build-fnos.ps1 -Platform arm
+```
+
+Linux 可分别运行 `bash scripts/build-fnos.sh x86` 或
+`bash scripts/build-fnos.sh arm`。产物输出到 `dist/fnos/`。
+
+ARM 包暂不包含仅有 x86-64 构建的内置 AirPlay 2 运行时，因此会自动隐藏
+AirPlay 2 开关；经典 AirPlay、DLNA 和其他功能不受影响。

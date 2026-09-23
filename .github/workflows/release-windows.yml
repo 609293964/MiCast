@@ -14,6 +14,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: 校验 tag 版本与代码/安装程序一致
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $Tag = $env:GITHUB_REF_NAME.TrimStart('v')
+          $App = (Select-String -Path micast\__init__.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $Iss = (Select-String -Path packaging\windows\MiCast.iss -Pattern '#define\s+AppVersion\s+"([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "tag=$Tag app=$App iss=$Iss"
+          if ($Tag -ne $App) { throw "tag 版本与 micast/__init__.py 的 __version__ 不一致" }
+          if ($Tag -ne $Iss) { throw "tag 版本与 MiCast.iss 的 AppVersion 不一致" }
+
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"

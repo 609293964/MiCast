@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "micast"
-version = "0.2.5"
+version = "0.3.0"
 description = "把手机、电脑上的音频投放到一台或多台小米智能音箱。支持跨型号组播、多音箱同步和立体声组合，通过 AirPlay / DLNA 即连即播。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,13 +12,17 @@ license = { text = "MIT" }
 authors = [
     { name = "DyMode" },
 ]
+# Runtime dependencies are duplicated in requirements.txt (Docker/fnOS builds
+# consume that file); keep the two in sync. requirements.txt is authoritative.
 dependencies = [
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "python-multipart>=0.0.9",
-    "miservice-fork>=0.0.1",
+    # Lower bound is the version whose aiohttp-based MiAccount the 15s command
+    # timeout wrapper assumes; older forks may run a different HTTP stack.
+    "miservice-fork>=2.9.3",
     "qrcode>=7.4",
     "pillow>=10.3",
     "aiofiles>=23.2",

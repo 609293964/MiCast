@@ -10,7 +10,7 @@ import {
 } from "./components/app-shell";
 import { bindDebugPanel, bindStreamKicks, renderConnectionChecks, renderDebugPanel, renderStreamRows, updateRuntimeLog, type DebugState } from "./components/debug-panel";
 import { bindDevicesView, renderDevicesView } from "./components/devices-view";
-import { bindTuningView, renderTuningView } from "./components/tuning-view";
+import { bindTuningView, disposeTuningView, renderTuningView } from "./components/tuning-view";
 import { renderQRSheet, bindQRSheet } from "./components/qr-sheet";
 import { bindReceiversView, renderReceiversView } from "./components/receivers-view";
 import { bindSettingsView, renderSettingsView } from "./components/settings-view";
@@ -20,8 +20,10 @@ import { bindAccessLogin, bindOnboarding, renderAccessLogin, renderOnboarding, r
 import { bindPlaybackBar, isPlaybackBarInteracting, renderPlaybackBar } from "./components/playback-bar";
 import { bindTopologyView, renderTopologyView } from "./components/topology-view";
 import { store, type Section, type State, type Theme } from "./state";
+import type { PlaybackState, Status } from "./api";
 import { appWebSocketUrl } from "./paths";
 import "./styles.css";
+import { safeUserMessage } from "./errors";
 
 // fnOS presents MiCast inside its own titled window/sheet. Mark that context
 // once, before the first render, so the web shell does not duplicate the host
@@ -146,6 +148,7 @@ function render(state: State) {
   const appName = state.fullConfig?.app.name ?? "MiCast";
   const activeSection = state.ui.activeSection;
   const tuningDid = state.ui.tuningDid;
+  if (lastRenderedTuningDid && !tuningDid) disposeTuningView();
 
   let mainContent = "";
 
@@ -584,8 +587,7 @@ async function finishOnboarding() {
 }
 
 function friendlyError(error: unknown): string {
-  const raw = error instanceof Error ? error.message : "未知错误";
-  return raw.match(/"detail"\s*:\s*"([^"]+)"/)?.[1] || raw;
+  return safeUserMessage(error);
 }
 
 // A freshly detected expiry opens the QR sheet directly — the user should
@@ -704,12 +706,15 @@ async function loadInitialState() {
       api.getStatus(),
       api.getAudioConfig(),
       api.getConfig(),
-      api.getXiaomiStatus(),
+      api.getXiaomiStatus(true),
       api.getAirPlay2State().catch(() => null),
     ]);
     document.documentElement.classList.toggle("is-fnos", config.deployment === "fnos");
     store.set({ status, audio, fullConfig: config, xiaomi, receivers: status.receivers, airplay2 });
     render(store.get());
+    // Initial state can already be expired (for example after reinstalling
+    // while retaining data). Do not wait for the 30-second poll to open recovery.
+    maybeAutoRecovery(xiaomi);
 
     if (xiaomi.logged_in) {
       api.getPlaybackState(true).then((playback) => {
@@ -763,7 +768,7 @@ async function init() {
   await loadInitialState();
 
   // Realtime state: WebSocket push when available, polling as fallback.
-  function applyStatus(status: any) {
+  function applyStatus(status: Status) {
     const changed = JSON.stringify(store.get().status) !== JSON.stringify(status);
     const interactionPending = store.get().saving;
     store.set(interactionPending ? { status } : { status, receivers: status.receivers });
@@ -775,10 +780,35 @@ async function init() {
     }
   }
 
-  function applyPlayback(playback: any) {
+  function applyPlayback(playback: PlaybackState) {
     if (JSON.stringify(playback) !== JSON.stringify(store.get().playback)) {
       store.set({ playback });
       updatePlaybackBar();
+    }
+  }
+
+  let sharedSettingsBusy = false;
+  async function syncSharedSettings() {
+    if (sharedSettingsBusy || document.hidden) return;
+    sharedSettingsBusy = true;
+    try {
+      const [fullConfig, audio, devices] = await Promise.all([
+        api.getConfig(),
+        api.getAudioConfig(),
+        store.get().xiaomi.logged_in ? api.getDevices() : Promise.resolve(store.get().devices),
+      ]);
+      const changed =
+        JSON.stringify(fullConfig) !== JSON.stringify(store.get().fullConfig) ||
+        JSON.stringify(audio) !== JSON.stringify(store.get().audio) ||
+        JSON.stringify(devices) !== JSON.stringify(store.get().devices);
+      if (changed) {
+        store.set({ fullConfig, audio, devices });
+        requestRender();
+      }
+    } catch {
+      // Existing state remains usable while another client or the network is unavailable.
+    } finally {
+      sharedSettingsBusy = false;
     }
   }
 
@@ -808,10 +838,23 @@ async function init() {
           // Playback controls keep the last confirmed state while temporarily offline.
         }
       }, 5000),
+      window.setInterval(() => void syncSharedSettings(), 5000),
     ];
   }
 
+  let realtimeSocket: WebSocket | null = null;
+  let realtimeRetry: number | null = null;
+  function realtimeHealthy(): boolean {
+    return (
+      realtimeSocket !== null &&
+      (realtimeSocket.readyState === WebSocket.OPEN ||
+        realtimeSocket.readyState === WebSocket.CONNECTING)
+    );
+  }
   function startRealtime() {
+    if (realtimeHealthy()) {
+      return;
+    }
     let socket: WebSocket | null = null;
     try {
       socket = new WebSocket(appWebSocketUrl("api/ws"));
@@ -819,37 +862,91 @@ async function init() {
       startPolling();
       return;
     }
+    realtimeSocket = socket;
     socket.onopen = () => stopPolling();
     socket.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
         if (message.type === "status") applyStatus(message.data);
         else if (message.type === "playback" && store.get().xiaomi.logged_in) applyPlayback(message.data);
+        else if (message.type === "tuning") {
+          window.dispatchEvent(new CustomEvent("micast:tuning-change", { detail: message.data }));
+        }
+        else if (message.type === "config") void syncSharedSettings();
       } catch {
         // malformed frame — ignore
       }
     };
     socket.onclose = () => {
+      if (realtimeSocket !== socket) return;
+      realtimeSocket = null;
       // Fall back to polling; retry the socket when it likely recovered.
       startPolling();
-      setTimeout(startRealtime, 30000);
+      if (realtimeRetry !== null) window.clearTimeout(realtimeRetry);
+      realtimeRetry = window.setTimeout(() => {
+        realtimeRetry = null;
+        startRealtime();
+      }, 30000);
     };
     socket.onerror = () => socket?.close();
   }
   startRealtime();
 
+  // iOS may freeze or tombstone the WebView while the TCP socket still looks
+  // OPEN to JavaScript. Re-entering the app is a lifecycle boundary: discard
+  // the old socket, refresh state immediately, then establish a new stream.
+  // Polling only starts when no healthy socket exists — otherwise every wake
+  // would leave the 3s/5s poll timers running on top of the live WS until the
+  // next disconnect.
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    void syncSharedSettings();
+    if (realtimeSocket) {
+      const old = realtimeSocket;
+      realtimeSocket = null;
+      old.close();
+    }
+    startRealtime();
+    if (!realtimeHealthy()) startPolling();
+  });
+  window.addEventListener("pageshow", () => {
+    if (document.visibilityState === "visible") {
+      void syncSharedSettings();
+      if (realtimeSocket) {
+        const old = realtimeSocket;
+        realtimeSocket = null;
+        old.close();
+      }
+      startRealtime();
+      if (!realtimeHealthy()) startPolling();
+    }
+  });
+
   // Xiaomi validity changes independently from transport status. Poll it
   // quietly so an expired cloud login is surfaced even when the user stays
-  // on the playback page and no device refresh is running.
+  // on the playback page and no device refresh is running. Hidden tabs skip
+  // the cloud round-trips: a background WebView firing a forced passToken
+  // verify plus an uncached device-list pull every 30s per tab is a rate
+  // limit / battery hazard, and re-entering the tab already refreshes.
   window.setInterval(async () => {
     if (document.hidden) return;
     if (!store.get().xiaomi.ever_logged_in && !store.get().xiaomi.logged_in) return;
     try {
-      const xiaomi = await api.getXiaomiStatus();
+      const xiaomi = await api.getXiaomiStatus(true);
       if (JSON.stringify(xiaomi) !== JSON.stringify(store.get().xiaomi)) {
         store.set({ xiaomi });
         maybeAutoRecovery(xiaomi);
         requestRender();
+      }
+      // The status endpoint only reports whether credentials are stored. A
+      // stale serviceToken can therefore look connected until a real Xiaomi
+      // request is made. Periodically refresh the device list so an expired
+      // passToken is detected and the recovery QR is opened automatically.
+      // A plain (cached) refresh keeps this cheap; only a state anomaly
+      // (expired session or an empty device list) bypasses the server cache.
+      if (xiaomi.logged_in && !store.get().qr.open) {
+        const degraded = xiaomi.status === "expired" || store.get().devices.length === 0;
+        await loadDevices(degraded);
       }
     } catch {
       // A status request failing is connectivity trouble, not proof of expiry.

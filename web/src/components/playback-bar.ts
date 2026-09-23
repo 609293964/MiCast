@@ -1,6 +1,7 @@
 import { api, type PlaybackState } from "../api";
 import { icon } from "../icons";
 import { store } from "../state";
+import { setVolume } from "../volume-service";
 
 // True while the user is holding any slider in the bar; playback pushes must
 // not re-render the bar (and reset a slider to the server value) mid-drag.
@@ -69,14 +70,15 @@ export function renderPlaybackBar(playback: PlaybackState | null): string {
 
   return `
     <button class="header-playback-trigger ${mobileMinimized ? "visible" : ""}" data-playback-restore
-            aria-label="打开播放控制" title="打开播放控制">
+            aria-label="打开播放控制：${escapeHtml(target)}" title="打开播放控制">
       ${icon(playback.playing ? "speaker" : "pause")}
+      <span class="header-playback-label"><strong>${escapeHtml(target)}</strong><small>${stateLabel}</small></span>
       <span class="header-playback-state ${playback.playing ? "is-playing" : "is-paused"}" aria-hidden="true"></span>
     </button>
     <section class="now-playing visible ${mobileMinimized ? "mobile-minimized" : ""} ${mobileRestoring ? "restoring" : ""} ${expanded && multi ? "expanded" : ""}" aria-label="播放控制">
       <div class="now-playing-main">
         <div class="now-playing-icon">${icon("speaker")}</div>
-        <div class="now-playing-copy">
+        <div class="now-playing-copy" title="${escapeHtml(target)}">
           <strong>${escapeHtml(target)}</strong>
           <span>${stateLabel}</span>
         </div>
@@ -139,7 +141,7 @@ export function bindPlaybackBar(container: HTMLElement) {
     const value = Number(slider.value);
     if (lastCommitted.get(key) === value) return;
     lastCommitted.set(key, value);
-    api.setVolume(value, dids).catch((e) => {
+    setVolume(value, dids).catch((e) => {
       const rollback = Number(slider.defaultValue || 0);
       lastCommitted.set(key, rollback);
       slider.value = String(rollback);

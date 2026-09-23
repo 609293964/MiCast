@@ -1,6 +1,7 @@
 import type { Device, PlaybackState, SpeakerEq } from "../api";
 import { api } from "../api";
 import { store } from "../state";
+import { setVolume } from "../volume-service";
 import { brandIcon, icon } from "../icons";
 import { openTuning } from "./tuning-view";
 
@@ -192,9 +193,20 @@ function renderDeviceDetails(device: Device, _playback: PlaybackState | null): s
         <span class="caption">设备 ID</span>
         <span class="cell-value footnote">${escapeHtml(device.did)}</span>
       </div>
+      ${renderCodecCapabilities(device)}
       ${renderEqSection(device)}
     </div>
   `;
+}
+
+function renderCodecCapabilities(device: Device): string {
+  const capabilities = device.codec_capabilities ?? {};
+  const entries = Object.entries(capabilities);
+  if (!entries.length) {
+    return `<div class="device-detail-row"><span class="caption">格式兼容性</span><span class="cell-value">播放后自动学习</span></div>`;
+  }
+  const labels = entries.map(([format, supported]) => `${escapeHtml(format)} ${supported ? "✓" : "✕"}`).join(" · ");
+  return `<div class="device-detail-row"><span class="caption">格式兼容性</span><span class="cell-value">${labels}</span></div>`;
 }
 
 function renderEqSection(device: Device): string {
@@ -318,7 +330,7 @@ export function bindDevicesView(
     // Commit on release only — keeps the thumb glued to the finger.
     input.addEventListener("change", async () => {
       try {
-        await api.setVolume(Number(input.value), [input.dataset.deviceVolume!]);
+        await setVolume(Number(input.value), [input.dataset.deviceVolume!]);
         store.showToast("音箱音量已调整");
       } catch (e) {
         store.showToast(`音量设置失败: ${e instanceof Error ? e.message : "未知错误"}`);
@@ -348,7 +360,7 @@ export function bindDevicesView(
     master.addEventListener("change", async () => {
       const value = Number(master.value);
       try {
-        await api.setVolume(value, dids);
+        await setVolume(value, dids);
         // All targets now share one volume: light the control up in place.
         const control = container.querySelector<HTMLElement>("[data-master-control]");
         control?.classList.remove("mixed");

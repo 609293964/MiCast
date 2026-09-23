@@ -65,6 +65,9 @@ export function renderAppShell(
           )
           .join("")}
       </nav>
+      <button class="icon-button fnos-theme-toggle" id="fnos-theme-toggle" aria-label="切换主题" title="${themeLabel(theme)}">
+        ${themeIcon(theme)}
+      </button>
     </div>
   `;
 }
@@ -85,17 +88,16 @@ export function bindThemeToggle(
   container: HTMLElement,
   onToggle: () => void
 ) {
-  const btn = container.querySelector("#theme-toggle");
-  btn?.addEventListener("click", onToggle);
+  container.querySelectorAll("#theme-toggle, #fnos-theme-toggle").forEach((btn) => btn.addEventListener("click", onToggle));
 }
 
 export function updateThemeToggle(container: ParentNode, theme: Theme) {
-  const btn = container.querySelector<HTMLButtonElement>("#theme-toggle");
-  if (!btn) return;
   const label = themeLabel(theme);
-  btn.innerHTML = themeIcon(theme);
-  btn.setAttribute("aria-label", `切换主题，当前：${label}`);
-  btn.title = label;
+  container.querySelectorAll<HTMLButtonElement>("#theme-toggle, #fnos-theme-toggle").forEach((btn) => {
+    btn.innerHTML = themeIcon(theme);
+    btn.setAttribute("aria-label", `切换主题，当前：${label}`);
+    btn.title = label;
+  });
 }
 
 export function applyTheme(theme: Theme) {

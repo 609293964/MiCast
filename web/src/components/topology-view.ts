@@ -111,14 +111,27 @@ export function bindTopologyView(container: HTMLElement): () => void {
           (Boolean(candidate.data.active) || Boolean(candidate.data.stalled))
       );
     }
+    // An unused local pipeline is not part of the live route. Without this
+    // check, engine→transcoder remains visible after its stream consumer is
+    // filtered out, leaving a misleading dangling branch.
+    if (edge.data.to.startsWith("pipe:")) {
+      return edges.some(
+        (candidate) =>
+          candidate.data.from === edge.data.to &&
+          candidate.data.to.startsWith("stream:") &&
+          candidate.data.active &&
+          edges.some(
+            (consumer) =>
+              consumer.data.from === candidate.data.to &&
+              (Boolean(consumer.data.active) || Boolean(consumer.data.stalled))
+          )
+      );
+    }
     return true;
   }
 
   function isNodeVisible(node: SimNode): boolean {
     if (showAll) return true;
-    // Speakers and the cloud stay as the dimmed backdrop; source/engine/
-    // pipeline/stream nodes only appear while part of a live flow.
-    if (node.data.kind === "speaker" || node.data.kind === "cloud") return true;
     return edges.some(
       (e) => isEdgeVisible(e) && (e.data.from === node.data.id || e.data.to === node.data.id)
     );
@@ -229,6 +242,7 @@ export function bindTopologyView(container: HTMLElement): () => void {
    * with siblings spread vertically. */
   function anchorFor(node: SimNode, visible: SimNode[]): [number, number] {
     const kind = node.data.kind;
+    const compact = (canvas.clientWidth || 1) < 640;
     const chainVisible = visible.some((n) =>
       ["source", "engine", "pipeline", "stream"].includes(n.data.kind)
     );
@@ -259,9 +273,9 @@ export function bindTopologyView(container: HTMLElement): () => void {
     }
     const lanes: Record<string, number> = {
       source: 0.12,
-      engine: 0.3,
-      pipeline: 0.44,
-      stream: 0.62,
+      engine: compact ? 0.25 : 0.3,
+      pipeline: compact ? 0.5 : 0.44,
+      stream: compact ? 0.72 : 0.62,
       speaker: 0.85,
     };
     const mates = visible.filter((n) => n.data.kind === kind).sort(byId);

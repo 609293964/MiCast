@@ -1,6 +1,7 @@
 import { api, type DebugState } from "../api";
 import { icon } from "../icons";
 import { store } from "../state";
+import { setVolume } from "../volume-service";
 import type { State } from "../state";
 import { EQ_PRESET_LABELS } from "./devices-view";
 import { getTestMedia, setTestMedia } from "../test-media";
@@ -155,7 +156,7 @@ export function renderDebugPanel(state: State, debug: DebugState | null): string
   return `
     <div class="page-heading">
       <h2 class="page-title">诊断</h2>
-      <p>查看连接与传输状态。测试工具会临时接管所选测试音箱，不属于日常播放控制。</p>
+      <p>先查看当前连接状态；遇到无声、不同步或格式不兼容时，再运行播放诊断。</p>
     </div>
 
     <div class="group-header">连接检查</div>
@@ -192,11 +193,11 @@ export function renderDebugPanel(state: State, debug: DebugState | null): string
       </div>
     </details>
 
-    <div class="group-header">播放测试</div>
+    <div class="group-header">播放诊断</div>
     <div class="group diagnostic-workbench">
-      <div class="debug-warning"><strong>测试期间会暂时切换播放内容</strong><span>停止测试后，MiCast 会尝试恢复此前正在播放的内容。</span></div>
+      <div class="debug-warning"><strong>诊断会播放一段测试音频</strong><span>用来确认目标音箱能否出声，以及多台音箱是否同步；结束后会尝试恢复原播放。</span></div>
       <label class="debug-target-row">
-        <span><strong>播放到</strong><small>可检查一台音箱，也可检查整个组合</small></span>
+        <span><strong>1. 选择诊断目标</strong><small>可以检查一台音箱或整个组合</small></span>
         <select class="input" data-debug-target aria-label="测试目标" ${debug?.devices.length ? "" : "disabled"}>
           ${debug === null ? `<option>正在加载音箱…</option>` : [
             ...debug.devices.map((device) => `<option value="speaker:${escapeHtml(device.did)}" ${(debugTargetKey || `speaker:${debug.selected_device_id}`) === `speaker:${device.did}` ? "selected" : ""}>${escapeHtml(device.name)}</option>`),
@@ -204,6 +205,7 @@ export function renderDebugPanel(state: State, debug: DebugState | null): string
           ].join("")}
         </select>
       </label>
+      <div class="diagnostic-step-label"><strong>2. 选择测试声音</strong><span>内置节拍适合快速检查，也可以使用熟悉的音频</span></div>
       <div class="test-source-tabs" role="radiogroup" aria-label="测试音频来源">
         ${([['builtin', '内置节拍'], ['upload', '上传音频'], ['url', '音频地址']] as const).map(([value, label]) => `<label><input type="radio" name="debug-source" value="${value}" ${debugTestSource === value ? "checked" : ""}><span>${label}</span></label>`).join("")}
       </div>
@@ -215,14 +217,16 @@ export function renderDebugPanel(state: State, debug: DebugState | null): string
         ${debugTestSource === "url" ? `<label class="test-url-field"><span>音频地址</span><input type="url" data-debug-url placeholder="输入可直接访问的音频地址" class="input"></label>` : ""}
       </div>
       <div class="test-session-bar" aria-live="polite">
-        <div><strong>${activeTestSession ? "测试音频正在播放" : debugTestBusy ? "正在准备测试…" : "准备就绪"}</strong><span>${activeTestSession ? "可调整音箱音量，完成后停止并恢复" : "开始后会暂时接管所选目标"}</span></div>
-        <button class="button ${activeTestSession ? "secondary" : "primary"}" type="button" data-debug-test-action ${debugTestBusy || !selectedTestDeviceIds(state, debug).length ? "disabled" : ""}>${debugTestBusy === "start" ? "正在开始…" : debugTestBusy === "stop" ? "正在恢复…" : activeTestSession ? "停止并恢复" : "开始测试"}</button>
+        <div><strong>${activeTestSession ? "测试声音正在播放" : debugTestBusy ? "正在准备诊断…" : "3. 开始播放检查"}</strong><span>${activeTestSession ? "听音箱是否出声、是否同步，完成后停止" : "开始后会暂时接管所选目标"}</span></div>
+        <button class="button ${activeTestSession ? "secondary" : "primary"}" type="button" data-debug-test-action ${debugTestBusy || !selectedTestDeviceIds(state, debug).length ? "disabled" : ""}>${debugTestBusy === "start" ? "正在播放…" : debugTestBusy === "stop" ? "正在恢复…" : activeTestSession ? "结束诊断并恢复" : debugTestSource === "builtin" ? "播放测试节拍" : "播放测试音频"}</button>
       </div>
+      <div class="diagnostic-step-label diagnostic-tools-label"><strong>单项检查</strong><span>仅在对应问题出现时使用</span></div>
       <div class="diagnostic-utilities">
-        <button class="diagnostic-test" id="btn-debug-tts" ${selectedTestDeviceIds(state, debug).length !== 1 ? "disabled" : ""}><strong>米家语音检查</strong><span>让单台音箱朗读“调试测试”，检查账号和指令响应</span></button>
-        <button class="diagnostic-test" id="btn-debug-play-stream" ${selectedStream ? "" : "disabled"}><strong>接回当前 AirPlay</strong><span>${selectedStream
+        <button class="diagnostic-test" id="btn-debug-codecs" ${selectedTestDeviceIds(state, debug).length ? "" : "disabled"}><strong>测试音频格式</strong><span>依次播放 MP3、FLAC 和 WAV，找出可用格式</span><em>开始检查</em></button>
+        <button class="diagnostic-test" id="btn-debug-tts" ${selectedTestDeviceIds(state, debug).length !== 1 ? "disabled" : ""}><strong>测试米家语音</strong><span>让单台音箱朗读测试语句，检查账号与指令响应</span><em>开始检查</em></button>
+        <button class="diagnostic-test" id="btn-debug-play-stream" ${selectedStream ? "" : "disabled"}><strong>重新接入当前 AirPlay</strong><span>${selectedStream
           ? selectedSessionActive ? `重新播放“${escapeHtml(selectedStream.name)}”当前收到的内容` : `“${escapeHtml(selectedStream.name)}”当前没有收到音频`
-          : "所选音箱没有对应的独立播放入口"}</span></button>
+          : "所选音箱没有对应的独立播放入口"}</span><em>尝试接入</em></button>
       </div>
       <label class="debug-volume volume-control test-volume-row">
         <span><strong>音箱音量</strong><small>修改目标音箱的真实音量</small></span>
@@ -243,7 +247,7 @@ export function renderDebugPanel(state: State, debug: DebugState | null): string
         </select>
         <button class="button plain log-action" type="button" data-log-pause>暂停</button>
         <button class="button plain log-action" type="button" data-log-copy>复制</button>
-        <button class="button plain log-action" type="button" data-log-report title="下载脱敏后的诊断报告（设置、状态与近期日志），反馈问题时请附上">下载报告</button>
+        <button class="button plain log-action log-report-action" type="button" data-log-report title="下载脱敏后的设置、状态与近期日志，反馈问题时请附上">导出报告</button>
       </div>
       <div class="runtime-log" role="log" aria-label="最新连接日志" data-runtime-log data-filter="micast">
         ${renderRuntimeLogRows(debug, "micast")}
@@ -446,6 +450,24 @@ export function bindDebugPanel(container: HTMLElement, showToast: (msg: string) 
       rerenderTestPanel();
     }
   });
+  container.querySelector("#btn-debug-codecs")?.addEventListener("click", async () => {
+    const devices = selectedTestDeviceIds(store.get(), store.get().debug);
+    if (!devices.length || debugTestBusy) return;
+    debugTestBusy = "start";
+    rerenderTestPanel();
+    showToast("正在逐项检测格式，当前音频会在完成后自动恢复");
+    try {
+      const result = await api.runCodecTest(devices);
+      const common = result.common_formats.length ? result.common_formats.join("、") : "暂无已确认共同格式";
+      showToast(result.restore_failed.length ? `检测完成：${common}；部分音箱恢复失败` : `检测完成：${common}`);
+      await api.getDevices(true).then((items) => store.set({ devices: items }));
+    } catch (e) {
+      showToast(`格式检测失败: ${e instanceof Error ? e.message : "未知错误"}`);
+    } finally {
+      debugTestBusy = "";
+      rerenderTestPanel();
+    }
+  });
   filter?.addEventListener("change", () => {
     if (!log) return;
     log.dataset.filter = filter.value;
@@ -516,7 +538,7 @@ export function bindDebugPanel(container: HTMLElement, showToast: (msg: string) 
       try {
         const dids = selectedTestDeviceIds(store.get(), store.get().debug);
         if (!dids.length) return;
-        await api.setVolume(value, dids);
+        await setVolume(value, dids);
       }
       catch (e) { showToast(`音量设置失败: ${e instanceof Error ? e.message : "未知错误"}`); }
     }, 100);

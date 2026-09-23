@@ -88,7 +88,7 @@ export function renderSettingsView(props: SettingsProps): string {
       <div class="cell">
         <div class="cell-content">
           <span class="cell-title">转码</span>
-          <span class="cell-subtitle">${transcoding ? "按下方设置编码后输出" : "已关闭，PCM 原始音频直出"}</span>
+          <span class="cell-subtitle">${transcoding ? "按下方设置编码 AirPlay 实时输出" : "AirPlay 使用 PCM 原始音频直出"}</span>
         </div>
         <input type="checkbox" class="switch" id="auto-transcode" ${audio?.auto_transcode ? "checked" : ""} aria-label="开启转码">
       </div>
@@ -229,6 +229,7 @@ export function renderSettingsView(props: SettingsProps): string {
       </div>
     </div>
     ${dlnaEnabled && dlnaStatus?.status === "error" ? `<div class="inline-notice error"><strong>DLNA 暂不可用</strong><span>请检查 MiCast 的网络访问权限后重试。</span></div>` : ""}
+    ${dlnaEnabled && dlnaStatus?.status !== "error" ? `<div class="inline-notice"><strong>DLNA 生效方式</strong><span>开关立即生效；投放音量控制会在下次投放媒体时生效。若正在播放，请先在播放器中停止，再重新选择音箱并投放。</span></div>` : ""}
 
     <div class="group-header">播放增强</div>
     <div class="group">
@@ -251,8 +252,15 @@ export function renderSettingsView(props: SettingsProps): string {
       </div>
       <div class="cell">
         <div class="cell-content">
+          <span class="cell-title">暂停会话过期</span>
+          <span class="cell-subtitle">AirPlay 暂停超过该时长后自动结束会话并停止音箱播放；0 表示不自动结束（秒）</span>
+        </div>
+        <input type="number" class="input settings-number" id="stale-session-timeout" min="0" max="3600" step="10" value="${config?.stale_session_timeout ?? 60}" aria-label="暂停会话过期时间（秒）">
+      </div>
+      <div class="cell">
+        <div class="cell-content">
           <span class="cell-title">投放音量控制</span>
-            <span class="cell-subtitle">独立音量保留音箱设置；音量联动直接控制音箱</span>
+            <span class="cell-subtitle">独立音量保留音箱设置；音量联动直接控制音箱。AirPlay 下次连接生效，DLNA 下次投放生效</span>
         </div>
         <select class="input" id="sender-volume-mode" aria-label="投放音量控制" style="max-width: 10rem">
           <option value="independent" ${config?.sender_volume_mode !== "linked" ? "selected" : ""}>独立音量</option>
@@ -309,7 +317,7 @@ export function renderSettingsView(props: SettingsProps): string {
       </div>
     </div>
 
-    <p class="footnote" style="margin: var(--space-md) var(--space-lg);">修改会自动保存，并在当前音频输出中重新应用。</p>
+    <p class="footnote" style="margin: var(--space-md) var(--space-lg);">音频编码、EQ、组合延迟和左右声道处理只作用于 AirPlay 实时输出，不处理 DLNA 直投媒体。</p>
   `;
 }
 
@@ -574,7 +582,9 @@ export function bindSettingsView(
       const result = await api.setSenderVolumeMode(select.value as "independent" | "linked");
       const config = store.get().fullConfig;
       if (config) store.set({ fullConfig: { ...config, ...result } });
-      store.showToast("已保存，下次 AirPlay 投放生效");
+      store.showToast(result.dlna_recast_required
+        ? "已保存；当前 DLNA 媒体仍使用原设置，请停止并重新投放"
+        : "已保存；AirPlay 下次连接、DLNA 下次投放时生效");
     } catch (e) {
       select.value = store.get().fullConfig?.sender_volume_mode ?? "independent";
       store.showToast(`保存失败: ${e instanceof Error ? e.message : "未知错误"}`);
@@ -591,6 +601,25 @@ export function bindSettingsView(
           const config = store.get().fullConfig;
           if (config) store.set({ fullConfig: { ...config, default_volume: volume } });
           store.showToast(`起播音量已设为 ${volume}`);
+        } catch (e) {
+          store.showToast(`保存失败: ${e instanceof Error ? e.message : "未知错误"}`);
+        }
+      }, 500);
+    });
+  }
+
+  const staleTimeoutInput = container.querySelector<HTMLInputElement>("#stale-session-timeout");
+  if (staleTimeoutInput) {
+    let debounce: ReturnType<typeof setTimeout> | null = null;
+    staleTimeoutInput.addEventListener("input", () => {
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(async () => {
+        const seconds = Math.max(0, Math.min(3600, parseInt(staleTimeoutInput.value || "0", 10) || 0));
+        try {
+          await api.setStaleSessionTimeout(seconds);
+          const config = store.get().fullConfig;
+          if (config) store.set({ fullConfig: { ...config, stale_session_timeout: seconds } });
+          store.showToast(seconds === 0 ? "已关闭暂停会话自动过期" : `暂停会话 ${seconds} 秒后自动结束`);
         } catch (e) {
           store.showToast(`保存失败: ${e instanceof Error ? e.message : "未知错误"}`);
         }
@@ -741,6 +770,12 @@ function bindResetAll(container: HTMLElement) {
 let updatePollTimer: ReturnType<typeof setInterval> | null = null;
 
 function bindUpdateSection(container: HTMLElement) {
+  // A settings section can be rebound after a shell render. Stop any polling
+  // owned by the previous DOM before attaching handlers to the new section.
+  if (updatePollTimer) {
+    clearInterval(updatePollTimer);
+    updatePollTimer = null;
+  }
   const statusEl = container.querySelector<HTMLElement>("[data-update-status]");
   const checkBtn = container.querySelector<HTMLButtonElement>("[data-update-check]");
   const downloadBtn = container.querySelector<HTMLButtonElement>("[data-update-download]");

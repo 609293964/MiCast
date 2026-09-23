@@ -269,7 +269,8 @@ export class CalibrationWizard {
       await api.calibrationApply(
         this.did,
         this.result.points.map((p) => [p.freq, p.gain]),
-        this.target
+        this.target,
+        store.get().devices.find((device) => device.did === this.did)?.eq?.revision
       );
       store.showToast("补偿曲线已应用");
     } catch (e) {

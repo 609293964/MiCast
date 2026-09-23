@@ -1,6 +1,7 @@
 import { api } from "./api";
 import { icon } from "./icons";
 import { store } from "./state";
+import { setMute, setVolume } from "./volume-service";
 
 // One delegated handler survives page rerenders without duplicate listeners.
 document.addEventListener("click", async (event) => {
@@ -26,7 +27,7 @@ document.addEventListener("click", async (event) => {
   if (!Number.isInteger(value) || (!relative && (value < 0 || value > 100))) return;
   button.disabled = true;
   try {
-    await api.setVolume(value, dids, relative);
+    await setVolume(value, dids, relative);
     store.showToast(relative ? "已同步增减音箱音量" : "音箱音量已统一");
   } catch (error) {
     store.showToast(error instanceof Error ? error.message : "音量调整失败");
@@ -48,7 +49,7 @@ async function toggleMute(button: HTMLButtonElement, dids: string[]) {
   button.innerHTML = icon(nextMuted ? "mute" : "speaker");
   button.disabled = true;
   try {
-    await api.setMute(nextMuted, dids);
+    await setMute(nextMuted, dids);
     const stateNow = store.get();
     const playbackDevices = (stateNow.playback?.devices ?? []).map((device) =>
       dids.includes(device.did) ? { ...device, muted: nextMuted } : device

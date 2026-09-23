@@ -7,6 +7,7 @@
  */
 
 import { api, type Device, type EqPresetsResponse, type SpeakerEq } from "../api";
+import { icon } from "../icons";
 import { appUrl, appWebSocketUrl } from "../paths";
 import { store } from "../state";
 import { CalibrationWizard } from "./calibration-wizard";
@@ -32,6 +33,8 @@ interface TuningState {
   points: CurvePoint[];
   preset: string;
   target: string;
+  revision: number;
+  undoAvailable: boolean;
 }
 
 let presetsCache: EqPresetsResponse | null = null;
@@ -40,6 +43,8 @@ let spectrumSocket: WebSocket | null = null;
 let spectrumTimer: number | null = null; // reconnect delay or poll interval
 let spectrumGen = 0; // guards stale callbacks after a rebind
 let commitTimer: number | null = null;
+let tuningSyncCleanup: (() => void) | null = null;
+let activeWizard: CalibrationWizard | null = null;
 
 /** Stop the spectrum feed: socket, pending reconnect, and poll fallback. */
 function closeSpectrumSocket() {
@@ -116,7 +121,22 @@ export function openTuning(did: string) {
 }
 
 export function closeTuning() {
+  disposeTuningView();
   store.setUi({ tuningDid: null });
+}
+
+export function disposeTuningView() {
+  activeWizard?.destroy();
+  activeWizard = null;
+  tuningSyncCleanup?.();
+  tuningSyncCleanup = null;
+  closeSpectrumSocket();
+  editor?.destroy();
+  editor = null;
+  if (commitTimer != null) {
+    window.clearTimeout(commitTimer);
+    commitTimer = null;
+  }
 }
 
 export function renderTuningView(device: Device | undefined): string {
@@ -128,7 +148,7 @@ export function renderTuningView(device: Device | undefined): string {
       <button type="button" class="icon-button" data-tuning-back aria-label="返回">${"<"}</button>
       <div>
         <h2 class="page-title">调音台 · ${escapeHtml(name)}</h2>
-        <p>拖动圆点调整，点击空白添加控制点；点按圆点选中后可删除（桌面端也可双击删除）。松手后生效。</p>
+        <p>拖动圆点调整，点击空白添加控制点；松手后应用到 AirPlay 实时输出。DLNA 媒体暂不经过 EQ。</p>
       </div>
     </div>
     <div class="tuning-canvas-wrap">
@@ -136,6 +156,7 @@ export function renderTuningView(device: Device | undefined): string {
       <button type="button" class="point-delete-chip" data-point-delete hidden>删除控制点</button>
     </div>
     <div class="tuning-toolbar">
+      <button type="button" class="icon-button compact" data-tuning-undo ${eq?.undo_available ? "" : "disabled"} aria-label="撤销上一次调整" title="撤销上一次调整">${icon("undo")}</button>
       <label class="tuning-target">
         <span class="caption">曲线</span>
         <select data-tuning-curve aria-label="曲线库"></select>
@@ -209,6 +230,8 @@ export function renderTuningView(device: Device | undefined): string {
 }
 
 export function bindTuningView(container: HTMLElement, onClose: () => void) {
+  tuningSyncCleanup?.();
+  tuningSyncCleanup = null;
   editor?.destroy();
   editor = null;
   closeSpectrumSocket();
@@ -223,6 +246,8 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
     points: (eq?.points ?? []).map(([freq, gain]) => ({ freq, gain })),
     preset: eq?.preset ?? "",
     target: eq?.target ?? "",
+    revision: eq?.revision ?? 0,
+    undoAvailable: Boolean(eq?.undo_available),
   };
 
   let wizard: CalibrationWizard | null = null;
@@ -241,9 +266,12 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
   } | null = null;
 
   container.querySelector<HTMLElement>("[data-tuning-back]")?.addEventListener("click", () => {
-    wizard?.destroy();
+    activeWizard?.destroy();
+    activeWizard = null;
     wizard = null;
     closeSpectrumSocket();
+    tuningSyncCleanup?.();
+    tuningSyncCleanup = null;
     editor?.setSpectrum(null);
     onClose();
   });
@@ -256,6 +284,7 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
   const curveSaveBtn = container.querySelector<HTMLButtonElement>("[data-tuning-curve-save]");
   const curveRenameBtn = container.querySelector<HTMLButtonElement>("[data-tuning-curve-rename]");
   const curveDeleteBtn = container.querySelector<HTMLButtonElement>("[data-tuning-curve-delete]");
+  const undoBtn = container.querySelector<HTMLButtonElement>("[data-tuning-undo]");
 
   // ---- curve library (global): presets + user-saved curves ----
 
@@ -377,6 +406,9 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
     if (dev) dev.eq = resp;
     if (nightToggle) nightToggle.checked = Boolean(resp.night_mode);
     if (loudnessToggle) loudnessToggle.checked = Boolean(resp.loudness_comp_enabled);
+    state.revision = resp.revision ?? state.revision;
+    state.undoAvailable = Boolean(resp.undo_available);
+    if (undoBtn) undoBtn.disabled = !state.undoAvailable;
   };
 
   const syncFull = (resp: SpeakerEq) => {
@@ -391,39 +423,93 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
     refreshTargetSelect();
   };
 
+  let remoteSyncBusy = false;
+  let localWrites = 0;
+  const localWrite = <T>(work: () => Promise<T>): Promise<T> => {
+    localWrites += 1;
+    return work().finally(() => { localWrites -= 1; });
+  };
+  const refreshRemote = async (force = false) => {
+    if (remoteSyncBusy || ((commitTimer != null || localWrites > 0) && !force)) return;
+    remoteSyncBusy = true;
+    try {
+      const latest = await api.getDeviceTuning(state.did);
+      const revision = latest.revision ?? 0;
+      const changed = revision > state.revision;
+      if (force || changed) {
+        syncFull(latest);
+        if (changed) store.showToast("调音已在另一端更新，已载入最新设置");
+      }
+    } catch {
+      // Realtime sync is best-effort; ordinary saves still surface failures.
+    } finally {
+      remoteSyncBusy = false;
+    }
+  };
+
+  const onTuningChange = (event: Event) => {
+    const revisions = (event as CustomEvent<Record<string, number>>).detail ?? {};
+    if ((revisions[state.did] ?? 0) > state.revision) void refreshRemote();
+  };
+  window.addEventListener("micast:tuning-change", onTuningChange);
+  const tuningPoll = window.setInterval(() => {
+    if (!document.hidden) void refreshRemote();
+  }, 2500);
+  tuningSyncCleanup = () => {
+    window.removeEventListener("micast:tuning-change", onTuningChange);
+    window.clearInterval(tuningPoll);
+  };
+
   const postCurve = () =>
-    api
-      .setDeviceEqCurve(state.did, {
+    localWrite(() => api.setDeviceEqCurve(state.did, {
         enabled: state.enabled,
         points: state.points.map((p) => [p.freq, p.gain]),
         preset: state.preset,
         target: state.target,
-      })
-      .then(syncLocal);
+        revision: state.revision,
+      })).then(syncLocal);
+
+  let curveRevision = 0;
 
   const save = (patch: Partial<TuningState> = {}) => {
     Object.assign(state, patch);
+    const revision = ++curveRevision;
     // Debounce: rapid commits (drag releases, preset taps) collapse into one
     // pipeline rebuild; each rebuild costs a sub-second encoder gap.
     if (commitTimer != null) window.clearTimeout(commitTimer);
     commitTimer = window.setTimeout(() => {
       commitTimer = null;
-      postCurve().catch((e) => {
-        store.showToast(`EQ 保存失败: ${e instanceof Error ? e.message : "未知错误"}`);
-      });
+      postCurve()
+        .then(() => {
+          if (revision === curveRevision) store.showToast("EQ 已应用");
+        })
+        .catch((e) => {
+          if (revision === curveRevision) {
+            store.showToast(`EQ 保存失败: ${e instanceof Error ? e.message : "未知错误"}`);
+            void refreshRemote(true);
+          }
+        });
     }, 300);
   };
 
   // Immediate commit (A/B switching) — flush any pending debounce first.
   // Awaitable so the blind test can sequence "apply curve → resume playback".
   const commitNow = () => {
+    const revision = ++curveRevision;
     if (commitTimer != null) {
       window.clearTimeout(commitTimer);
       commitTimer = null;
     }
-    return postCurve().catch((e) => {
-      store.showToast(`EQ 保存失败: ${e instanceof Error ? e.message : "未知错误"}`);
-    });
+    return postCurve()
+      .then(() => {
+        if (revision === curveRevision) store.showToast("EQ 已应用");
+      })
+      .catch((e) => {
+        if (revision === curveRevision) {
+          store.showToast(`EQ 保存失败: ${e instanceof Error ? e.message : "未知错误"}`);
+          void refreshRemote(true);
+        }
+      });
   };
 
   // ---- canvas ----
@@ -498,29 +584,55 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
   });
 
   nightToggle?.addEventListener("change", () => {
-    api
-      .setDeviceNightMode(state.did, nightToggle.checked)
+    localWrite(() => api.setDeviceNightMode(state.did, nightToggle.checked, state.revision))
       .then(syncLocal)
       .catch((e) => {
         nightToggle.checked = !nightToggle.checked;
         store.showToast(`夜间模式切换失败: ${e instanceof Error ? e.message : "未知错误"}`);
+        void refreshRemote(true);
       });
   });
 
   loudnessToggle?.addEventListener("change", () => {
-    api
-      .setDeviceLoudness(state.did, loudnessToggle.checked)
+    localWrite(() => api.setDeviceLoudness(state.did, loudnessToggle.checked, state.revision))
       .then(syncLocal)
       .catch((e) => {
         loudnessToggle.checked = !loudnessToggle.checked;
         store.showToast(`响度补偿切换失败: ${e instanceof Error ? e.message : "未知错误"}`);
+        void refreshRemote(true);
       });
   });
 
-  targetSelect?.addEventListener("change", () => {
+  undoBtn?.addEventListener("click", async () => {
+    if (undoBtn.disabled) return;
+    undoBtn.disabled = true;
+    try {
+      const resp = await localWrite(() => api.undoDeviceTuning(state.did, state.revision));
+      syncFull(resp);
+      store.showToast("已撤销上一次调音调整");
+    } catch (e) {
+      store.showToast(`撤销失败: ${e instanceof Error ? e.message : "未知错误"}`);
+      await refreshRemote(true);
+    }
+  });
+
+  targetSelect?.addEventListener("change", async () => {
+    const previous = state.target;
     state.target = targetSelect.value;
     applyTarget(state.target);
-    save();
+    targetSelect.disabled = true;
+    try {
+      const resp = await localWrite(() => api.setDeviceEqTarget(state.did, state.target, state.revision));
+      syncLocal(resp);
+    } catch (e) {
+      state.target = previous;
+      targetSelect.value = previous;
+      applyTarget(previous);
+      store.showToast(`参考曲线保存失败: ${e instanceof Error ? e.message : "未知错误"}`);
+      void refreshRemote(true);
+    } finally {
+      targetSelect.disabled = false;
+    }
   });
 
   curveSelect?.addEventListener("change", () => {
@@ -582,7 +694,8 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
     importFile.value = "";
     if (!file) return;
     try {
-      const resp = await api.importGraphicEq(state.did, await file.text());
+      const text = await file.text();
+      const resp = await localWrite(() => api.importGraphicEq(state.did, text, state.revision));
       syncFull(resp);
       store.showToast("已导入 AutoEq 曲线");
     } catch (e) {
@@ -793,6 +906,7 @@ export function bindTuningView(container: HTMLElement, onClose: () => void) {
     wizard = new CalibrationWizard(wizardHost, did, () => {
       void refreshFromDevice();
     });
+    activeWizard = wizard;
   });
 }
 

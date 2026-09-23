@@ -2,6 +2,7 @@
  * Tiny reactive store with UI persistence.
  */
 
+import { safeUserMessage } from "./errors";
 import type { AccessStatus, AirPlay2State, AudioConfig, Device, FullConfig, PlaybackState, ReceiverInfo, XiaomiStatus } from "./api";
 import type { DebugState } from "./components/debug-panel";
 
@@ -120,6 +121,7 @@ const initialState: State = {
 class Store {
   private state: State = { ...initialState };
   private subscribers: Subscriber[] = [];
+  private toastTimer: number | null = null;
 
   get(): State {
     return this.state;
@@ -132,6 +134,7 @@ class Store {
   }
 
   setUi(partial: Partial<State["ui"]>) {
+    const prev = this.state;
     const next = { ...this.state.ui, ...partial };
     this.state = { ...this.state, ui: next };
     try {
@@ -139,7 +142,7 @@ class Store {
     } catch {
       // ignore
     }
-    this.subscribers.forEach((fn) => fn(this.state, this.state));
+    this.subscribers.forEach((fn) => fn(this.state, prev));
   }
 
   subscribe(fn: Subscriber) {
@@ -151,9 +154,12 @@ class Store {
   }
 
   showToast(message: string, duration = 2500) {
+    message = safeUserMessage(message);
+    if (this.toastTimer != null) window.clearTimeout(this.toastTimer);
     this.set({ toast: { message, visible: true } });
     window.dispatchEvent(new CustomEvent("micast:toast", { detail: { message, visible: true } }));
-    setTimeout(() => {
+    this.toastTimer = window.setTimeout(() => {
+      this.toastTimer = null;
       this.set({ toast: { message: "", visible: false } });
       window.dispatchEvent(
         new CustomEvent("micast:toast", { detail: { message: "", visible: false } })

@@ -2,17 +2,24 @@
  * Minimal typed API client for MiCast.
  */
 
-import { store } from "./state";
 import { appUrl } from "./paths";
+import { safeUserMessage } from "./errors";
 
 async function apiFetch(path: string, init?: RequestInit) {
   const res = await fetch(appUrl(path), init);
   if (!res.ok) {
-    const text = await res.text().catch(() => "Unknown error");
+    const text = await res.text().catch(() => "");
     if (res.status === 401 && text.includes("需要登录 MiCast")) {
       window.dispatchEvent(new Event("micast:access-required"));
     }
-    throw new Error(`HTTP ${res.status}: ${text}`);
+    let detail = "";
+    try {
+      const payload = JSON.parse(text) as { detail?: unknown };
+      if (typeof payload.detail === "string") detail = payload.detail;
+    } catch {
+      detail = text;
+    }
+    throw new Error(safeUserMessage(detail));
   }
   return res.json();
 }
@@ -53,6 +60,7 @@ export interface FullConfig {
   touchscreen_lyrics: boolean;
   default_volume: number;
   default_volume_enabled: boolean;
+  stale_session_timeout: number;
   sender_volume_mode: "independent" | "linked";
   notify_webhook_url: string;
   airplay2_enabled: boolean;
@@ -159,6 +167,15 @@ export interface SpeakerGroup {
   network_channels?: Record<string, "left" | "right">;
 }
 
+export interface CodecCompatibility {
+  members: Record<string, Record<string, boolean>>;
+  possible_common_formats: string[];
+  confirmed_common_formats: string[];
+  recommended_format: string | null;
+  status: "confirmed" | "needs_check" | "incompatible";
+  unknown_members: string[];
+}
+
 export type NetworkDeviceKind = "speaker" | "tv" | "projector";
 
 export interface NetworkDevice {
@@ -217,6 +234,8 @@ export interface SpeakerEq {
   content_profile?: string;
   /** Saved per-speaker scene curves keyed by profile name. */
   profiles?: Record<string, [number, number][]>;
+  revision?: number;
+  undo_available?: boolean;
 }
 
 export interface EqPresetsResponse {
@@ -235,6 +254,8 @@ export interface Device {
   model: string;
   presence?: string;
   play_error?: string | null;
+  codec_capabilities?: Record<string, boolean>;
+  codec_capability_details?: Record<string, { status: "supported" | "unsupported"; verified_at: number }>;
   playing?: boolean;
   muted?: boolean;
   enabled: boolean;
@@ -458,7 +479,17 @@ export const api = {
     });
   },
 
-  setSenderVolumeMode(mode: "independent" | "linked"): Promise<{ sender_volume_mode: "independent" | "linked" }> {
+  setStaleSessionTimeout(seconds: number): Promise<{ stale_session_timeout: number }> {
+    return apiFetch("/api/config/stale-session-timeout", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seconds }),
+    });
+  },
+
+  setSenderVolumeMode(mode: "independent" | "linked"): Promise<{
+    sender_volume_mode: "independent" | "linked";
+    dlna_recast_required: boolean;
+  }> {
     return apiFetch("/api/config/sender-volume", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode }),
     });
@@ -505,8 +536,8 @@ export const api = {
     return apiFetch(`/api/airplay2/instances/${encodeURIComponent(id)}`, { method: "DELETE" });
   },
 
-  getXiaomiStatus(): Promise<XiaomiStatus> {
-    return apiFetch("/api/xiaomi/status");
+  getXiaomiStatus(verify = false): Promise<XiaomiStatus> {
+    return apiFetch(`/api/xiaomi/status${verify ? "?verify=true" : ""}`);
   },
 
   logoutXiaomi(): Promise<{ ok: boolean }> {
@@ -553,28 +584,48 @@ export const api = {
     return apiFetch("/api/devices/eq/presets");
   },
 
+  getDeviceTuning(did: string): Promise<{ did: string } & SpeakerEq> {
+    return apiFetch(`/api/tuning/${encodeURIComponent(did)}`);
+  },
+
   /** Save a speaker's EQ curve (control points). Committed on release, not mid-drag. */
   setDeviceEqCurve(did: string, eq: SpeakerEq): Promise<{ did: string } & SpeakerEq> {
     return apiFetch("/api/tuning/eq", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ did, ...eq }),
+      body: JSON.stringify({ did, ...eq, expected_revision: eq.revision }),
     });
   },
 
-  setDeviceNightMode(did: string, enabled: boolean): Promise<{ did: string } & SpeakerEq> {
+  setDeviceEqTarget(did: string, target: string, expectedRevision?: number): Promise<{ did: string } & SpeakerEq> {
+    return apiFetch("/api/tuning/target", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ did, target, expected_revision: expectedRevision }),
+    });
+  },
+
+  setDeviceNightMode(did: string, enabled: boolean, expectedRevision?: number): Promise<{ did: string } & SpeakerEq> {
     return apiFetch("/api/tuning/night-mode", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ did, enabled }),
+      body: JSON.stringify({ did, enabled, expected_revision: expectedRevision }),
     });
   },
 
-  setDeviceLoudness(did: string, enabled: boolean): Promise<{ did: string } & SpeakerEq> {
+  setDeviceLoudness(did: string, enabled: boolean, expectedRevision?: number): Promise<{ did: string } & SpeakerEq> {
     return apiFetch("/api/tuning/loudness", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ did, enabled }),
+      body: JSON.stringify({ did, enabled, expected_revision: expectedRevision }),
+    });
+  },
+
+  undoDeviceTuning(did: string, expectedRevision?: number): Promise<{ did: string } & SpeakerEq> {
+    return apiFetch("/api/tuning/undo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ did, expected_revision: expectedRevision }),
     });
   },
 
@@ -611,11 +662,11 @@ export const api = {
     });
   },
 
-  switchDeviceProfile(did: string, profile: string): Promise<{ did: string } & SpeakerEq> {
+  switchDeviceProfile(did: string, profile: string, expectedRevision?: number): Promise<{ did: string } & SpeakerEq> {
     return apiFetch("/api/tuning/profile/switch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ did, profile }),
+      body: JSON.stringify({ did, profile, expected_revision: expectedRevision }),
     });
   },
 
@@ -635,11 +686,11 @@ export const api = {
     return apiFetch(`/api/tuning/${encodeURIComponent(did)}/spectrum`);
   },
 
-  importGraphicEq(did: string, text: string): Promise<{ did: string } & SpeakerEq> {
+  importGraphicEq(did: string, text: string, expectedRevision?: number): Promise<{ did: string } & SpeakerEq> {
     return apiFetch(`/api/tuning/${encodeURIComponent(did)}/import`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, expected_revision: expectedRevision }),
     });
   },
 
@@ -680,12 +731,13 @@ export const api = {
   calibrationApply(
     did: string,
     points: [number, number][],
-    target: string
+    target: string,
+    expectedRevision?: number
   ): Promise<{ did: string } & SpeakerEq> {
     return apiFetch("/api/tuning/calibration/apply", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ did, points, target }),
+      body: JSON.stringify({ did, points, target, expected_revision: expectedRevision }),
     });
   },
 
@@ -754,7 +806,7 @@ export const api = {
     speakerIds: string[],
     airplayTargets: string[] = [],
     dlnaTargets: string[] = []
-  ): Promise<SpeakerGroup> {
+  ): Promise<SpeakerGroup & { codec_compatibility?: CodecCompatibility }> {
     return apiFetch("/api/receivers/groups", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -763,6 +815,13 @@ export const api = {
         airplay_targets: airplayTargets,
         dlna_targets: dlnaTargets,
       }),
+    });
+  },
+
+  getGroupCompatibility(speakerIds: string[]): Promise<CodecCompatibility> {
+    return apiFetch("/api/receivers/groups/compatibility", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ speaker_ids: speakerIds }),
     });
   },
 
@@ -822,44 +881,20 @@ export const api = {
     return apiFetch(`/api/playback/state${refresh ? "?refresh=true" : ""}`);
   },
 
-  async setVolume(volume: number, deviceIds?: string[], relative = false): Promise<void> {
-    const result: { devices: Array<{ did: string; ok: boolean; volume?: number; error?: string }> } = await apiFetch("/api/playback/volume", {
+  setVolume(volume: number, deviceIds?: string[], relative = false): Promise<{ devices: Array<{ did: string; ok: boolean; volume?: number; error?: string }> }> {
+    return apiFetch("/api/playback/volume", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ [relative ? "delta" : "volume"]: volume, device_ids: deviceIds }),
     });
-    const confirmed = new Map(result.devices.filter(d => d.ok && d.volume !== undefined).map(d => [d.did, d.volume!]));
-    const state = store.get();
-    const playback = state.playback;
-    const devices = playback?.devices.map(d => confirmed.has(d.did) ? { ...d, volume: confirmed.get(d.did)! } : d);
-    const known = devices?.map(d => d.volume).filter((v): v is number => v != null) ?? [];
-    store.set({
-      devices: state.devices.map(d => confirmed.has(d.did) ? { ...d, volume: confirmed.get(d.did)! } : d),
-      ...(playback && devices ? { playback: { ...playback, devices, volume: known.length ? Math.round(known.reduce((a, b) => a + b, 0) / known.length) : null, mixed_volume: new Set(known).size > 1 } } : {}),
-    });
-    document.dispatchEvent(new CustomEvent("micast:render-devices"));
-    const failed = result.devices.filter(d => !d.ok);
-    if (failed.length) throw new Error(`${failed.length} 台音箱未能调整${confirmed.size ? "，其他音箱已更新" : ""}：${failed[0].error ?? "请检查连接"}`);
   },
 
-  async setMute(muted: boolean, deviceIds?: string[]): Promise<void> {
-    const result: { muted: boolean; devices: Array<{ did: string; ok: boolean; muted?: boolean; error?: string }> } = await apiFetch("/api/playback/mute", {
+  setMute(muted: boolean, deviceIds?: string[]): Promise<{ muted: boolean; devices: Array<{ did: string; ok: boolean; muted?: boolean; error?: string }> }> {
+    return apiFetch("/api/playback/mute", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ muted, device_ids: deviceIds }),
     });
-    const confirmed = new Map(result.devices.filter(d => d.ok).map(d => [d.did, d.muted!]));
-    const state = store.get();
-    const playback = state.playback;
-    const devices = playback?.devices.map(d => confirmed.has(d.did) ? { ...d, muted: confirmed.get(d.did)! } : d);
-    store.set({
-      devices: state.devices.map(d => confirmed.has(d.did) ? { ...d, muted: confirmed.get(d.did)! } : d),
-      ...(playback && devices ? { playback: { ...playback, devices, muted: !!devices.length && devices.every(d => d.muted) } } : {}),
-    });
-    document.dispatchEvent(new CustomEvent("micast:render-devices"));
-    document.dispatchEvent(new CustomEvent("micast:render-playback"));
-    const failed = result.devices.filter(d => !d.ok);
-    if (failed.length) throw new Error(`${failed.length} 台音箱未能${muted ? "静音" : "恢复音量"}：${failed[0].error ?? "请检查连接"}`);
   },
 
   async getDeviceVolume(did: string): Promise<number> {
@@ -931,6 +966,12 @@ export const api = {
   stopDebugTest(sessionId: string, restore = true): Promise<{ ok: boolean; restored: number }> {
     return apiFetch("/api/debug/test/stop", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId, restore }),
+    });
+  },
+
+  runCodecTest(deviceIds: string[]): Promise<{ ok: boolean; results: Record<string, Record<string, boolean>>; common_formats: string[]; restore_failed: string[] }> {
+    return apiFetch("/api/debug/codec-test", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device_ids: deviceIds }),
     });
   },
 

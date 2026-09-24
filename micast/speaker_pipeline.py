@@ -36,6 +36,14 @@ SOURCE_STALL_CHECK_SECONDS = 2.0
 # timestamps are NOT advanced by synthesized chunks: a genuinely wedged
 # source still trips the restart watchdog above.
 SOURCE_SILENCE_CHUNK_BYTES = 32768
+# Grace window before synthesizing: a source read gets this many consecutive
+# chunk periods (~0.5s at 48k) of zero bytes before the first silence chunk.
+# shairport's pipe writes are jittery — one late chunk (a read window without
+# bytes) must NOT inject 170ms of digital silence into a healthy stream:
+# measured on a 50-300ms-jitter source, the single-timeout trigger synthesized
+# 3.5-4.6s of silence per 6s (audible stutter, invisible to every diagnostic
+# counter). Still far below the speaker's ~2s abandonment threshold.
+SOURCE_SILENCE_GRACE_PERIODS = 3
 
 
 class SpeakerPipeline:
@@ -486,19 +494,29 @@ class SpeakerPipeline:
         trip the restart watchdog.
         """
         chunk_seconds = SOURCE_SILENCE_CHUNK_BYTES / (4 * (self._input_sample_rate or 44100))
-        try:
-            chunk = await asyncio.wait_for(
-                reader.read(SOURCE_SILENCE_CHUNK_BYTES), chunk_seconds
-            )
-            return chunk, False
-        except TimeoutError:
-            if not self._stream_server.client_count(self._stream_id):
-                return await reader.read(SOURCE_SILENCE_CHUNK_BYTES), False
-            logger.debug(
-                "Source stalled for %s; feeding silence to keep clients alive",
-                self._stream_id,
-            )
-            return b"\x00" * SOURCE_SILENCE_CHUNK_BYTES, True
+        if not self._stream_server.client_count(self._stream_id):
+            # Nobody is listening: silence would be pure CPU burn. Plain
+            # blocking read, exactly like the pre-keepalive behaviour.
+            return await reader.read(SOURCE_SILENCE_CHUNK_BYTES), False
+        # Grace: the encoder tolerates a sub-grace gap on its own (the speaker
+        # buffers seconds); only a sustained zero-byte run synthesizes. This
+        # keeps bursty shairport pipe writes from becoming digital-silence
+        # gaps while still answering a real stall in ~0.5s, well under the
+        # speaker's ~2s abandonment. Late bytes within the grace window are
+        # returned immediately — no silence, no extra beat of delay.
+        for _ in range(SOURCE_SILENCE_GRACE_PERIODS):
+            try:
+                chunk = await asyncio.wait_for(
+                    reader.read(SOURCE_SILENCE_CHUNK_BYTES), chunk_seconds
+                )
+                return chunk, False
+            except TimeoutError:
+                continue
+        logger.debug(
+            "Source stalled for %s; feeding silence to keep clients alive",
+            self._stream_id,
+        )
+        return b"\x00" * SOURCE_SILENCE_CHUNK_BYTES, True
 
     async def _pump_source_to_encoder(self, reader: asyncio.StreamReader, writer) -> None:
         try:

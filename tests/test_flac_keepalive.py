@@ -15,6 +15,7 @@ transparent passthrough.
 """
 
 import asyncio
+import time
 
 import pytest
 from fastapi import Request
@@ -257,3 +258,119 @@ async def test_broadcast_accumulates_rate_samples_for_delay_line():
     # Re-registration resets the sample count: warmup starts over.
     server.register_stream("airplay2", StreamFormat("audio/flac", "flac", None))
     assert server._delay_line_byte_rate("airplay2") is None
+
+
+# --- Regression: grace window against jitter-induced silence injection ---
+
+class _WriterAdapter:
+    """Adapt the _RecordingWriter list-consumption to the raw pipeline."""
+
+    def __init__(self, writer):
+        self._writer = writer
+
+    def write(self, data: bytes) -> None:
+        self._writer.write(data)
+
+    def write_eof(self) -> None:
+        pass
+
+    async def drain(self) -> None:
+        return None
+
+
+
+
+class _PipeSource:
+    """Producer-driven source like a process stdout pipe: a background task
+    pushes chunks on its own jittery schedule; reads only consume what has
+    arrived (cancellation-safe via StreamReader's internal buffer)."""
+
+    def __init__(self, delays: list[float]):
+        self._delays = delays
+        self._reader = asyncio.StreamReader()
+        self._producer: asyncio.Task | None = None
+
+    def start(self) -> None:
+        async def produce() -> None:
+            index = 0
+            while True:
+                await asyncio.sleep(self._delays[index % len(self._delays)])
+                index += 1
+                self._reader.feed_data(b"\x7f" * SOURCE_SILENCE_CHUNK_BYTES)
+
+        self._producer = asyncio.create_task(produce())
+
+    async def read(self, n: int = -1) -> bytes:
+        return await self._reader.read(n)
+
+    async def stop(self) -> None:
+        if self._producer:
+            self._producer.cancel()
+            await asyncio.gather(self._producer, return_exceptions=True)
+
+
+def _zero(chunk: bytes) -> bool:
+    return chunk == b"\x00" * SOURCE_SILENCE_CHUNK_BYTES
+
+
+@pytest.mark.asyncio
+async def test_jittery_pipe_source_never_gets_synthesis():
+    """A shairport-like pipe with 50-300ms write jitter must produce ZERO
+    synthesized silence (the single-timeout trigger injected 3.5-4.6s of
+    digital silence per 6s — audible stutter, invisible to diagnostics)."""
+    pipeline, writer, _ = _pipeline(client_count=1)
+    source = _PipeSource([0.05, 0.30, 0.10, 0.26, 0.17, 0.30])
+    source.start()
+    task = asyncio.create_task(pipeline._pump_source_to_encoder(source._reader, _WriterAdapter(writer)))
+    await asyncio.sleep(5)
+    task.cancel()
+    await source.stop()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert writer.chunks, "the source did feed anything"
+    assert all(not _zero(chunk) for chunk in writer.chunks)
+
+
+@pytest.mark.asyncio
+async def test_real_stall_starts_silence_within_grace():
+    """A genuinely dead source must still be kept alive — the first silence
+    chunk arrives after ~GRACE x chunk period (~0.5s), far below the speaker's
+    ~2s abandonment threshold."""
+    pipeline, writer, _ = _pipeline(client_count=1)
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"\x7f" * SOURCE_SILENCE_CHUNK_BYTES)  # one real chunk, then dead
+
+    task = asyncio.create_task(
+        pipeline._pump_source_to_encoder(reader, _WriterAdapter(writer))
+    )
+    started = time.monotonic()
+    while len(writer.chunks) < 2 and time.monotonic() - started < 3:
+        await asyncio.sleep(0.01)
+    first_silence_at = time.monotonic() - started
+
+    assert len(writer.chunks) >= 2
+    assert _zero(writer.chunks[-1])
+    # ~0.51s grace at 48kHz; generous bounds for CI scheduling jitter.
+    assert 0.35 < first_silence_at < 1.2
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_late_data_within_grace_is_fed_without_extra_beat():
+    """Data arriving during the grace window is consumed immediately (no
+    silence inserted, no additional chunk-period delay), and the grace budget
+    resets — repeated sub-grace gaps never synthesize."""
+    pipeline, writer, _ = _pipeline(client_count=1)
+    source = _PipeSource([0.05, 0.34, 0.05, 0.34, 0.05])  # sub-grace gaps
+    source.start()
+    task = asyncio.create_task(
+        pipeline._pump_source_to_encoder(source._reader, _WriterAdapter(writer))
+    )
+    await asyncio.sleep(3.5)
+    task.cancel()
+    await source.stop()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert writer.chunks
+    assert all(not _zero(chunk) for chunk in writer.chunks)

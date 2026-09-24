@@ -28,6 +28,14 @@ logger = logging.getLogger(__name__)
 # is the signal that it wedged.
 SOURCE_STALL_TIMEOUT_SECONDS = 8.0
 SOURCE_STALL_CHECK_SECONDS = 2.0
+# When the PCM source stops delivering while HTTP clients are connected, the
+# pumps synthesize zero-PCM chunks after roughly one chunk period of stall.
+# FLAC has no precomputable silence frame (unlike mp3), so the running
+# encoder must be fed zero PCM to keep the stream's frame sequence unbroken —
+# a starved Xiaomi pull player abandons the response in ~2s. Stall watchdog
+# timestamps are NOT advanced by synthesized chunks: a genuinely wedged
+# source still trips the restart watchdog above.
+SOURCE_SILENCE_CHUNK_BYTES = 32768
 
 
 class SpeakerPipeline:
@@ -456,6 +464,33 @@ class SpeakerPipeline:
                 logger.exception("Failed to restart stalled source for %s", self._stream_id)
                 self._status = "error"
 
+    async def _read_source_chunk(self, reader: asyncio.StreamReader) -> tuple[bytes, bool]:
+        """Read one source chunk, synthesizing silence on source stalls.
+
+        Returns (b"", False) only at EOF. While HTTP clients are connected, a
+        source that stops delivering for ~one chunk period yields a zero-PCM
+        chunk (synthesized=True) instead of starving the encoder — see
+        SOURCE_SILENCE_CHUNK_BYTES. With no clients connected this degenerates
+        to a plain blocking read: silence would be pure CPU burn with nobody
+        listening. The flag lets callers leave stall-watchdog timestamps
+        untouched for synthesized chunks: a genuinely wedged source must still
+        trip the restart watchdog.
+        """
+        chunk_seconds = SOURCE_SILENCE_CHUNK_BYTES / (4 * (self._input_sample_rate or 44100))
+        try:
+            chunk = await asyncio.wait_for(
+                reader.read(SOURCE_SILENCE_CHUNK_BYTES), chunk_seconds
+            )
+            return chunk, False
+        except TimeoutError:
+            if not self._stream_server.client_count(self._stream_id):
+                return await reader.read(SOURCE_SILENCE_CHUNK_BYTES), False
+            logger.debug(
+                "Source stalled for %s; feeding silence to keep clients alive",
+                self._stream_id,
+            )
+            return b"\x00" * SOURCE_SILENCE_CHUNK_BYTES, True
+
     async def _pump_source_to_encoder(self, reader: asyncio.StreamReader, writer) -> None:
         try:
             rate = self._input_sample_rate or 44100
@@ -464,10 +499,11 @@ class SpeakerPipeline:
             started_at = loop.time()
             fed_bytes = 0
             while self._running:
-                chunk = await reader.read(32768)
+                chunk, synthesized = await self._read_source_chunk(reader)
                 if not chunk:
                     break
-                self._note_source_bytes(chunk)
+                if not synthesized:
+                    self._note_source_bytes(chunk)
                 gained = self._apply_input_gain(chunk)
                 if spectrum_wanted():
                     self._spectrum.feed(gained)
@@ -516,10 +552,11 @@ class SpeakerPipeline:
                 # is a valid container (and gets cached as the join prefix).
                 await self._stream_server.broadcast(self._stream_id, wav_header(rate))
             while self._running:
-                chunk = await reader.read(32768)
+                chunk, synthesized = await self._read_source_chunk(reader)
                 if not chunk:
                     break
-                self._note_source_bytes(chunk)
+                if not synthesized:
+                    self._note_source_bytes(chunk)
                 gained = self._apply_input_gain(chunk)
                 if spectrum_wanted():
                     self._spectrum.feed(gained)

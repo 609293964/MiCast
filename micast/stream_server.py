@@ -39,6 +39,14 @@ CLIENT_UNDRAINED_SECONDS = 10.0
 # First bytes of an encoder run are cached and replayed to late-joining
 # clients: WAV/FLAC decoders need the stream header, MP3 just skips it.
 STREAM_PREFIX_BYTES = 16384
+# Delay-line trust thresholds for formats without a nominal byte rate
+# (flac): the EMA must be based on at least this many broadcast samples
+# (~2-4s of streaming) and exceed an absolute floor — below ~64 kbps the
+# "stream" is silence/underrun, not audio worth throttling. Flac has no
+# nominal expectation to take a percentage of, so the floor is absolute;
+# a wrong rate here would mis-throttle healthy clients, so stay conservative.
+DELAY_LINE_MIN_SAMPLES = 20
+DELAY_LINE_MIN_BYTES_PER_SECOND = 8000
 
 _MEDIA_UA = (
     "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -108,6 +116,9 @@ class StreamServer:
         # milliseconds for formats whose StreamFormat has no nominal byte_rate
         # (flac). Nominal byte_rate wins when present.
         self._observed_byte_rate: dict[str, float] = {}
+        # Broadcast-sample count feeding the EMA; the flac delay line only
+        # trusts the EMA after DELAY_LINE_MIN_SAMPLES samples.
+        self._rate_samples: dict[str, int] = {}
         # One-shot rendezvous used when a grouped speaker disconnects while
         # its AirPlay session is still live. New HTTP clients wait here until
         # every group member has arrived, then start on the same future chunk.
@@ -276,6 +287,11 @@ class StreamServer:
         self.total_bytes_sent.setdefault(device_id, 0)
         self.dropped_chunks.setdefault(device_id, 0)
         self.dropped_bytes.setdefault(device_id, 0)
+        # A re-registration (format change) invalidates the previous run's
+        # observed rate; the EMA must rebuild before the flac delay line
+        # may use it.
+        self._observed_byte_rate.pop(device_id, None)
+        self._rate_samples[device_id] = 0
         logger.info("Registered stream /stream/%s (%s)", device_id, stream_format.content_type)
 
     def register_diagnostic_media(self, token: str, path: Path, media_type: str) -> None:
@@ -299,6 +315,8 @@ class StreamServer:
         self.total_bytes_sent.pop(device_id, None)
         self.dropped_chunks.pop(device_id, None)
         self.dropped_bytes.pop(device_id, None)
+        self._observed_byte_rate.pop(device_id, None)
+        self._rate_samples.pop(device_id, None)
 
     def stream_ids(self) -> list[str]:
         return list(self._streams.keys())
@@ -446,7 +464,10 @@ class StreamServer:
                 if stream_format and stream_format.content_type == "audio/mpeg"
                 else b""
             )
-            byte_rate = stream_format.byte_rate
+            # Delay-line byte rate: nominal when the format has one (mp3/wav/
+            # pcm); for flac the broadcast-observed EMA once it is trustworthy.
+            # Until then the client stays on the transparent passthrough.
+            byte_rate = self._delay_line_byte_rate(device_id)
             buffer_seconds = settings.stream_buffer_seconds
             initial_buffer = int(byte_rate * buffer_seconds) if byte_rate else 0
             # Delay alignment: extra bytes held back per client so this speaker
@@ -811,6 +832,7 @@ class StreamServer:
                 self._observed_byte_rate[device_id] = (
                     instantaneous if ema is None else ema * 0.9 + instantaneous * 0.1
                 )
+                self._rate_samples[device_id] = self._rate_samples.get(device_id, 0) + 1
             prefix = self._prefixes.get(device_id)
             if prefix is not None and len(prefix) < STREAM_PREFIX_BYTES:
                 prefix.extend(chunk[: STREAM_PREFIX_BYTES - len(prefix)])
@@ -822,6 +844,23 @@ class StreamServer:
         if stream_format and stream_format.byte_rate:
             return float(stream_format.byte_rate)
         return self._observed_byte_rate.get(device_id)
+
+    def _delay_line_byte_rate(self, device_id: str) -> int | None:
+        """Byte rate the per-client delay line may use for this stream.
+
+        Formats with a nominal byte rate always qualify. FLAC has none: only
+        a well-sampled EMA above the absolute floor qualifies, so volatile
+        warm-up periods and silence keep the transparent passthrough.
+        """
+        stream_format = self._streams.get(device_id)
+        if stream_format and stream_format.byte_rate:
+            return int(stream_format.byte_rate)
+        if self._rate_samples.get(device_id, 0) < DELAY_LINE_MIN_SAMPLES:
+            return None
+        rate = self._observed_byte_rate.get(device_id)
+        if rate is None or rate < DELAY_LINE_MIN_BYTES_PER_SECOND:
+            return None
+        return int(rate)
 
     def drop_metrics(self, device_id: str) -> dict[str, int]:
         """Cross-format-comparable drop accounting for one stream.

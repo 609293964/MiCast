@@ -29,4 +29,4 @@ desktop_applaunchname=micast.main
 ctl_stop=true
 checkport=false
 disable_authorization_path=true
-changelog=0.2.5<br>· 修复 CI 打包的 fpk 打开应用提示 Not Found（脚本漏拷 dist 目录层级）<br>· 应用介绍产品图限制在面板宽度内<br>· 播放稳定性：AirPlay 抖动缓冲加深至约 400ms，丢包重传更从容，大幅减少跳拍<br>· EQ 调整防抖：连续拖动不再触发多次编码器重启<br>· 小米登录自愈：serviceToken 失效自动换新并重试，仅在凭证真正失效时要求重新登录<br>· 登录过期自动弹出扫码框，账号页可直接重新登录<br>· 修复 DLNA 投放含非 UTF-8 标签的媒体时崩溃<br>· 修复网关模式下 DLNA 链接无法访问<br>· 歌词行不再误入歌手名，可从标题后缀回收歌手<br>· 应用介绍支持图文展示
+changelog=0.3.2<br>· 修复 AirPlay 2 无声：源流停滞重建时的任务取消递归导致管道永久停止，现可自动重建恢复<br>· 修复 AirPlay 2 轻微卡顿：静音续流触发过于敏感，管道抖动被误判为停滞并注入数字静音<br>· 修复 AirPlay 1 / AirPlay 2 互切后无声：重试不再用过期的投放来源抢占音箱<br>· AirPlay 2 切歌不再无声：shairport 回调弹跳不再重复触发云端重播<br>· 修复丢包计数持续增长：回收重连后残留的幽灵拉流连接<br>· FLAC 流短暂停滞时持续输送静音，音箱不再约 2 秒断连<br>· 诊断面板支持跨格式对比的丢包字节数 / 毫秒数，PCM、编码器、流服务三层计数可对账<br>· 调音多端协同：多标签页同时调音不再互相覆盖，支持撤销上一步调音<br>· 新增音箱编解码能力学习，创建组合时提示不兼容音箱<br>· fnOS 新增 ARM 架构安装包

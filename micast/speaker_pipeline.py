@@ -107,6 +107,14 @@ class SpeakerPipeline:
             return None
         return self._spectrum.bands()
 
+    def drop_stats(self) -> dict[str, int]:
+        """Encoder-stage loss counters (input/output), for end-to-end drop
+        diagnostics alongside stream-server dropped_chunks and PCM-tee drops.
+        Empty when no encoder is running (raw bypass never drops here)."""
+        if self._encoder is None:
+            return {"in": 0, "out": 0}
+        return self._encoder.drop_stats()
+
     @property
     def status(self) -> str:
         return self._status
@@ -483,21 +491,12 @@ class SpeakerPipeline:
     async def _pump_encoder_to_stream(self, reader) -> None:
         try:
             while self._running:
+                # read(32768) coalesces every immediately-pending muxer write
+                # into one ≤32KB chunk (see _EncodedReader), so all encoded
+                # formats broadcast at a uniform granularity.
                 chunk = await reader.read(32768)
                 if not chunk:
                     break
-                # The muxer flushes frames as many small writes (a FLAC frame
-                # can arrive as hundreds of tiny sink writes). Each write would
-                # otherwise become one broadcast and one per-client queue item,
-                # making queue accounting meaningless and multiplying drop
-                # counters — coalesce whatever is immediately pending so one
-                # encoded frame travels as one chunk. The wait for the first
-                # chunk already throttles this loop to the encoder's pace.
-                while len(chunk) < 32768:
-                    extra = reader.read_nowait()
-                    if not extra:
-                        break
-                    chunk += extra
                 await self._stream_server.broadcast(self._stream_id, chunk)
         except asyncio.CancelledError:
             pass

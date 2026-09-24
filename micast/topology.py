@@ -331,6 +331,11 @@ def _stream_node(
         "clients": info.get("clients", 0),
         "bytes_sent": info.get("bytes_sent", 0),
         "dropped_chunks": info.get("dropped_chunks", 0),
+        # Cross-format-comparable loss: raw chunk counts depend on the codec's
+        # mux granularity; bytes/extrapolated milliseconds do not.
+        "dropped_bytes": info.get("dropped_bytes", 0),
+        "dropped_ms": info.get("dropped_ms", 0),
+        "pipeline_drops": info.get("pipeline_drops", {}),
     }
 
 

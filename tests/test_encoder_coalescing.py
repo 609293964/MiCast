@@ -1,83 +1,136 @@
-"""Encoder-output coalescing: muxer flush granularity must not reach the
-stream server as hundreds of tiny per-client queue items.
+"""Unified encoder-output chunking and cross-format drop accounting.
 
-Measured on the real chain (flac/48000): one muxed frame produced ~55 output
-writes whose sizes vary wildly (tiny control writes up to full frames). Each
-write became one broadcast and one per-client queue item, so a 256-item queue
-held anywhere from milliseconds to minutes of audio depending on write sizes,
-and every tiny write multiplied drop accounting by an arbitrary factor.
+The muxer flushes one encoded frame as many small writes (measured: a flac
+frame can arrive as dozens of tiny control writes plus the frame body; wav
+adds a ~78-byte header write). ``_EncodedReader.read(n)`` coalesces every
+immediately-pending write into at most n bytes so ALL encoded formats
+(flac/mp3/wav) reach the stream server at one uniform granularity — without
+it each write becomes one per-client queue item and drop counters mean
+different durations per format.
 """
 
 import asyncio
-from unittest.mock import AsyncMock
+import time
 
 import pytest
 
-from micast.speaker_pipeline import SpeakerPipeline
+from micast.audio_encoder import AudioEncoder, StreamFormat, _EncodedReader
+from micast.stream_server import StreamServer
 
 
-class _FakeEncodedReader:
-    """Async reader with read()/read_nowait() over staged chunk lists. The
-    stages reproduce encoder cadence: everything pending in one flush, then a
-    gap, then the next frame."""
-
-    def __init__(self, stages: list[list[bytes]]):
-        self._stages = [list(stage) for stage in stages]
-
-    async def read(self, n: int = -1) -> bytes:
-        await asyncio.sleep(0.01)  # encoder produces the next frame later
-        while self._stages and not self._stages[0]:
-            self._stages.pop(0)
-        if not self._stages:
-            return b""
-        return self._stages[0].pop(0)
-
-    def read_nowait(self) -> bytes:
-        # Only the CURRENT flush is pending; a later frame is not merged.
-        if not self._stages or not self._stages[0]:
-            return b""
-        return self._stages[0].pop(0)
+class _FakeEncoderConfig:
+    def __init__(self, fmt="flac"):
+        self.format = fmt
+        self.bitrate = "320k"
+        self.sample_rate = 48000
 
 
-@pytest.mark.asyncio
-async def test_pump_coalesces_immediately_pending_encoder_writes():
-    pipeline = object.__new__(SpeakerPipeline)
-    pipeline._running = True
-    pipeline._stream_id = "airplay2"
-    pipeline._status = "running"
-    broadcasts: list[bytes] = []
-    pipeline._stream_server = AsyncMock()
-    pipeline._stream_server.broadcast = AsyncMock(
-        side_effect=lambda stream_id, chunk: broadcasts.append(chunk)
-    )
-    # One encoded frame flushed as many small writes; the next frame arrives
-    # only after a cadence gap.
+def _reader_with(chunks: list[bytes | None]) -> _EncodedReader:
+    q: asyncio.Queue = asyncio.Queue()
+    for chunk in chunks:
+        q.put_nowait(chunk)
+    return _EncodedReader(q)
+
+
+def test_read_coalesces_pending_writes_up_to_n():
     small = [b"\xAA" * 640, b"\xBB" * 512, b"\xCC" * 2048] + [b"\xDD" * 100] * 50
-    reader = _FakeEncodedReader([small, [b"\xEE" * 40000]])
+    reader = _reader_with([*small, None])
 
-    task = asyncio.create_task(pipeline._pump_encoder_to_stream(reader))
-    await asyncio.wait_for(task, timeout=5)
+    async def run():
+        first = await reader.read(32768)
+        assert first == b"".join(small)  # 53 writes travel as ONE chunk
+        assert await reader.read(32768) == b""  # EOF already consumed
 
-    small_total = 640 + 512 + 2048 + 50 * 100
-    assert broadcasts == [b"".join(small), b"\xEE" * 40000]
-    assert len(broadcasts[0]) == small_total
+    asyncio.run(run())
+
+
+def test_read_returns_oversized_item_whole():
+    frame = b"\xAB" * 40000  # larger than n: returned unsplit
+    reader = _reader_with([frame, None])
+
+    async def run():
+        assert await reader.read(32768) == frame
+        assert await reader.read(32768) == b""
+
+    asyncio.run(run())
+
+
+def test_read_defers_eof_when_consumed_mid_aggregation():
+    reader = _reader_with([b"\x01" * 100, None])
+
+    async def run():
+        # The EOF sentinel sits pending right after the data; aggregation
+        # must not swallow it into the data chunk.
+        assert await reader.read(32768) == b"\x01" * 100
+        assert await reader.read(32768) == b""
+
+    asyncio.run(run())
+
+
+def test_read_nowait_drains_without_blocking():
+    reader = _reader_with([b"\x01" * 10])
+    assert reader.read_nowait() == b"\x01" * 10
+    assert reader.read_nowait() == b""  # empty, non-blocking
 
 
 @pytest.mark.asyncio
-async def test_pump_passes_single_frame_unchanged():
-    pipeline = object.__new__(SpeakerPipeline)
-    pipeline._running = True
-    pipeline._stream_id = "r1"
-    pipeline._status = "running"
-    broadcasts: list[bytes] = []
-    pipeline._stream_server = AsyncMock()
-    pipeline._stream_server.broadcast = AsyncMock(
-        side_effect=lambda stream_id, chunk: broadcasts.append(chunk)
-    )
-    frame = b"\xAB" * 32768
-    reader = _FakeEncodedReader([[frame]])
+async def test_encoder_drop_stats_count_input_and_output_loss():
+    """A stalled encoder input (full queue) and a stalled output both surface
+    drop counts — PCM-layer loss becomes as visible as stream-server drops.
 
-    task = asyncio.create_task(pipeline._pump_encoder_to_stream(reader))
-    await asyncio.wait_for(task, timeout=5)
+    Input drops are measured with the worker not started (deterministic fill);
+    silence frames need 4096 samples, so the 65 tiny pre-start writes can
+    never make the started worker emit before the output queue is pre-filled.
+    """
+    enc = AudioEncoder(_FakeEncoderConfig(), 48000)
+    for _ in range(64):  # fill the input queue (maxsize=64)
+        enc.stdin.write(b"\x00" * 100)
+    enc.stdin.write(b"\x00" * 100)  # this one must evict the oldest
+    assert enc.drop_stats()["in"] == 1
 
-    assert broadcasts == [frame]
+    await enc.start()
+    for _ in range(64):  # pre-fill the output queue (exactly capacity)
+        enc._loop.call_soon_threadsafe(enc._out.put_nowait, b"\xff" * 50)
+    await asyncio.sleep(0.2)
+    enc.stdin.write(b"\x00" * 32768)  # 8192 samples → 2 flac frames emitted
+    await asyncio.sleep(0.5)
+    assert enc.drop_stats()["out"] >= 1
+    await enc.stop()
+
+
+def test_drop_metrics_are_cross_format_comparable():
+    """Same lost audio expressed in chunks means wildly different durations;
+    dropped_bytes and estimated_ms must agree across formats."""
+    server = StreamServer()
+    # mp3: nominal byte_rate 40000 (320k). flac: no nominal rate — the
+    # observed EMA from broadcast() stands in so both produce a ms estimate.
+    server.register_stream("mp3", StreamFormat("audio/mpeg", "mp3", 40000))
+    server.register_stream("flac", StreamFormat("audio/flac", "flac", None))
+
+    async def run():
+        # Drive the flac EMA with a steady 16000 B/s so its rate is known.
+        for _ in range(20):
+            server._last_broadcast["flac"] = time.monotonic() - 1.0
+            await server.broadcast("flac", b"\x00" * 16000)
+            await asyncio.sleep(0.01)
+        assert 14000 < server._stream_byte_rate("flac") < 18000
+
+        mp3_q: asyncio.Queue = asyncio.Queue(maxsize=1)
+        flac_q: asyncio.Queue = asyncio.Queue(maxsize=1)
+        server._clients["mp3"].add(mp3_q)
+        server._clients["flac"].add(flac_q)
+        server._client_delay[mp3_q] = {"last_get_at": time.monotonic()}
+        server._client_delay[flac_q] = {"last_get_at": time.monotonic()}
+        mp3_q.put_nowait(b"\x00" * 4000)  # 100ms of mp3 audio
+        flac_q.put_nowait(b"\x00" * 1600)  # 100ms of flac audio
+        server._broadcast_to("mp3", b"\x01" * 4000)
+        server._broadcast_to("flac", b"\x01" * 1600)
+
+        mp3_metrics = server.drop_metrics("mp3")
+        flac_metrics = server.drop_metrics("flac")
+        assert mp3_metrics["chunks"] == flac_metrics["chunks"] == 1
+        # Same 100ms of lost audio on both formats → same ms, comparable count.
+        assert mp3_metrics["estimated_ms"] == 100
+        assert abs(flac_metrics["estimated_ms"] - 100) <= 20  # EMA tolerance
+
+    asyncio.run(run())

@@ -17,17 +17,21 @@ from micast.audio_encoder import StreamFormat
 from micast.stream_server import CLIENT_UNDRAINED_SECONDS, StreamServer
 
 
-def _request() -> Request:
+def _request_for(stream_id: str) -> Request:
     return Request(
         {
             "type": "http",
             "method": "GET",
-            "path": "/stream/airplay2",
+            "path": f"/stream/{stream_id}",
             "query_string": b"",
             "headers": [],
             "client": ("192.168.0.128", 51000),
         }
     )
+
+
+def _request() -> Request:
+    return _request_for("airplay2")
 
 
 def _flac_server() -> StreamServer:
@@ -100,4 +104,36 @@ async def test_group_recovery_waiter_is_not_reaped():
     assert queue in server._clients["airplay2"]
 
     server.abort_group_recovery("airplay2")
+    await response.body_iterator.aclose()
+
+
+@pytest.mark.parametrize(
+    "content_type,byte_rate",
+    [
+        ("audio/mpeg", 40000),
+        ("audio/flac", None),
+        ("audio/wav", 192000),
+    ],
+)
+@pytest.mark.asyncio
+async def test_ghost_reaping_and_drop_metrics_cover_all_formats(content_type, byte_rate):
+    """The ghost-client fix and byte/ms drop accounting are format-independent:
+    every encoder output (flac/mp3/wav) and the raw PCM bypass travel the same
+    _broadcast_to path."""
+    server = StreamServer()
+    server.register_stream("s1", StreamFormat(content_type, "x", byte_rate))
+    response = await server._serve_stream(_request_for("s1"), "s1")
+    queue = next(iter(server._clients["s1"]))
+    state = server._client_delay[queue]
+    state["last_get_at"] = time.monotonic() - CLIENT_UNDRAINED_SECONDS - 1
+    for _ in range(queue.maxsize):
+        queue.put_nowait(b"\xff" * 1024)
+
+    server._broadcast_to("s1", b"\xee" * 1024)
+
+    assert queue not in server._clients["s1"]
+    metrics = server.drop_metrics("s1")
+    # Reaped before the broadcast loop: the ghost caused ZERO drops.
+    assert metrics["chunks"] == 0
+    assert metrics["bytes"] == 0
     await response.body_iterator.aclose()

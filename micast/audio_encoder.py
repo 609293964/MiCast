@@ -212,10 +212,19 @@ class AudioEncoder:
         # unbounded PCM grows by ~635 MB/hour when an encoder stalls.
         self._in: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
         self._out: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
+        # Loss counters for the drop-oldest overflow paths (see _put_latest_*):
+        # input drops mean the pipeline fed PCM faster than this encoder could
+        # consume; output drops mean the event loop did not drain encoded
+        # chunks fast enough. Both are realtime losses, surfaced via
+        # SpeakerPipeline.drop_stats() alongside stream-server dropped_chunks.
+        self._drop_counts = {"in": 0, "out": 0}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._exit_code: int | None = None
-        self.stdin = _PCMWriter(self._in)
+        self.stdin = _PCMWriter(self._in, self._drop_counts, "in")
+
+    def drop_stats(self) -> dict[str, int]:
+        return dict(self._drop_counts)
 
     @property
     def format(self) -> StreamFormat:
@@ -299,7 +308,11 @@ class AudioEncoder:
         loop = self._loop
 
         def emit(chunk: bytes) -> None:
-            loop.call_soon_threadsafe(_put_latest_async, out, chunk)
+            def put() -> None:
+                if _put_latest_async(out, chunk):
+                    self._drop_counts["out"] += 1
+
+            loop.call_soon_threadsafe(put)
 
         container = av.open(_StreamSink(emit), mode="w", format=self.config.format)
         stream = _open_encoder(
@@ -330,11 +343,14 @@ class AudioEncoder:
 class _PCMWriter:
     """Sync facade over the input queue; matches StreamWriter's used surface."""
 
-    def __init__(self, pcm_queue: queue.Queue):
+    def __init__(self, pcm_queue: queue.Queue, drop_counts: dict, drop_key: str):
         self._queue = pcm_queue
+        self._drop_counts = drop_counts
+        self._drop_key = drop_key
 
     def write(self, data: bytes) -> None:
-        _put_latest_sync(self._queue, data)
+        if _put_latest_sync(self._queue, data):
+            self._drop_counts[self._drop_key] += 1
 
     def write_eof(self) -> None:
         _put_latest_sync(self._queue, None)
@@ -345,42 +361,88 @@ class _PCMWriter:
         return
 
 
-def _put_latest_sync(target: queue.Queue, item: bytes | None) -> None:
-    """Bound latency by discarding the oldest realtime chunk on overflow."""
+def _put_latest_sync(target: queue.Queue, item: bytes | None) -> bool:
+    """Bound latency by discarding the oldest realtime chunk on overflow.
+
+    Returns True when a chunk was discarded."""
     try:
         target.put_nowait(item)
+        return False
     except queue.Full:
         with contextlib.suppress(queue.Empty):
             target.get_nowait()
         target.put_nowait(item)
+        return True
 
 
-def _put_latest_async(target: asyncio.Queue, item: bytes | None) -> None:
+def _put_latest_async(target: asyncio.Queue, item: bytes | None) -> bool:
+    """Async counterpart of _put_latest_sync; True when a chunk was discarded."""
     try:
         target.put_nowait(item)
+        return False
     except asyncio.QueueFull:
         with contextlib.suppress(asyncio.QueueEmpty):
             target.get_nowait()
         target.put_nowait(item)
+        return True
 
 
 class _EncodedReader:
-    """Async read() facade over the output queue; matches StreamReader."""
+    """Async read(n) facade over the output queue; matches StreamReader.
+
+    ``read(n)`` returns AT MOST n bytes, coalescing every chunk that is
+    immediately pending — the muxer flushes one encoded frame as many small
+    writes (a FLAC frame can be hundreds of tiny sink writes), and without
+    aggregation each write would become one broadcast and one per-client
+    queue item, making queue accounting meaningless and multiplying drop
+    counters by an arbitrary factor. Items are never split; a single item
+    larger than n is returned whole. This is the ONE chunker every encoded
+    format (flac/mp3/wav) travels through, so all formats present the same
+    granularity downstream regardless of muxer write patterns.
+    """
 
     def __init__(self, out_queue: asyncio.Queue):
         self._queue = out_queue
+        self._saw_eof = False
 
     async def read(self, n: int = -1) -> bytes:
-        item = await self._queue.get()
-        return item if item is not None else b""
+        if self._saw_eof:
+            return b""
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                self._saw_eof = True
+                return b""
+            if n <= 0 or len(item) >= n:
+                return item
+            parts = [item]
+            total = len(item)
+            while total < n:
+                try:
+                    extra = self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if extra is None:
+                    # EOF sentinel consumed mid-aggregation: the queued audio
+                    # still belongs to this run; report EOF on the next call.
+                    self._saw_eof = True
+                    break
+                parts.append(extra)
+                total += len(extra)
+            return b"".join(parts)
 
     def read_nowait(self) -> bytes:
         """Drain one immediately-available chunk (b"" when none)."""
+        if self._saw_eof:
+            return b""
         try:
             item = self._queue.get_nowait()
         except asyncio.QueueEmpty:
             return b""
-        return item if item is not None else b""
+        if item is None:
+            self._saw_eof = True
+            return b""
+        return item
 
 
 # ---------------------------------------------------------------------------

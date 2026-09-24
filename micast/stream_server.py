@@ -99,6 +99,15 @@ class StreamServer:
         self._calibration_sessions: dict[str, dict] = {}
         self._diagnostic_media: dict[str, tuple[Path, str]] = {}
         self._diagnostic_hits: dict[str, int] = {}
+        # Byte-accurate drop accounting: chunk counts are NOT comparable
+        # across formats (a wav chunk carries ~100x the audio of an mp3
+        # frame), so drops are also tracked in bytes and converted to an
+        # estimated duration via the stream's byte rate.
+        self.dropped_bytes: dict[str, int] = {}
+        # Observed output byte rate per stream (EMA), used to express drops in
+        # milliseconds for formats whose StreamFormat has no nominal byte_rate
+        # (flac). Nominal byte_rate wins when present.
+        self._observed_byte_rate: dict[str, float] = {}
         # One-shot rendezvous used when a grouped speaker disconnects while
         # its AirPlay session is still live. New HTTP clients wait here until
         # every group member has arrived, then start on the same future chunk.
@@ -266,6 +275,7 @@ class StreamServer:
         self._prefixes[device_id] = bytearray()
         self.total_bytes_sent.setdefault(device_id, 0)
         self.dropped_chunks.setdefault(device_id, 0)
+        self.dropped_bytes.setdefault(device_id, 0)
         logger.info("Registered stream /stream/%s (%s)", device_id, stream_format.content_type)
 
     def register_diagnostic_media(self, token: str, path: Path, media_type: str) -> None:
@@ -288,6 +298,7 @@ class StreamServer:
         self._prefixes.pop(device_id, None)
         self.total_bytes_sent.pop(device_id, None)
         self.dropped_chunks.pop(device_id, None)
+        self.dropped_bytes.pop(device_id, None)
 
     def stream_ids(self) -> list[str]:
         return list(self._streams.keys())
@@ -789,12 +800,44 @@ class StreamServer:
     async def broadcast(self, device_id: str, chunk: bytes | None) -> None:
         """Send a chunk to all connected clients for a stream."""
         if chunk:
+            now = time.monotonic()
+            last = self._last_broadcast.get(device_id, 0.0)
             self.total_bytes_sent[device_id] = self.total_bytes_sent.get(device_id, 0) + len(chunk)
-            self._last_broadcast[device_id] = time.monotonic()
+            self._last_broadcast[device_id] = now
+            dt = now - last
+            if dt > 0:
+                instantaneous = len(chunk) / dt
+                ema = self._observed_byte_rate.get(device_id)
+                self._observed_byte_rate[device_id] = (
+                    instantaneous if ema is None else ema * 0.9 + instantaneous * 0.1
+                )
             prefix = self._prefixes.get(device_id)
             if prefix is not None and len(prefix) < STREAM_PREFIX_BYTES:
                 prefix.extend(chunk[: STREAM_PREFIX_BYTES - len(prefix)])
         self._broadcast_to(device_id, chunk)
+
+    def _stream_byte_rate(self, device_id: str) -> float | None:
+        """Nominal rate when known (mp3/wav/pcm), observed EMA otherwise (flac)."""
+        stream_format = self._streams.get(device_id)
+        if stream_format and stream_format.byte_rate:
+            return float(stream_format.byte_rate)
+        return self._observed_byte_rate.get(device_id)
+
+    def drop_metrics(self, device_id: str) -> dict[str, int]:
+        """Cross-format-comparable drop accounting for one stream.
+
+        ``chunks`` is the raw counter (format-dependent granularity);
+        ``bytes`` is exact; ``estimated_ms`` converts bytes via the stream's
+        byte rate so flac and mp3 drops are comparable on one scale.
+        """
+        chunks = self.dropped_chunks.get(device_id, 0)
+        dropped_bytes = self.dropped_bytes.get(device_id, 0)
+        rate = self._stream_byte_rate(device_id)
+        return {
+            "chunks": chunks,
+            "bytes": dropped_bytes,
+            "estimated_ms": round(dropped_bytes / rate * 1000) if rate and dropped_bytes else 0,
+        }
 
     def is_flowing(self, device_id: str, window: float = 3.0) -> bool:
         """True only while bytes actually move: a paused speaker can hold the
@@ -867,7 +910,13 @@ class StreamServer:
                 # speaker reconnect and refill on a fixed period — one clock
                 # drift event becomes a permanent rhythmic stutter.
                 try:
-                    queue.get_nowait()
+                    dropped = queue.get_nowait()
+                    if isinstance(dropped, bytes):
+                        # Byte-accurate accounting: chunk counts mean different
+                        # durations per format; bytes/ms are comparable.
+                        self.dropped_bytes[device_id] = (
+                            self.dropped_bytes.get(device_id, 0) + len(dropped)
+                        )
                     queue.put_nowait(chunk)
                     state = self._client_delay.get(queue)
                     if state is not None:

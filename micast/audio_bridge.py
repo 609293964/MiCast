@@ -171,6 +171,13 @@ class AudioBridge:
                 "clients": self._stream_server.client_count(receiver_id),
                 "bytes_sent": self._stream_server.total_bytes_sent.get(receiver_id, 0),
                 "dropped_chunks": self._stream_server.dropped_chunks.get(receiver_id, 0),
+                "dropped_bytes": self._stream_server.dropped_bytes.get(receiver_id, 0),
+                "dropped_ms": self._stream_server.drop_metrics(receiver_id)["estimated_ms"],
+                "pipeline_drops": (
+                    pipeline.drop_stats()
+                    if (pipeline := self.pipeline_for_stream(receiver_id)) is not None
+                    else {}
+                ),
                 "flowing": self._stream_server.is_flowing(receiver_id),
                 "latency": self._stream_server.latency_metrics(receiver_id),
             }

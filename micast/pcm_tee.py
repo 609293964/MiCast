@@ -22,6 +22,11 @@ class PCMTee:
     def start(self) -> None:
         self._task = asyncio.create_task(self._run())
 
+    @property
+    def dropped_chunks(self) -> int:
+        """PCM chunks lost because a branch could not keep up with realtime."""
+        return sum(out.dropped_chunks for out in self.outputs)
+
     async def _run(self) -> None:
         try:
             while True:
@@ -57,6 +62,10 @@ class BoundedPCMReader:
     def __init__(self, max_chunks: int = 64):
         self._queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=max_chunks)
         self._eof = False
+        # Drops at this layer mean a downstream encoder/branch fell behind
+        # realtime; surfaced via drop_stats so PCM-layer loss is as visible
+        # as stream-server dropped_chunks.
+        self.dropped_chunks = 0
 
     def feed_data(self, data: bytes) -> None:
         if self._eof:
@@ -66,6 +75,7 @@ class BoundedPCMReader:
         except asyncio.QueueFull:
             with contextlib.suppress(asyncio.QueueEmpty):
                 self._queue.get_nowait()
+            self.dropped_chunks += 1
             self._queue.put_nowait(data)
 
     def feed_eof(self) -> None:
@@ -77,6 +87,7 @@ class BoundedPCMReader:
         except asyncio.QueueFull:
             with contextlib.suppress(asyncio.QueueEmpty):
                 self._queue.get_nowait()
+            self.dropped_chunks += 1
             self._queue.put_nowait(None)
 
     def at_eof(self) -> bool:

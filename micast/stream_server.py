@@ -28,6 +28,14 @@ CLIENT_MAX_LAG_SECONDS = 4.0
 # A Xiaomi pull player abandons an HTTP response that stays silent for ~2s;
 # keepalive yields must stay well under that.
 CLIENT_KEEPALIVE_SECONDS = 1.0
+# A client whose queue stays full this long without the reader taking a single
+# chunk is a ghost: the speaker opened a replacement connection and the old
+# socket died half-open. Reaping it (instead of dropping chunks forever) stops
+# the dropped-chunks counter from growing one per broadcast — and the speaker's
+# own retry lands on a fresh queue at the live edge. Xiaomi players read in
+# bursts but always drain pending data within a second or two; ten seconds of
+# zero reads with a full queue means the reader is gone.
+CLIENT_UNDRAINED_SECONDS = 10.0
 # First bytes of an encoder run are cached and replayed to late-joining
 # clients: WAV/FLAC decoders need the stream header, MP3 just skips it.
 STREAM_PREFIX_BYTES = 16384
@@ -368,6 +376,10 @@ class StreamServer:
             "calibrated": False,
             "skip_ms": 0,
             "intentional_close": False,
+            # Last time the reader took a chunk from the queue. A full queue
+            # with a stale timestamp is a dead (half-open) connection; see
+            # CLIENT_UNDRAINED_SECONDS in _broadcast_to.
+            "last_get_at": time.monotonic(),
             # Drift counters: how often this client was skipped to live
             # (lag_drops/queue_drops) or needed injected silence (underruns).
             "lag_drops": 0,
@@ -437,6 +449,7 @@ class StreamServer:
                     chunk = await queue.get()
                     if chunk is None:
                         break
+                    self._note_client_read(queue)
                     if not byte_rate:
                         yield chunk
                         continue
@@ -791,10 +804,58 @@ class StreamServer:
         last = self._last_broadcast.get(device_id, 0.0)
         return (time.monotonic() - last) < window
 
+    def _note_client_read(self, queue: asyncio.Queue) -> None:
+        """Record that the HTTP reader took a chunk (ghost-client detector)."""
+        state = self._client_delay.get(queue)
+        if state is not None:
+            state["last_get_at"] = time.monotonic()
+
+    def _client_is_ghost(self, queue: asyncio.Queue) -> bool:
+        """True when the reader has taken nothing for a long while — a
+        half-open dead connection (the speaker replaced its pull socket and
+        the old one died without a close). Group-recovery waiters are exempt:
+        they deliberately hold data unread until every grouped sink has
+        connected."""
+        state = self._client_delay.get(queue)
+        if state is None:
+            return False
+        receiver_id = state.get("receiver")
+        waiting = self._group_recoveries.get(receiver_id) if receiver_id else None
+        if (
+            waiting is not None
+            and not waiting["event"].is_set()
+            and state.get("sink") in waiting["expected"]
+        ):
+            return False
+        last_get = state.get("last_get_at") or 0.0
+        return (time.monotonic() - float(last_get)) > CLIENT_UNDRAINED_SECONDS
+
+    def reap_ghost_clients(self, device_id: str) -> int:
+        """Close dead (half-open) client connections of one stream; returns how
+        many were reaped. Mirrors kick_clients' intentional_close semantics so
+        group-recovery hooks don't fire for a dead socket. Without this, every
+        broadcast to a ghost queue drops one chunk — the dropped-chunks
+        counter grows for as long as the session stays active."""
+        clients = self._clients.get(device_id)
+        if not clients:
+            return 0
+        dead = [queue for queue in clients if self._client_is_ghost(queue)]
+        for queue in dead:
+            state = self._client_delay.get(queue)
+            if state is not None:
+                state["intentional_close"] = True
+            clients.discard(queue)
+            with contextlib.suppress(Exception):
+                queue.put_nowait(None)
+        if dead:
+            logger.info("Reaped %d ghost client(s) from /stream/%s", len(dead), device_id)
+        return len(dead)
+
     def _broadcast_to(self, device_id: str, chunk: bytes | None) -> None:
         clients = self._clients.get(device_id)
         if not clients:
             return
+        self.reap_ghost_clients(device_id)
         dead: set[asyncio.Queue] = set()
         for queue in clients:
             try:

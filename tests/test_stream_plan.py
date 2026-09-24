@@ -225,3 +225,39 @@ def test_disabled_entries_drop_out_of_the_plan():
 
 def test_entry_fingerprint_unknown_id_is_none():
     assert entry_fingerprint(_settings(), "nope") is None
+
+
+def test_fingerprint_stable_with_full_tuning_surface():
+    """Regression: mid-playback rebuilds on fnOS 0.3.0 were suspected to come
+    from nondeterministic fingerprints. Pin stability across repeated computes
+    with EQ, night mode, loudness, stereo channels, gains, delays, and
+    external network targets all live."""
+    s = _settings()
+    group = s.groups[0]
+    group.mode = "stereo"
+    group.anchor_did = "a"
+    group.delays_ms = {"a": 0, "b": 1800}
+    group.channels = {"a": "left", "b": "right"}
+    group.gains_db = {"a": -1.5, "b": 2.0}
+    group.airplay_targets = ["aa1122334455"]
+    group.dlna_targets = ["uuid:renderer-1"]
+    group.network_channels = {"aa1122334455": "right"}
+    s.speakers = [
+        SpeakerConfig(
+            did="a",
+            eq_enabled=True,
+            eq_points=[EqPoint(freq=100, gain_db=2.0), EqPoint(freq=1000, gain_db=-1.0)],
+            night_mode=True,
+            loudness_comp_enabled=True,
+        ),
+        SpeakerConfig(did="b", eq_enabled=True, eq_points=[EqPoint(freq=200, gain_db=1.5)]),
+    ]
+    first = compute_plan(s)
+    for _ in range(5):
+        assert compute_plan(s) == first
+    assert diff_plans(first, compute_plan(s)).noop
+    # Sanity: the tuning surface really is represented (so the test isn't
+    # vacuously comparing empty fingerprints).
+    receiver_fp = first["entries"]["r1"]
+    assert receiver_fp["group"]["speakers"][0]["eq"] is not None
+    assert {v["suffix"] for v in receiver_fp["variants"]} == {"", "-L-q1", "-R", "-R-q1"}

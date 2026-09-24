@@ -594,6 +594,22 @@ class DeviceManager:
                     self._play_errors.pop(did, None)
                     attempts_map.pop(did, None)
                     continue
+                if (
+                    self._stream_urls.get(did) != url
+                    or self._owners.get(did) != entry.get("receiver")
+                ):
+                    # Stale entry: the speaker has moved on since the failure
+                    # (ownership transferred — the phone switched AirPlay 1/2 —
+                    # or the stream URL was re-issued). Replaying the recorded
+                    # url with the recorded owner would steal the speaker back
+                    # to a dead stream: silent speaker, cloud still "playing".
+                    logger.info(
+                        "Dropping stale play error for %s: owner/url moved on",
+                        did,
+                    )
+                    self._play_errors.pop(did, None)
+                    attempts_map.pop(did, None)
+                    continue
                 try:
                     await self.play_stream(did, url, owner=entry.get("receiver"), force=True)
                 except Exception as exc:

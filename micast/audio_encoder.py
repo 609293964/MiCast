@@ -374,6 +374,14 @@ class _EncodedReader:
         item = await self._queue.get()
         return item if item is not None else b""
 
+    def read_nowait(self) -> bytes:
+        """Drain one immediately-available chunk (b"" when none)."""
+        try:
+            item = self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return b""
+        return item if item is not None else b""
+
 
 # ---------------------------------------------------------------------------
 # One-shot transcodes (DLNA media proxy, debug-page preview)

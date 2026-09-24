@@ -56,6 +56,12 @@ class PlaybackOrchestrator:
         self._pending_stops: dict[str, asyncio.Task] = {}
         self._pending_group_recoveries: dict[str, asyncio.Task] = {}
         self._lyrics_sessions: dict[str, LyricsSession] = {}
+        # Receivers whose session start this orchestrator already served. The
+        # AirPlay 2 receiver (shairport-sync) fires play-begins again on track
+        # gaps and underruns while the session never ended — replaying the
+        # cloud play in that case only makes the Xiaomi player reload the URL.
+        self._started_sessions: set[str] = set()
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     def attach(self) -> None:
         """Install every bridge/device-manager hook this orchestrator serves."""
@@ -183,11 +189,16 @@ class PlaybackOrchestrator:
         # rejects its media type. Verify the real HTTP pull after startup and
         # learn this device's support for the format actually in use.
         self._start_background(
-            self.verify_receiver_streams(receiver_id, targets),
+            self.verify_receiver_streams(receiver_id, targets, attempted),
             f"verify-codec:{receiver_id}",
         )
 
-    async def verify_receiver_streams(self, receiver_id: str, targets: list[str]) -> None:
+    async def verify_receiver_streams(
+        self,
+        receiver_id: str,
+        targets: list[str],
+        attempted: dict[str, str] | None = None,
+    ) -> None:
         fmt = "PCM/WAV" if not settings.audio.auto_transcode else settings.audio.format.upper()
         pending = {
             did for did in targets if self.device_manager.owner_of(did) == receiver_id
@@ -211,9 +222,20 @@ class PlaybackOrchestrator:
         if not self.bridge.is_session_active(receiver_id):
             return
         for did in pending:
+            if self.device_manager.owner_of(did) != receiver_id:
+                # Ownership moved (the phone switched AirPlay 1/2 or another
+                # receiver took the speaker): whatever this probe concludes, it
+                # must not touch the new owner's playback.
+                continue
+            current_url = self.device_manager.stream_url_of(did)
+            if attempted is not None and current_url != attempted.get(did):
+                # A newer play superseded the URL we probed (re-point, lyrics
+                # re-send, recovery replay): the verdict below would stop a
+                # playback that is no longer the one we started from.
+                continue
             message = f"音箱未实际拉取 {fmt} 音频，可能不支持当前格式"
             self.device_manager.note_codec_capability(did, fmt, False, "no_stream_pull")
-            url = self.device_manager.stream_url_of(did)
+            url = current_url
             # A decoder that accepted the cloud command but never pulls the
             # stream leaves a live server-side queue. Unload it immediately so
             # an unsupported format cannot turn into an endless dropped-chunk
@@ -232,7 +254,31 @@ class PlaybackOrchestrator:
 
         return _stream_active_for(device_id)
 
+    def _session_lock(self, receiver_id: str) -> asyncio.Lock:
+        lock = self._session_locks.get(receiver_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[receiver_id] = lock
+        return lock
+
     async def on_session_start(self, receiver_id: str):
+        # Serialize start/stop pairs per receiver: a RECORD and a shairport
+        # play-begins callback can interleave and each would otherwise issue
+        # its own full round of cloud plays.
+        async with self._session_lock(receiver_id):
+            # Skip only when the session never ended (duplicate play-begins).
+            # After an engine restart the bridge's active set is cleared, so a
+            # genuinely fresh start always replays even if our latch survived.
+            if (
+                receiver_id in self._started_sessions
+                and self.bridge.is_session_active(receiver_id)
+            ):
+                logger.debug(
+                    "Receiver %s session start already served; skipping replay",
+                    receiver_id,
+                )
+                return
+            self._started_sessions.add(receiver_id)
         url = f"http://{settings.effective_stream_host}:{settings.stream_port}/stream/{receiver_id}"
         await self.play_receiver(receiver_id, url)
         await self.start_lyrics_session(receiver_id)
@@ -241,12 +287,14 @@ class PlaybackOrchestrator:
         )
 
     async def on_session_stop(self, receiver_id: str):
-        self.bridge._sender_volumes.pop(receiver_id, None)
-        self.bridge._volume_modes.pop(receiver_id, None)
-        lyrics = self._lyrics_sessions.pop(receiver_id, None)
-        if lyrics:
-            await lyrics.stop()
-        self.bridge.lyrics_matched.pop(receiver_id, None)
+        async with self._session_lock(receiver_id):
+            self._started_sessions.discard(receiver_id)
+            self.bridge._sender_volumes.pop(receiver_id, None)
+            self.bridge._volume_modes.pop(receiver_id, None)
+            lyrics = self._lyrics_sessions.pop(receiver_id, None)
+            if lyrics:
+                await lyrics.stop()
+            self.bridge.lyrics_matched.pop(receiver_id, None)
 
         async def delayed_stop():
             try:

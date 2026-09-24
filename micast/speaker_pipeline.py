@@ -486,6 +486,18 @@ class SpeakerPipeline:
                 chunk = await reader.read(32768)
                 if not chunk:
                     break
+                # The muxer flushes frames as many small writes (a FLAC frame
+                # can arrive as hundreds of tiny sink writes). Each write would
+                # otherwise become one broadcast and one per-client queue item,
+                # making queue accounting meaningless and multiplying drop
+                # counters — coalesce whatever is immediately pending so one
+                # encoded frame travels as one chunk. The wait for the first
+                # chunk already throttles this loop to the encoder's pace.
+                while len(chunk) < 32768:
+                    extra = reader.read_nowait()
+                    if not extra:
+                        break
+                    chunk += extra
                 await self._stream_server.broadcast(self._stream_id, chunk)
         except asyncio.CancelledError:
             pass

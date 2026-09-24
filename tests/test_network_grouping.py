@@ -161,7 +161,8 @@ async def test_prebuffer_eof_returns_none():
 async def test_play_error_retry_loop(monkeypatch):
     manager = DeviceManager.__new__(DeviceManager)
     manager._play_errors = {}
-    manager._stream_urls = {}
+    manager._stream_urls = {"did1": "http://x/stream/1"}
+    manager._owners = {"did1": "rcv1"}
     manager._error_retry_task = None
 
     monkeypatch.setattr("micast.xiaomi.device_manager.PLAY_ERROR_RETRY_SECONDS", 0.01)
@@ -194,7 +195,8 @@ async def test_play_error_retry_loop_gives_up_after_cap(monkeypatch):
     manager = DeviceManager.__new__(DeviceManager)
     manager._play_errors = {}
     manager._play_error_attempts = {}
-    manager._stream_urls = {}
+    manager._stream_urls = {"did1": "http://x/stream/1"}
+    manager._owners = {"did1": "rcv1"}
     manager._error_retry_task = None
 
     monkeypatch.setattr("micast.xiaomi.device_manager.PLAY_ERROR_RETRY_SECONDS", 0.01)

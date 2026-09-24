@@ -111,6 +111,13 @@ find "$STAGE_DIR/app" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 find "$STAGE_DIR/app/vendor" -type d \( -name tests -o -name test -o -name __pycache__ \) -prune -exec rm -rf {} +
 find "$STAGE_DIR/app/vendor" -type f -name '*.pyi' -delete
 
+# miservice-fork 只在它的独立 CLI（cli.py）里用到 rich / mutagen / setuptools；
+# MiCast 走的是 miaccount / minaservice 等库路径，不需要这些，剥掉省约 2MB。
+for junk in rich pygments mutagen setuptools pkg_resources _distutils_hack; do
+  rm -rf "$STAGE_DIR/app/vendor/$junk"
+  rm -rf "$STAGE_DIR/app/vendor/${junk}-"*.dist-info "$STAGE_DIR/app/vendor/${junk/-/_}"-*.dist-info
+done
+
 (
   cd "$STAGE_DIR"
   fnpack build

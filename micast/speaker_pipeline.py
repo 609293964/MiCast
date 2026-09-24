@@ -361,10 +361,19 @@ class SpeakerPipeline:
             await asyncio.gather(self._recovery_task, return_exceptions=True)
         if self._recovery_task is not current:
             self._recovery_task = None
+        # The stall-recovery aux task runs INSIDE this pipeline and reaches
+        # stop() via bridge._recover_stalled_source -> rebuild. Cancelling and
+        # gathering the current task here makes Task.cancel recurse into its
+        # own gather child (~1000 frames, RecursionError on py3.14) and wedges
+        # the stop forever — the exact "AirPlay 2 dead after PCM stall" crash.
+        # Skip the current task like _recovery_task above; it unwinds on its
+        # own once stop() returns.
         for task in list(self._aux_tasks):
-            task.cancel()
-        if self._aux_tasks:
-            await asyncio.gather(*list(self._aux_tasks), return_exceptions=True)
+            if task is not current:
+                task.cancel()
+        others = [task for task in self._aux_tasks if task is not current]
+        if others:
+            await asyncio.gather(*others, return_exceptions=True)
         self._aux_tasks.clear()
 
         for task in self._tasks:

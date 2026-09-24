@@ -1289,7 +1289,15 @@ class AudioBridge:
         return lambda: receiver_id in self._active_sessions
 
     async def _recover_stalled_source(self, stream_id: str) -> None:
-        """Replace the upstream receiver after PCM stalls in a live session."""
+        """Replace the upstream receiver after PCM stalls in a live session.
+
+        The rebuild tears the pipelines down before recreating them; if it
+        throws, the entry is left half-stopped and the stall watchdog is
+        already gone (it exits after spawning this recovery) — so a single
+        failure would silence the entry until the next engine restart. Retry
+        once after a short backoff; the flag in the finally still releases the
+        re-entry latch, so a later stall triggers a fresh attempt.
+        """
         if self._stall_recovery_requested:
             return
         self._stall_recovery_requested = True
@@ -1298,16 +1306,40 @@ class AudioBridge:
             airplay2_ids = [item.id for item in settings.airplay2_instances if item.enabled]
             instance_id = _stream_owner(stream_id, airplay2_ids)
             if instance_id is None:
-                await self.restart()
+                await self._stall_recovery_once(self.restart)
                 return
             self._maintenance_sessions.add(instance_id)
             self._active_sessions.discard(instance_id)
             try:
-                await self._rebuild_airplay2_instances({instance_id})
+                await self._stall_recovery_once(
+                    lambda: self._rebuild_airplay2_instances({instance_id})
+                )
             finally:
                 self._maintenance_sessions.discard(instance_id)
         finally:
             self._stall_recovery_requested = False
+
+    @staticmethod
+    async def _stall_recovery_once(action) -> None:
+        """Run one stall-recovery action; retry once after a backoff.
+
+        An exhausted retry propagates to the caller's task logger — the entry
+        stays silent but the next stall (watchdog re-arms on the new
+        pipelines, or a full engine restart) gets another chance."""
+        for attempt in (1, 2):
+            try:
+                await action()
+                return
+            except Exception:
+                logger.exception(
+                    "Stall recovery attempt %d failed%s",
+                    attempt,
+                    "; retrying once" if attempt == 1 else "",
+                )
+                if attempt == 1:
+                    await asyncio.sleep(2.0)
+                else:
+                    raise
 
     def stream_starved(self, stream_id: str) -> bool:
         """The stream's pipeline stopped producing bytes during a live sender

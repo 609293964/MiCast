@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STAGE_DIR="${ROOT_DIR}/build/fnos/micast"
-OUTPUT_DIR="${ROOT_DIR}/dist/fnos"
+STAGE_DIR="${MICAST_FNOS_STAGE_DIR:-${ROOT_DIR}/build/fnos/micast}"
+OUTPUT_DIR="${MICAST_FNOS_OUTPUT_DIR:-${ROOT_DIR}/dist/fnos}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 PLATFORM="${1:-${MICAST_FNOS_PLATFORM:-x86}}"
 
@@ -75,28 +75,28 @@ cp -a "$ROOT_DIR/micast" "$STAGE_DIR/app/"
 cp -a "$ROOT_DIR/web/dist" "$STAGE_DIR/app/web/"
 
 if [ "$PLATFORM" = "arm" ]; then
-  "$PYTHON_BIN" -m pip install \
-    --disable-pip-version-check \
-    --no-compile \
-    --only-binary=:all: \
-    --platform manylinux_2_28_aarch64 \
-    --platform manylinux_2_17_aarch64 \
-    --platform manylinux2014_aarch64 \
-    --implementation cp \
-    --python-version 3.12 \
-    --abi cp312 \
-    --target "$STAGE_DIR/app/vendor" \
-    --requirement "$ROOT_DIR/requirements.txt"
+  WHEEL_PLATFORMS="--platform manylinux_2_28_aarch64 --platform manylinux_2_17_aarch64 --platform manylinux2014_aarch64"
 else
-  # Never install the micast package itself into vendor: the runtime resolves
-  # `python -m micast` from the app directory (PYTHONPATH puts vendor first,
-  # so a vendored micast would shadow the app source and run stale code).
-  "$PYTHON_BIN" -m pip install \
-    --disable-pip-version-check \
-    --no-compile \
-    --target "$STAGE_DIR/app/vendor" \
-    --requirement "$ROOT_DIR/requirements.txt"
+  WHEEL_PLATFORMS="--platform manylinux_2_28_x86_64 --platform manylinux_2_17_x86_64 --platform manylinux2014_x86_64"
 fi
+
+# Always cross-download the target platform wheels, even for x86 on an x86
+# host: a plain `pip install` on Windows/macOS would vendor that host's
+# binaries into a Linux package. Never install the micast package itself into
+# vendor either — the runtime resolves `python -m micast` from the app
+# directory, and vendor comes first on PYTHONPATH, so a vendored micast would
+# shadow the app source and run stale code.
+# shellcheck disable=SC2086
+"$PYTHON_BIN" -m pip install \
+  --disable-pip-version-check \
+  --no-compile \
+  --only-binary=:all: \
+  $WHEEL_PLATFORMS \
+  --implementation cp \
+  --python-version 3.12 \
+  --abi cp312 \
+  --target "$STAGE_DIR/app/vendor" \
+  --requirement "$ROOT_DIR/requirements.txt"
 
 sed -i "s/^platform=.*/platform=$PLATFORM/" "$STAGE_DIR/manifest"
 
